@@ -85,6 +85,29 @@ object CarLifeLauncher {
     }
 
     /**
+     * 回收 CarWith 进程并重新调起直连入口（等价用户手动「停止再启动」）。
+     *
+     * 2026-11-22/23 实车定谳（三份日志）：CarWith 编码器初始化偶发卡死时，进程进入
+     * 「7240 照常监听但协议层不响应」的坏状态——重发入口无效（同一个坏进程再应答一次），
+     * 唯一恢复路径是进程冷启动。`killBackgroundProcesses` 是 normal 级权限，无需 root。
+     *
+     * @return 是否至少发起了「杀进程」动作（重新调起的结果看日志，两者都可能被 ROM 拦）
+     */
+    fun restartCarWithProcess(context: Context?): Boolean {
+        val ctx = context ?: return false
+        val killed =
+            runCatching {
+                ctx.getSystemService(ActivityManager::class.java)
+                    ?.killBackgroundProcesses(CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH)
+                true
+            }.getOrDefault(false)
+        // 给系统一点落账时间，否则紧跟的 startActivity 可能命中尚未清完的旧进程状态
+        Thread.sleep(300)
+        launchXiaomiCarWithDirect(ctx)
+        return killed
+    }
+
+    /**
      * 本应用当前是否在前台（mcarplay 同款 `ActivityManager.getMyMemoryState` 判定）。
      *
      * 为什么需要它（2026-10-26 小米实测，mcarplay `CarLifeLauncher.isAppInForeground` 原注释）：

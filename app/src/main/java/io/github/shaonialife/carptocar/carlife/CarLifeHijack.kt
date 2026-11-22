@@ -1289,14 +1289,31 @@ object CarLifeHijack {
                 }
             }
             while (running.get() && hu.isRunning) {
-                if (preferCarWith && !hasVideo && !carWithWakeSent && handshakeAtMs > 0L &&
+                if (preferCarWith && !hasVideo && handshakeAtMs > 0L &&
                     android.os.SystemClock.uptimeMillis() - handshakeAtMs > 5_000L
                 ) {
-                    carWithWakeSent = true
                     val ctx = appContext
                     if (ctx != null && CarLifeAutoPrefs.autoLaunchOnConnect(ctx)) {
-                        logSink?.invoke("CARLIFE: 已附着七口超过 5s 无视频帧——补请求 CarWith 公开虚拟屏入口")
-                        CarLifeLauncher.launchXiaomiCarWithDirect(ctx)
+                        if (!carWithWakeSent) {
+                            // 第一级：温和补请求（可能只是入口请求被引擎吞掉）
+                            carWithWakeSent = true
+                            logSink?.invoke("CARLIFE: 已附着七口超过 5s 无视频帧——补请求 CarWith 公开虚拟屏入口")
+                            CarLifeLauncher.launchXiaomiCarWithDirect(ctx)
+                        } else if (android.os.SystemClock.uptimeMillis() - handshakeAtMs > 10_000L) {
+                            // 第二级（1.2.99，2026-11-23 实车日志 000616 定谳）：温和补请求
+                            // 之后仍零帧 = 编码器卡死（握手成功、端口活着、协议不应答）。
+                            // 「停止→快速再启动」的用户操作节奏会绕过 Coordinator 的守候
+                            // 窗口（出帧即 disarm），必须在这里跟着连接循环本身兜底——
+                            // killBackgroundProcesses 回收 CarWith 进程 + 重新调起，
+                            // 等价用户手动重启。每轮连接最多一次（handshakeAtMs 在本轮
+                            // 结束时归零，下一轮自动重新武装）。
+                            carWithWakeSent = true
+                            logSink?.invoke(
+                                "CARLIFE: 补请求后仍无帧（握手已成功 ≥10s）——CarWith 编码器疑似卡死，" +
+                                    "回收进程并重新调起（等价手动重启）",
+                            )
+                            CarLifeLauncher.restartCarWithProcess(ctx)
+                        }
                     }
                 }
                 sleep(500)
