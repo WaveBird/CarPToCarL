@@ -435,8 +435,9 @@
                         android:textStyle="bold" />
                 </LinearLayout>
 
-                <!-- 连接时自动拉起并在出帧后退后台 -->
+                <!-- 连接时自动拉起并在出帧后退后台（小米机型整行隐藏：CarWith 直连入口天然后台） -->
                 <LinearLayout
+                    android:id="@+id/rowAutoLaunchCarLife"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:gravity="center_vertical"

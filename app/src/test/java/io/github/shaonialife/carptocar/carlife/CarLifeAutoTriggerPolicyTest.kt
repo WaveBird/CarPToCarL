@@ -218,10 +218,17 @@ class CarLifeAutoTriggerPolicyTest {
             )
         val installed = listOf(carWith, baidu)
 
+        // 小米机型：AUTO 把 CarWith 提到最前（detectInstalled 的推荐序本就 CarWith 在前，
+        // resolvePreferred 额外兜一道「小米机必须优先 CarWith」，防推荐序后续重排时漏掉）
         assertEquals(carWith, CarLifeLauncher.resolvePreferred(installed, LaunchTarget.AUTO))
+        // 非小米机型：AUTO 维持原推荐序（若 CarWith 缺席则首选百度 CarLife+）
+        assertEquals(carWith, CarLifeLauncher.resolvePreferred(installed, LaunchTarget.AUTO, xiaomiDevice = false))
+        assertEquals(baidu, CarLifeLauncher.resolvePreferred(listOf(baidu, carWith), LaunchTarget.AUTO, xiaomiDevice = false))
         assertEquals(baidu, CarLifeLauncher.resolvePreferred(installed, LaunchTarget.BAIDU_CARLIFE))
         // 选了未安装的组件时自动回退到首选项
         assertEquals(carWith, CarLifeLauncher.resolvePreferred(installed, LaunchTarget.XIAOMI_CARLIFE_COMPONENT))
+        // 小米机 AUTO 在 CarWith 缺席时回退到列表首选
+        assertEquals(baidu, CarLifeLauncher.resolvePreferred(listOf(baidu), LaunchTarget.AUTO, xiaomiDevice = true))
     }
 
     @Test

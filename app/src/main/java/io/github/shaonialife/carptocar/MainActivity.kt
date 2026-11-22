@@ -1741,6 +1741,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshCarLifeTargetRow(snapshot: CarLifeLauncher.StatusSnapshot) {
         val pref = CarLifeAutoPrefs.launchTarget(this)
+        val xiaomi = CarLifeLauncher.isXiaomiDevice()
         val shortName =
             when (pref) {
                 CarLifeAutoPrefs.LaunchTarget.AUTO -> "自动"
@@ -1756,8 +1757,19 @@ class MainActivity : AppCompatActivity() {
                 snapshot.installedApps.joinToString(" / ") { it.displayName }
             }
         val activeChoice = snapshot.preferredApp?.displayName ?: "无"
-        val note = "当前将拉起：$activeChoice（本机已安装：$installedNames）"
+        val autoHint =
+            if (pref == CarLifeAutoPrefs.LaunchTarget.AUTO && xiaomi) {
+                "（小米机型自动=优先 CarWith 直连入口）"
+            } else {
+                ""
+            }
+        val note = "当前将拉起：$activeChoice（本机已安装：$installedNames）$autoHint"
         if (carLifeTargetNote.text != note) carLifeTargetNote.text = note
+        // 小米机型走 CarWith 直连入口：拉起即后台虚拟屏，「出帧后退后台」对它无意义
+        // （界面瞬息即隐，退后台动作是多余的 moveTaskToBack 往返）——整个选项行隐藏。
+        val row = findViewById<View>(R.id.rowAutoLaunchCarLife)
+        val rowVisibility = if (xiaomi) View.GONE else View.VISIBLE
+        if (row.visibility != rowVisibility) row.visibility = rowVisibility
     }
 
     private fun refreshCarLifeAccessibilityRow() {

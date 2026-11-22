@@ -523,6 +523,16 @@ object CarLifeAutoCoordinator {
         if (hasPendingConnect) {
             firePendingConnect("✓ 已收到 $targetName 真实首帧")
         }
+        // 直连入口（CarlifeAdbActivity）的 CarWith 天生就是后台虚拟屏：拉起后界面瞬息
+        // 即隐，不存在「需要退后台」的问题。出帧后再执行 GO_HOME/BRING_APP_BACK 只是
+        // 多一次 moveTaskToBack 往返 + 750ms 等待，界面上还会闪一下——直接跳过。
+        //（用户手点「启动并退后台」时若人正看着界面，可以自己按 Home；这里不做多余动作。）
+        if (isDirectCarWithEntry) {
+            SessionController.appendLog(
+                "CARLIFE-AUTO: ✓ $targetName 已接管出帧（直连入口天然后台，无需退后台动作）",
+            )
+            return
+        }
         if (action == ReturnAction.NONE) {
             SessionController.appendLog("CARLIFE-AUTO: ✓ $targetName 已接管出帧（按设置保持当前界面）")
             return

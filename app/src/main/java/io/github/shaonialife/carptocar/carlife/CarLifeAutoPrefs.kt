@@ -20,7 +20,7 @@ object CarLifeAutoPrefs {
         val key: String,
         val label: String,
     ) {
-        AUTO("auto", "自动（优先百度 CarLife+）"),
+        AUTO("auto", "自动（小米机优先 CarWith，其它优先百度 CarLife+）"),
         XIAOMI_CARWITH("xiaomi_carwith", "小米 CarWith"),
         BAIDU_CARLIFE("baidu_carlife", "百度 CarLife+"),
         XIAOMI_CARLIFE_COMPONENT("xiaomi_carlife_component", "小米 CarLife+ 组件"),

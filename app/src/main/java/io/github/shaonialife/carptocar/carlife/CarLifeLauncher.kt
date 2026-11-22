@@ -1,6 +1,7 @@
 package io.github.shaonialife.carptocar.carlife
 
 import android.app.ActivityManager
+import android.os.Build
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -100,6 +101,18 @@ object CarLifeLauncher {
             ActivityManager.getMyMemoryState(info)
             info.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
         }.getOrDefault(true)
+
+    /**
+     * 本机是否小米/红米（MIUI/HyperOS）。
+     *
+     * 用于「自动」目标的机型分派：小米机的 CarWith 走**公开直连入口**
+     * （`CarlifeAdbActivity`，拉起即建虚拟屏、退到后台照常出帧——它本来就是设计成
+     * 无界面后台服务），因此小米机把 CarWith 排在百度 CarLife+ 前面；非小米机没有
+     * CarWith，维持原「优先百度 CarLife+」逻辑。
+     */
+    fun isXiaomiDevice(): Boolean =
+        Build.MANUFACTURER.equals("Xiaomi", ignoreCase = true) ||
+            Build.MANUFACTURER.equals("Redmi", ignoreCase = true)
 
     /** 探测本机已安装且可合法调起的 CarWith / CarLife 应用列表（按推荐顺序）。 */
     fun detectInstalled(context: Context): List<DetectedApp> {
@@ -217,10 +230,19 @@ object CarLifeLauncher {
     fun resolvePreferred(
         installed: List<DetectedApp>,
         preference: CarLifeAutoPrefs.LaunchTarget,
+        /** 单测注入：生产路径取默认（[isXiaomiDevice] 真实机型判定）。 */
+        xiaomiDevice: Boolean = isXiaomiDevice(),
     ): DetectedApp? {
         if (installed.isEmpty()) return null
         if (preference == CarLifeAutoPrefs.LaunchTarget.AUTO) {
-            return installed.first()
+            // 机型分派：小米/红米优先 CarWith（直连入口、天然后台），其余维持原
+            // 「detectInstalled 的推荐序」（CarWith 直连 > 百度 CarLife+ > …）。
+            return if (xiaomiDevice) {
+                installed.firstOrNull { it.target == CarLifeAutoPrefs.LaunchTarget.XIAOMI_CARWITH }
+                    ?: installed.first()
+            } else {
+                installed.first()
+            }
         }
         return installed.firstOrNull { it.target == preference } ?: installed.first()
     }
