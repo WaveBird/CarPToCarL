@@ -21,7 +21,9 @@ plugins {
  * 下面那段 `require` 就是这条规则的执行者：撞号时**构建立刻失败**，而不是等到
  * 发完版才发现号码犯忌。
  */
-val appVersionName = "1.2.76"
+// 旁支版本号：本条分支基于 27938d7（1.2.76）只并入导航 Opus 更新，不带上游 1.2.80+；
+// 号码取 1.2.90 是为了高于手机上已装的 1.2.85（否则 adb install 会判定降级）。
+val appVersionName = "1.2.90"
 require(!appVersionName.replace(".", "").contains("44")) {
     // 前面留一段 ASCII 前缀：Gradle 控制台按 GBK 输出时中文会成乱码，前缀至少能被人认出来。
     "[version] $appVersionName contains repeated 4 (44/444/4.4/4.44) —— " +

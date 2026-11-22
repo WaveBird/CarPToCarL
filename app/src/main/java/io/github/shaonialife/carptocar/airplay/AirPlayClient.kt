@@ -2569,6 +2569,13 @@ class AirPlayClient(
         /** AAC-LC 44100Hz 立体声（1<<22；catplay `AAC_LC_44100_STEREO`）。 */
         const val AUDIO_FORMAT_AAC_LC_44K_STEREO = 1L shl 22
 
+        /**
+         * Opus 48kHz（bit30, 0x40000000）——宝马 MGU 全系 alert/default/telephony
+         * 档的**唯一**声明位（2026-11-22 /info 实测六档全带 bit30，无任何 PCM/AAC 位）。
+         * ct=32（AirPlay 压缩类型表）。帧长 20ms（960 样本@48k）。
+         */
+        const val AUDIO_FORMAT_OPUS_48K = 1L shl 30
+
         /** AAC-LC 48000Hz 立体声（1<<23；catplay `AAC_LC_48000_STEREO`）。 */
         const val AUDIO_FORMAT_AAC_48K_STEREO = 1L shl 23
 
@@ -2617,6 +2624,7 @@ class AirPlayClient(
             when (codec) {
                 AudioCodec.PCM -> 1L
                 AudioCodec.AAC_LC -> 4L
+                AudioCodec.OPUS -> 32L
             }
 
         /** 车机音量 ≤ 这个值（dB）视为静音位（AirPlay 里 -144 约等于全静音）。 */
@@ -3241,6 +3249,10 @@ class AirPlayClient(
         // 排太靠后会让 44.1k 立体声先命中（多一次重采样，甚至位图里根本没有）。
         val ordered =
             listOf(
+                // Opus bit30 排最前:宝马 MGU 全系 alert/default/telephony 只声明这一位,
+                // 排后面等于永远轮不到(2026-11-22 实测六档全无 PCM/AAC 位)。其他车机
+                // 没声明 bit30 时自然跳过,不影响既有候选序。
+                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_OPUS_48K,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_STEREO,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_MONO,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_STEREO,
@@ -3274,6 +3286,7 @@ class AirPlayClient(
         val (streamType, bit) = hit
         val (rate, codec, channels) =
             when (bit) {
+                AUDIO_FORMAT_OPUS_48K -> Triple(48_000, AudioCodec.OPUS, 1)
                 AUDIO_FORMAT_PCM_48K_STEREO -> Triple(48_000, AudioCodec.PCM, 2)
                 AUDIO_FORMAT_PCM_48K_MONO -> Triple(48_000, AudioCodec.PCM, 1)
                 AUDIO_FORMAT_PCM_44K_STEREO -> Triple(44_100, AudioCodec.PCM, 2)
