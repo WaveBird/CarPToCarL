@@ -122,6 +122,7 @@ internal class CarPlayResourceStreams(
     }
 
     private fun applyScreen() {
+        val fromCarUiNow = screenRequestFromCarUi
         var published = false
         if (screenRequested && !client.phoneOwnsScreen) {
             // 实验开关打开时「尊重借用」：车机说有人在借（转向影像/倒车）就不去抢。
@@ -132,6 +133,17 @@ internal class CarPlayResourceStreams(
         }
         screenRequested = false
         screenRequestFromCarUi = false
+        // requestUI 跳变（我们 11-14 实车验证 + 上游 MGU-50-J P4 同一结论）：
+        // 车机发 requestUI 时若主屏已在本机手里，它的 HMI 等的是一次真实的
+        // 「让出(entity=2) → 拿回(entity=1)」归属跳变——只补关键帧车机切不进
+        // CarPlay 界面（2026-11-22 15:49 实测：合并时误删此分支后 18 次 requestUI
+        // 全部无跳变，车机停在原车界面）。顺序刻意不重发 RECORD：这台车对
+        // 重复 RECORD 过敏（补发后 1.79~2.03s 拆链）。
+        if (fromCarUiNow && client.phoneOwnsScreen) {
+            client.retakeScreenForUiRequest()
+            sender?.requestKeyFrame()
+            log("MODE: requestUI 且主屏在本机——已执行让出再拿回跳变 + 补关键帧")
+        }
         val owned = client.phoneOwnsScreen
         val warmAlive = screenStreaming && sender?.isRunning == true
         if (owned && warmAlive) {
