@@ -483,6 +483,10 @@ object SessionController {
         installAppStateBridge()
         installProtocolModules()
         startMediaWatchdog()
+        // 音频自愈(上游 1.2.77 c7979be,合并审计 D 项孤儿代码回接):
+        // 流被 stop 后自动重建,退避 1/2/3/4/5min 上限 5 次;
+        // 与 rebuildAudioChannel 拆流兜底天然互斥(看门狗治"流死了",兜底治"流活着撞 400")。
+        startAudioSelfHealWatchdog()
         // 监听器没被系统绑上时的兜底（荣耀常态）：自己枚举会话，
         // 媒体键直投不再依赖「服务是否被绑上」。
         MediaSessionFallback.start(context.applicationContext, ::appendLog)
@@ -509,6 +513,104 @@ object SessionController {
      * Shizuku 后就永久坏掉。这里改用系统公开 API `requestRebind()`，无需任何权限。
      * 连上后拉长到 60s 只看不动，避免无意义调用。
      */
+    // ---- 音频自愈看门狗(上游 1.2.77 c7979be 回接;原实现经我们 rebuildAudioChannel) ----
+
+    @Volatile
+    private var audioSelfHealStarted = false
+
+    /** 流死满 3 秒才动手(短期抖动不折腾)。 */
+    private const val AUDIO_HEAL_DEAD_MS = 3_000L
+
+    /** 退避上限:5 次仍失败就放弃,等下一轮会话。 */
+    private const val AUDIO_HEAL_MAX_ATTEMPTS = 5
+
+    /** 看门狗节拍(5s)。 */
+    private const val AUDIO_HEAL_TICK_MS = 5_000L
+
+    @Volatile private var audioHealAttempts = 0
+    @Volatile private var audioHealNextAt = 0L
+    @Volatile private var audioHealGaveUp = false
+    @Volatile private var audioHealLastDropSeen = 0
+    @Volatile private var audioDeadSinceAt = 0L
+
+    private fun startAudioSelfHealWatchdog() {
+        if (audioSelfHealStarted) return
+        audioSelfHealStarted = true
+        Thread({
+            while (true) {
+                try {
+                    Thread.sleep(AUDIO_HEAL_TICK_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                runCatching { audioSelfHealTick() }
+                    .onFailure { appendLog("AUDIO: 音频自愈看门狗异常 - ${it.message}") }
+            }
+        }, "audio-self-heal").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun audioSelfHealTick() {
+        val sender = audioSender
+        // 音频在推 = 一切正常:账本清零
+        if (sender != null && sender.isRunning) {
+            if (audioHealAttempts > 0 || audioHealGaveUp) {
+                appendLog("AUDIO: 音频流已恢复运行——自愈计账清零(此前尝试 $audioHealAttempts 次)")
+            }
+            audioHealAttempts = 0
+            audioHealGaveUp = false
+            audioHealNextAt = 0L
+            audioDeadSinceAt = 0L
+            audioHealLastDropSeen = 0
+            CarLifeHijack.resetAudioDeadDrops()
+            return
+        }
+        // 本轮还没建过音频流(没要声音/尚未协商出档位):不折腾
+        if (sender == null) return
+        val client = currentClient
+        if (client == null || client.cancelled || !client.controlSessionAlive) return
+        // 通话中音频由 callWatcher 换档管理,别在这里抢
+        if (audioInCallMode) return
+
+        val now = android.os.SystemClock.uptimeMillis()
+        val drops = CarLifeHijack.audioDeadDrops
+        if (drops == audioHealLastDropSeen) {
+            // 这一拍没有任何新丢弃:引擎停了(用户暂停)或已不在推 → 连续窗口断开
+            audioDeadSinceAt = 0L
+            return
+        }
+        audioHealLastDropSeen = drops
+        if (audioDeadSinceAt == 0L) audioDeadSinceAt = now
+        if (now - audioDeadSinceAt < AUDIO_HEAL_DEAD_MS) return
+        if (!client.phoneOwnsAudio) return
+        if (now < audioHealNextAt) return
+        if (audioHealAttempts >= AUDIO_HEAL_MAX_ATTEMPTS) {
+            if (!audioHealGaveUp) {
+                audioHealGaveUp = true
+                appendLog(
+                    "AUDIO: 音频自愈放弃(已试 $audioHealAttempts 次)——等下一轮会话;语音键三连击仍可手动触发拆流兜底",
+                )
+            }
+            return
+        }
+        audioHealAttempts++
+        audioHealNextAt =
+            now + (audioHealAttempts * 60_000L).coerceAtMost(300_000L) // 1/2/3/4/5 分钟退避
+        appendLog(
+            "AUDIO: 音频自愈第 $audioHealAttempts 次(流已死 ${now - audioDeadSinceAt}ms、丢弃 $drops 包)——重建音频流",
+        )
+        val rebuilt = rebuildAudioChannel("音频自愈(第 $audioHealAttempts 次)", allowTeardownFallback = false)
+        if (rebuilt) {
+            audioHealLastDropSeen = 0
+            CarLifeHijack.resetAudioDeadDrops()
+            appendLog("AUDIO: ✓ 音频自愈成功——声音应已恢复")
+        } else {
+            appendLog("AUDIO: 音频自愈本次没成功——${audioHealNextAt - now}ms 后再试")
+        }
+    }
+
     private fun startMediaWatchdog() {
         if (mediaWatchdogStarted) return
         mediaWatchdogStarted = true
