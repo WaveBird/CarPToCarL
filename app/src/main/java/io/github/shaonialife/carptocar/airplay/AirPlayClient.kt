@@ -6,6 +6,7 @@ import io.github.shaonialife.carptocar.audio.AudioCodec
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
 import io.github.shaonialife.carptocar.audio.AudioSender
+import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.audio.AudioTuning
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.CarPlayUplinkHealth
@@ -3242,29 +3243,32 @@ class AirPlayClient(
      * 是 AAC-ELD，我们没有那个编码器，所以「照 iPhone 用 AAC」在这里不成立。
      * 位图里没有 PCM 才退到 AAC-LC。
      */
-    fun audioProfileForType(audioType: String): AudioProfile? {
+    /**
+     * 指定 audioType 的**全部候选变体**，按优先序返回（空表 = 车机没声明该档）。
+     *
+     * 为什么是多变体而不是单档（2026-11-22 宝马 MGU-55-J）：bit30（Opus）位图里
+     * **没写采样率/声道数**——车机只声明「这条通路吃 Opus」，到底要 16k 直编还是
+     * 48k 重采样、单声道还是立体声，/info 不给答案，只有 SETUP/出声结果能定。
+     * 所以同一 bit30 生成多个变体逐个试：被拒自动切下一个，成功变体写进车机记忆，
+     * 下次直用。其他格式位（PCM/AAC 位图自带采样率语义）保持单变体不变。
+     */
+    fun audioProfileVariantsForType(audioType: String): List<AudioProfile> {
         val wanted = audioType.trim().lowercase()
-        if (wanted.isEmpty()) return null
+        if (wanted.isEmpty()) return emptyList()
         val info =
             negotiatedInfo ?: run {
                 log("AIRPLAY: 未拿到 /info，无法确认 audioType=$wanted 档 —— 不建独立流")
-                return null
+                return emptyList()
             }
         val declared =
             (info["audioFormats"] as? List<*>)
                 ?.mapNotNull { it as? Map<*, *> }
                 .orEmpty()
-        // 顺序即优先级：101 AltAudio 全组合（PCM 48k/44.1k × 立体声/单声道 → AAC-LC），
-        // 再退到 100 MainAudio 的同名档——车机只在 100 上声明 default 时也能出声，
-        // 但仍然是独立流，不进媒体那一条。
-        //
-        // **单声道必须排在对应立体声之后但同率之前**：奥迪 101/default 只有 mono 位，
-        // 排太靠后会让 44.1k 立体声先命中（多一次重采样，甚至位图里根本没有）。
+        if (declared.isEmpty()) return emptyList()
+
+        // 与 audioProfileForType 相同的命中逻辑，但命中的是 (streamType, bit) 组合
         val ordered =
             listOf(
-                // Opus bit30 排最前:宝马 MGU 全系 alert/default/telephony 只声明这一位,
-                // 排后面等于永远轮不到(2026-11-22 实测六档全无 PCM/AAC 位)。其他车机
-                // 没声明 bit30 时自然跳过,不影响既有候选序。
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_OPUS_48K,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_STEREO,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_MONO,
@@ -3279,57 +3283,86 @@ class AirPlayClient(
                 AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_48K_STEREO,
                 AUDIO_STREAM_TYPE to AUDIO_FORMAT_AAC_LC_44K_STEREO,
             )
-        val hit = pickDeclaredFormat(declared, wanted, ordered)
-        if (hit == null) {
-            val declaredTypes = declared.mapNotNull { (it["audioType"] as? String)?.lowercase() }.distinct()
-            if (wanted in declaredTypes) {
-                log(
-                    "AIRPLAY: audioType=$wanted 档已声明，但位图里没有可用的 PCM 48k/44.1k 或 AAC-LC" +
-                        "（该档 type/output=" +
-                        declared
-                            .filter { (it["audioType"] as? String)?.lowercase() == wanted }
-                            .mapNotNull { (it["type"] as? Number)?.toLong() to (it["audioOutputFormats"] as? Number)?.toLong() } +
-                        "）—— 不建独立流",
-                )
-            } else {
-                log("AIRPLAY: 车机 /info 未声明 audioType=$wanted 档（已声明=$declaredTypes）—— 不建独立流")
-            }
-            return null
+        // 逐 (type,bit) 组合找所有命中位（同一 audioType 可能多档声明）
+        val hits = mutableListOf<Pair<Long, Long>>()
+        for ((streamType, bit) in ordered) {
+            val channels =
+                declared.any {
+                    ((it["type"] as? Number)?.toLong() == streamType) &&
+                        ((it["audioType"] as? String)?.lowercase() == wanted) &&
+                        (((it["audioOutputFormats"] as? Number)?.toLong() ?: 0L) and bit) != 0L
+                }
+            if (channels) hits += streamType to bit
         }
-        val (streamType, bit) = hit
-        val (rate, codec, channels) =
+        if (hits.isEmpty()) return emptyList()
+
+        val latency = { st: Long -> latencyFor(info, wanted, st) }
+        val variants = mutableListOf<AudioProfile>()
+        for ((streamType, bit) in hits) {
             when (bit) {
-                AUDIO_FORMAT_OPUS_48K -> Triple(48_000, AudioCodec.OPUS, 1)
-                AUDIO_FORMAT_PCM_48K_STEREO -> Triple(48_000, AudioCodec.PCM, 2)
-                AUDIO_FORMAT_PCM_48K_MONO -> Triple(48_000, AudioCodec.PCM, 1)
-                AUDIO_FORMAT_PCM_44K_STEREO -> Triple(44_100, AudioCodec.PCM, 2)
-                AUDIO_FORMAT_PCM_44K_MONO -> Triple(44_100, AudioCodec.PCM, 1)
-                AUDIO_FORMAT_AAC_48K_STEREO -> Triple(48_000, AudioCodec.AAC_LC, 2)
-                else -> Triple(44_100, AudioCodec.AAC_LC, 2)
+                AUDIO_FORMAT_OPUS_48K -> {
+                    // 变体 1：16kHz 直编（TTS 源即 16k，零重采样；RTP 时间轴 16k）。
+                    // 仅当设备 MediaCodec 真支持 16k Opus 编码才列入——多数 c2 编码器
+                    // 只配 48k,探测不到就剔除,免得 SETUP 成功后编码器立不起来。
+                    if (OpusEncoder.supportsSampleRate(16_000)) {
+                        variants +=
+                        AudioProfile(
+                            audioType = wanted,
+                            formatBit = bit,
+                            sampleRate = 16_000,
+                            latencyMs = latency(streamType),
+                            streamType = streamType,
+                            codec = AudioCodec.OPUS,
+                            channels = 1,
+                        )
+                    }
+                    // 变体 2：48kHz 重采样（MediaCodec audio/opus 原生采样率，
+                    // 编码器零配置直吃；RTP 时间轴 48k）——若变体 1 被拒，这条是主路径
+                    variants +=
+                        AudioProfile(
+                            audioType = wanted,
+                            formatBit = bit,
+                            sampleRate = 48_000,
+                            latencyMs = latency(streamType),
+                            streamType = streamType,
+                            codec = AudioCodec.OPUS,
+                            channels = 1,
+                        )
+                    // 变体 3：48kHz 立体声（若车机 Opus 链只认立体声帧——个别实现
+                    // 单声道输入按双声道拷贝；最后一级兜底）
+                    variants +=
+                        AudioProfile(
+                            audioType = wanted,
+                            formatBit = bit,
+                            sampleRate = 48_000,
+                            latencyMs = latency(streamType),
+                            streamType = streamType,
+                            codec = AudioCodec.OPUS,
+                            channels = 2,
+                        )
+                }
+                AUDIO_FORMAT_PCM_48K_STEREO ->
+                    variants += AudioProfile(wanted, bit, 48_000, latency(streamType), streamType, AudioCodec.PCM, channels = 2)
+                AUDIO_FORMAT_PCM_48K_MONO ->
+                    variants += AudioProfile(wanted, bit, 48_000, latency(streamType), streamType, AudioCodec.PCM, channels = 1)
+                AUDIO_FORMAT_PCM_44K_STEREO ->
+                    variants += AudioProfile(wanted, bit, 44_100, latency(streamType), streamType, AudioCodec.PCM, channels = 2)
+                AUDIO_FORMAT_PCM_44K_MONO ->
+                    variants += AudioProfile(wanted, bit, 44_100, latency(streamType), streamType, AudioCodec.PCM, channels = 1)
+                AUDIO_FORMAT_AAC_48K_STEREO ->
+                    variants += AudioProfile(wanted, bit, 48_000, latency(streamType), streamType, AudioCodec.AAC_LC, channels = 2)
+                AUDIO_FORMAT_AAC_LC_44K_STEREO ->
+                    variants += AudioProfile(wanted, bit, 44_100, latency(streamType), streamType, AudioCodec.AAC_LC, channels = 2)
             }
-        val channel =
-            declared.firstOrNull {
-                ((it["type"] as? Number)?.toLong()) == streamType &&
-                    (it["audioType"] as? String)?.lowercase() == wanted
-            }
-        val profile =
-            AudioProfile(
-                audioType = wanted,
-                formatBit = bit,
-                sampleRate = rate,
-                latencyMs = latencyFor(info, wanted, streamType),
-                streamType = streamType,
-                codec = codec,
-                // 单声道档（奥迪 101/default 的 bit14/bit10）必须原样告诉发送端：
-                // 立体声负载推到单声道档上会被解成噪声或直接不出声。
-                channels = channels,
-                // 输入位图照原样带出仅供诊断：麦克风端口**绝不**挂这条流
-                // （输入端口只属于 media 档，挂错会让车机关通道甚至重启整机）
-                inputFormats = (channel?.get("audioInputFormats") as? Number)?.toLong(),
-            )
-        log("AIRPLAY: audioType=$wanted 档可用 → ${profile.label}")
-        return profile
+        }
+        log("AIRPLAY: audioType=$wanted 候选变体=${variants.map { it.label }}")
+        return variants
     }
+
+    /** [audioProfileVariantsForType] 的单档便捷版（首个命中；老调用方语义不变）。 */
+    fun audioProfileForType(audioType: String): AudioProfile? = audioProfileVariantsForType(audioType).firstOrNull()
+
+    /** [audioProfileVariantsForType] 的单档便捷版（首个命中；老调用方语义不变）。 */
 
     /**
      * **通话音频**档位候选（`audioType=telephony`，2026-10-29 适配）。

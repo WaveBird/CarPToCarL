@@ -98,7 +98,13 @@ data class AudioProfile(
      * 加后缀等于把整份历史作废。上行档才追加 `|in` 区分。
      */
     val key: String
-        get() = "$streamType|${audioType.lowercase()}|$formatBit|${codec.name}" + if (isInput) "|in" else ""
+        get() = buildString {
+            append("$streamType|${audioType.lowercase()}|$formatBit|${codec.name}")
+            // Opus 变体（16k/48k mono、48k stereo）共用 bit30:车机记忆必须按
+            // 变体区分,否则成功变体的记忆会被下一个被拒变体覆盖。
+            if (codec == AudioCodec.OPUS) append("|${sampleRate}x$channels")
+            if (isInput) append("|in")
+        }
 
     /** 日志用短标签（上行带 ↑ 前缀，一眼区分收发方向）。 */
     val label: String

@@ -37,6 +37,28 @@ class OpusEncoder(
         /** Opus 20ms 帧长（每声道样本数 @48kHz）。 */
         const val FRAME_SAMPLES_PER_CHANNEL = 960
 
+        /**
+         * 设备上的 MediaCodec 是否支持**指定采样率**的 Opus 编码。
+         *
+         * 大多数 c2.android.opus.encoder 只配 48k；16k 直编变体是否可行逐设备探测——
+         * 探测不到就把 16k 变体从候选表剔除，免得 SETUP 成功后编码器立不起来，
+         * 整条导航流反而死在"SETUP 已过、无法回退"的死角。
+         */
+        fun supportsSampleRate(sampleRate: Int): Boolean =
+            runCatching {
+                val format =
+                    MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, sampleRate, 1)
+                val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+                try {
+                    encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    true
+                } catch (_: Exception) {
+                    false
+                } finally {
+                    runCatching { encoder.release() }
+                }
+            }.getOrDefault(false)
+
         /** 编码器输入/输出超时（微秒），与 AacLcEncoder 同一量级。 */
         private const val TIMEOUT_US = 10_000L
     }
