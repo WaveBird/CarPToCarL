@@ -2,10 +2,12 @@ package io.github.shaonialife.carptocar.bt
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
@@ -378,12 +380,64 @@ class Iap2BluetoothClient(
                     "（未指定目标：依次尝试全部候选设备，可在「连接准备」中指定）"
                 },
         )
+        ensureDiscoverableWindow(target)
         Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
             isDaemon = true
             thread = this
             start()
         }
         return true
+    }
+
+    /**
+     * 确保本机处于「可被发现」窗口（首次配对的前提，mcarplay 竞品对照结论）。
+     *
+     * ## 为什么需要它
+     *
+     * 2026-11-22 小米 17PM 实测：平时适配器是 `SCAN_MODE_CONNECTABLE`——**只可连接、
+     * 不可被发现**，车机在自己的蓝牙列表里扫不到本机；只有打开系统蓝牙设置页（系统
+     * 自动临时置为可发现）或发 `REQUEST_DISCOVERABLE` 弹窗确认后，才会翻成
+     * `SCAN_MODE_CONNECTABLE_DISCOVERABLE`。「到蓝牙设置页才能被搜到」正是这个原因。
+     *
+     * 竞品 BOX OFF 的做法（见 mcarplay `CARWITH-ENTRY-FINDINGS.md` §蓝牙公告，2026-11-16
+     * 静态分析）：无指定目标、开始等待前发 `REQUEST_DISCOVERABLE` 300 秒；已处于可发现
+     * （`getScanMode()==23`）时**复用现有窗口、不重复弹窗**。这里照抄同一套判据：
+     *
+     *  - 已可发现 → 什么都不做（用户可能刚从设置页出来，再弹一次系统弹窗就是打扰）；
+     *  - 不可发现 → 发一次系统弹窗（120s，够首配；弹窗被拒/忽略不影响本流程——
+     *    已配对车机「回连手机」只需要 CONNECTABLE，本方法只是给首配补一条路）；
+     *  - 无指定目标（首次配对概率最高）或已有目标但尚未配对成功，都请求；弹窗本身
+     *    需要用户在屏幕上点一下，属于用户可见操作，不打断后台自动重连的节奏。
+     */
+    @SuppressLint("MissingPermission")
+    private fun ensureDiscoverableWindow(target: TargetDevicePrefs.Target?) {
+        val adapter =
+            runCatching { context.getSystemService(BluetoothManager::class.java)?.adapter }.getOrNull()
+            ?: return
+        val scanMode =
+            runCatching { adapter.scanMode }.getOrDefault(BluetoothAdapter.SCAN_MODE_NONE)
+        if (scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
+            log("BT-C: 本机已可被发现（scanMode=23）——复用现有窗口，不再请求")
+            return
+        }
+        val bondedExists =
+            target != null &&
+                runCatching {
+                    adapter.bondedDevices.any { TargetDevicePrefs.matches(target, it.address) }
+                }.getOrDefault(false)
+        if (target != null && bondedExists) {
+            // 已配对目标在场：车机走「回连」路径，CONNECTABLE 就够，不弹窗打扰。
+            return
+        }
+        runCatching {
+            context.startActivity(
+                Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+            log("BT-C: 已请求可被发现窗口（系统弹窗 120s）——首次配对请在车机列表里选中本机")
+        }.onFailure { error ->
+            log("BT-C: 可发现窗口请求失败（${error.javaClass.simpleName}）——已配对回连不受影响")
+        }
     }
 
     @SuppressLint("MissingPermission")
