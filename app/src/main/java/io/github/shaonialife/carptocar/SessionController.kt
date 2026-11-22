@@ -2333,6 +2333,11 @@ object SessionController {
             try {
                 if (ctx == null) return@Thread
                 val appCtx = ctx.applicationContext
+                // 守卫启动时刻的 RFCOMM 连入计数快照:之后计数变大 = 本轮车机连进来了
+                // (上游 1.2.77 的 controlConnected 判据,合并时被丢——16:12 实车守卫
+                // 瞎踢 11 次 HFP/A2DP 到 300s 上限,宝马音频被反复踢后 RFCOMM 建不稳,
+                // 表现成"连连接都连不上")。
+                val connectCountAtStart = BtSessionGate.controlConnectCount
                 val drops =
                     BtProfiles.guardAudioProfiles(
                         appCtx,
@@ -2340,10 +2345,11 @@ object SessionController {
                             BtSessionGate.activePeerAddress
                                 ?: TargetDevicePrefs.get(appCtx)?.address
                         },
-                        shouldStop = { guardStopReason() != null },
+                        shouldStop = { guardStopReason(BtSessionGate.controlConnectCount > connectCountAtStart) != null },
                         onEvent = { line -> appendLog(line) },
-                        stopLabel = { guardStopReason() ?: "会话状态已变化" },
+                        stopLabel = { guardStopReason(BtSessionGate.controlConnectCount > connectCountAtStart) ?: "会话状态已变化" },
                         shouldPause = { BtSessionGate.hasActiveControl },
+                        controlConnected = { BtSessionGate.controlConnectCount > connectCountAtStart },
                     )
                 appendLog("BT-GUARD: 守卫线程结束（共断开 $drops 次）")
             } catch (error: Throwable) {
@@ -2360,12 +2366,13 @@ object SessionController {
     /**
      * 音频配置守卫该不该收工、因为哪个条件（`null` = 继续盯）。判定在 [AudioGuardGate]。
      */
-    private fun guardStopReason(): String? =
+    private fun guardStopReason(controlConnected: Boolean = false): String? =
         AudioGuardGate.stopReason(
             sessionWanted = sessionWanted,
             iap2Ready = BtSessionGate.iap2Ready,
             sessionActive = BtSessionGate.sessionActive,
             streaming = isStreaming(),
+            controlConnected = controlConnected,
         )
 
     /**
@@ -4651,18 +4658,23 @@ object SessionController {
         }
         var profile: AudioProfile? = null
         var info: AirPlayClient.AudioStreamInfo? = null
-        for (variant in variants) {
+        // RECORD 敏感窗快速放弃（2026-11-22 审计 F 项根因）：
+        // 1.2.76 对宝马 101/default 是零 SETUP；多变体轮试在这个窗口对一台"对
+        // RECORD 后过敏"的车机最多打出 9s RTSP SETUP 流量，撞车机 6s 控制会话
+        // 就绪超时 → 整轮拆链。所以：
+        //  - 首变体 1.5s 短超时（宝马 400 是 25ms 量级快速拒绝，1.5s 足够判生死）；
+        //  - 任一变体失败即放弃本轮（不试满 3 档）——变体记忆留给下一轮会话，
+        //    那时不占 RECORD 窗口，随便试。
+        for ((index, variant) in variants.withIndex()) {
             val attempt =
                 try {
-                    // 3s 超时：第二条流自己慢不要紧，但它挡住的是后面那次 RECORD——
-                    // 而 RECORD 必须等两条流都 SETUP 完才发（补发 RECORD 会弄死宝马车机）
                     client.runAudioStream(
                         secret,
                         variant,
                         AudioTuning.RAW_SPF,
                         micPort = 0,
                         fixVolume = false,
-                        setupTimeoutMillis = 3_000,
+                        setupTimeoutMillis = if (index == 0) 1_500 else 3_000,
                     )
                 } catch (error: Exception) {
                     appendLog("AUDIO: 导航流 ${variant.label} 协商异常 - ${error.message}")
@@ -4673,7 +4685,11 @@ object SessionController {
                 info = attempt
                 break
             }
-            appendLog("AUDIO: 导航流变体 ${variant.label} SETUP 被拒——自动切下一方案")
+            appendLog(
+                "AUDIO: 导航流变体 ${variant.label} SETUP 被拒——RECORD 敏感窗内不继续盲试，" +
+                    "本轮放弃（成功变体下轮经车机记忆直用）",
+            )
+            break
         }
         val chosen = profile
         val streamInfo = info
