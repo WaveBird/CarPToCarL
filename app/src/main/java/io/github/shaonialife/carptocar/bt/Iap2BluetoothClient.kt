@@ -102,6 +102,14 @@ class Iap2BluetoothClient(
         private const val NUDGE_MAX_WAIT_MILLIS = 10_000L
 
         /**
+         * 可发现窗口时长（秒，随 REQUEST_DISCOVERABLE 下发）。
+         *
+         * 对齐竞品 BOX OFF 的 300s（mcarplay CARWITH-ENTRY-FINDINGS.md）：系统默认 120s
+         * 只覆盖一轮 BT 退避（阶梯 16→60s），车机晚到就错过窗口；300s 覆盖两轮以上。
+         */
+        private const val DISCOVERABLE_WINDOW_SECONDS = 300
+
+        /**
          * 两次「提前重试」的最小间隔。
          *
          * 必须限流：车机可能每 30 秒抖一次 ACL，每次都催就等于把退避阶梯作废，
@@ -150,6 +158,16 @@ class Iap2BluetoothClient(
             .AtomicLong(0)
 
     private val channelLock: Any = this
+
+    /**
+     * 本进程内是否**曾经成功建立过** CarPlay 会话（拿到端点即置位，永不清零）。
+     *
+     * 供 [targetBondedAndEverConnected] 区分「已配对且回连可信」与「bond 在但从未连通
+     * （首配失败后重试，仍需可发现窗口）」。进程重启后回到 false——多弹一次可跳过的
+     * 窗口，换取首配场景不漏，方向是对的。
+     */
+    @Volatile
+    private var sessionEverEstablished: Boolean = false
 
     private fun ownsChannel(channel: Iap2LinkChannel): Boolean =
         activeChannel === channel && BtSessionGate.ownsControl(channel) && !channel.closedLocally
@@ -346,7 +364,16 @@ class Iap2BluetoothClient(
             PackageManager.PERMISSION_GRANTED
 
     @Synchronized
-    fun start(): Boolean {
+    /**
+     * 启动连接循环。
+     *
+     * @param interactiveStart **用户手动「启动连接」= true**（默认）：允许在需要时弹
+     *   「可被发现」系统弹窗——用户正看着屏幕，弹窗是可理解的交互。后台自动恢复
+     *   （解冻重拉、进程重启续链）必须传 **false**：用户多半没在看手机，弹窗要么被
+     *   忽略、要么被 MIUI「后台弹出界面」静默吞掉（mcarplay 2026-10-26 实测），白弹
+     *   一次还可能盖住正在展示的其它界面。
+     */
+    fun start(interactiveStart: Boolean = true): Boolean {
         if (running) return true
         if (!hasPermission()) {
             log("BT-C: 缺少 BLUETOOTH_CONNECT 权限")
@@ -380,7 +407,7 @@ class Iap2BluetoothClient(
                     "（未指定目标：依次尝试全部候选设备，可在「连接准备」中指定）"
                 },
         )
-        ensureDiscoverableWindow(target)
+        ensureDiscoverableWindow(target, allowSystemDialog = interactiveStart)
         Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
             isDaemon = true
             thread = this
@@ -401,16 +428,22 @@ class Iap2BluetoothClient(
      *
      * 竞品 BOX OFF 的做法（见 mcarplay `CARWITH-ENTRY-FINDINGS.md` §蓝牙公告，2026-11-16
      * 静态分析）：无指定目标、开始等待前发 `REQUEST_DISCOVERABLE` 300 秒；已处于可发现
-     * （`getScanMode()==23`）时**复用现有窗口、不重复弹窗**。这里照抄同一套判据：
+     * （`getScanMode()==23`）时**复用现有窗口、不重复弹窗**。这里照抄同一套判据，外加
+     * 两条自己的边界：
      *
-     *  - 已可发现 → 什么都不做（用户可能刚从设置页出来，再弹一次系统弹窗就是打扰）；
-     *  - 不可发现 → 发一次系统弹窗（120s，够首配；弹窗被拒/忽略不影响本流程——
-     *    已配对车机「回连手机」只需要 CONNECTABLE，本方法只是给首配补一条路）；
-     *  - 无指定目标（首次配对概率最高）或已有目标但尚未配对成功，都请求；弹窗本身
-     *    需要用户在屏幕上点一下，属于用户可见操作，不打断后台自动重连的节奏。
+     *  - [allowSystemDialog]=false（后台自动恢复）→ 绝不弹窗：已可发现就复用，否则只
+     *    打一行日志提示用户手动点一次「启动连接」才能补上首配窗口；
+     *  - 「已配对」≠「已连通」：bond 存在但从未成功建立过 CarPlay 会话时，车机可能还没
+     *    记住本机的无线 CarPlay 能力（首配失败后重试的常态），仍要给窗口；只有
+     *    「已配对 **且** 曾经成功连上」才走纯回连、免弹窗。
+     *  - 弹窗时长对齐竞品的 300s：系统默认 120s，而 BT 退避阶梯最长 60s×多轮，
+     *    车机晚到就错过窗口——300s 覆盖两轮退避。
      */
     @SuppressLint("MissingPermission")
-    private fun ensureDiscoverableWindow(target: TargetDevicePrefs.Target?) {
+    private fun ensureDiscoverableWindow(
+        target: TargetDevicePrefs.Target?,
+        allowSystemDialog: Boolean,
+    ) {
         val adapter =
             runCatching { context.getSystemService(BluetoothManager::class.java)?.adapter }.getOrNull()
             ?: return
@@ -420,25 +453,49 @@ class Iap2BluetoothClient(
             log("BT-C: 本机已可被发现（scanMode=23）——复用现有窗口，不再请求")
             return
         }
-        val bondedExists =
-            target != null &&
-                runCatching {
-                    adapter.bondedDevices.any { TargetDevicePrefs.matches(target, it.address) }
-                }.getOrDefault(false)
-        if (target != null && bondedExists) {
-            // 已配对目标在场：车机走「回连」路径，CONNECTABLE 就够，不弹窗打扰。
+        if (target != null && targetBondedAndEverConnected(adapter, target)) {
+            // 已配对且曾经连上：车机走「回连」路径，CONNECTABLE 就够，不弹窗打扰。
+            return
+        }
+        if (!allowSystemDialog) {
+            log(
+                "BT-C: 本机当前不可被发现，且本次是后台自动恢复（不弹窗）——" +
+                    "若车机需要重新扫描配对本机，请手动点一次「启动连接」",
+            )
             return
         }
         runCatching {
             context.startActivity(
                 Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                    .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_WINDOW_SECONDS)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
-            log("BT-C: 已请求可被发现窗口（系统弹窗 120s）——首次配对请在车机列表里选中本机")
+            log(
+                "BT-C: 已请求可被发现窗口（系统弹窗 ${DISCOVERABLE_WINDOW_SECONDS}s）——" +
+                    "首次配对请在车机列表里选中本机",
+            )
         }.onFailure { error ->
             log("BT-C: 可发现窗口请求失败（${error.javaClass.simpleName}）——已配对回连不受影响")
         }
     }
+
+    /**
+     * 目标车机是否「已配对 **且** 曾经成功连上」。
+     *
+     * 只查 bond 不够：首配失败的轮次里 bond 可能已建立（系统级配对成功）但 CarPlay
+     * 会话从没跑通过——此时车机侧仍可能不认本机，仍需要可发现窗口让它重新扫描。
+     * 「曾经成功」以 [sessionEverEstablished] 为准（进程内存活；进程重启后回退为
+     * 「只查 bond」——重启后首配窗口多给一次，代价只是一次可跳过的弹窗）。
+     */
+    @SuppressLint("MissingPermission")
+    private fun targetBondedAndEverConnected(
+        adapter: BluetoothAdapter,
+        target: TargetDevicePrefs.Target,
+    ): Boolean =
+        runCatching {
+            val bonded = adapter.bondedDevices.any { TargetDevicePrefs.matches(target, it.address) }
+            bonded && sessionEverEstablished
+        }.getOrDefault(false)
 
     @SuppressLint("MissingPermission")
     private fun connectLoop(myGeneration: Long) {
@@ -913,7 +970,14 @@ class Iap2BluetoothClient(
                 context,
                 SESSION_TIMEOUT_MILLIS,
                 log,
-                onEndpoint = { if (ownsChannel(channel)) onEndpoint(it) },
+                onEndpoint = {
+                    if (ownsChannel(channel)) {
+                        // 首配成功即记下：之后「已配对且曾连上」免弹可发现窗（见
+                        // ensureDiscoverableWindow / targetBondedAndEverConnected）。
+                        sessionEverEstablished = true
+                        onEndpoint(it)
+                    }
+                },
                 onWifiCredentials = { if (ownsChannel(channel)) onWifiCredentials(it) },
                 onEndpointUpdate = { if (ownsChannel(channel)) onEndpointUpdate(it) },
                 nowPlayingProvider = nowPlayingProvider,

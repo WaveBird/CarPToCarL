@@ -2142,7 +2142,10 @@ object SessionController {
     /** 恢复前把蓝牙组件拉起来（已运行则空操作）。真车/测试台两条路径都拉，判断交给组件自身。 */
     private fun restartBluetoothForRecovery() {
         if (bluetoothClient?.isRunning == true && bluetoothServer?.isRunning == true) return
-        runCatching { bluetoothClient?.start() }
+        // interactiveStart=false：后台自动恢复（解冻/进程重启续链）不弹「可发现」系统窗
+        // ——用户多半没在看手机，弹窗会被忽略或被 MIUI 静默吞掉；首配窗口由用户下次
+        // 手动「启动连接」时补上（Iap2BluetoothClient.start 的 interactiveStart 参数）。
+        runCatching { bluetoothClient?.start(interactiveStart = false) }
         runCatching { bluetoothServer?.start() }
         appendLog("PROC: 蓝牙链路已重新拉起（等车机重新下发 0x4301）")
     }
