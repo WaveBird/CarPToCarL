@@ -51,32 +51,62 @@ object CarCanvasMemory {
         return width to height
     }
 
-    /** 上次的车机画布；没有/不合法返回 null（调用方回落到 [DEFAULT]）。 */
-    fun last(context: Context?): Pair<Int, Int>? {
+    /**
+     * 按车机键读取画布；[carKey] 为空/无记录时回落到全局键（兼容 1.2.101 前的旧数据），
+     * 再没有返回 null（调用方回落到 [DEFAULT]）。
+     *
+     * 为什么要按车机分键（1.2.102，2026-11-23 日志 010309 定谳）：画布缓存原先全局单键，
+     * 「AirPlay /info 到达后才写入」+「引擎只在建编码器前认尺寸」两个事实叠加，导致
+     * 缓存未命中的那轮必然按 1280×720 降档编码、断开重连才恢复。按车机分键后，
+     * 同一台车装过一次就永久命中。
+     */
+    fun last(
+        context: Context?,
+        carKey: String? = null,
+    ): Pair<Int, Int>? {
         val app = context?.applicationContext ?: return null
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!carKey.isNullOrBlank()) {
+            val width = prefs.getInt("${KEY_WIDTH}_$carKey", 0)
+            val height = prefs.getInt("${KEY_HEIGHT}_$carKey", 0)
+            sanitize(width, height)?.let { return it }
+        }
         val width = prefs.getInt(KEY_WIDTH, 0)
         val height = prefs.getInt(KEY_HEIGHT, 0)
         return sanitize(width, height)
     }
 
     /**
-     * 记下这台车的画布。值未变或非法时返回 false（调用方可据此避免重复写盘/重复打日志）。
+     * 记下这台车的画布；[carKey] 非空时按车机分键落盘（同时更新全局键兜底旧读路径）。
+     * 值未变或非法时返回 false（调用方可据此避免重复写盘/重复打日志）。
      */
     fun remember(
         context: Context?,
         width: Int,
         height: Int,
+        carKey: String? = null,
     ): Boolean {
         val app = context?.applicationContext ?: return false
         val (w, h) = sanitize(width, height) ?: return false
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (prefs.getInt(KEY_WIDTH, 0) == w && prefs.getInt(KEY_HEIGHT, 0) == h) return false
+        val changed = prefs.getInt(KEY_WIDTH, 0) != w || prefs.getInt(KEY_HEIGHT, 0) != h
         prefs
             .edit()
             .putInt(KEY_WIDTH, w)
             .putInt(KEY_HEIGHT, h)
             .apply()
-        return true
+        if (!carKey.isNullOrBlank()) {
+            if (prefs.getInt("${KEY_WIDTH}_$carKey", 0) == w &&
+                prefs.getInt("${KEY_HEIGHT}_$carKey", 0) == h
+            ) {
+                return changed
+            }
+            prefs
+                .edit()
+                .putInt("${KEY_WIDTH}_$carKey", w)
+                .putInt("${KEY_HEIGHT}_$carKey", h)
+                .apply()
+        }
+        return changed
     }
 }

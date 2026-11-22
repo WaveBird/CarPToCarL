@@ -2,6 +2,7 @@ package io.github.shaonialife.carptocar.carlife
 
 import android.content.Context
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
+import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.input.TouchDomainMapping
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.media.MediaSessionsState
@@ -857,6 +858,10 @@ object CarLifeHijack {
             .putBoolean(KEY_ENABLED, enabled).apply()
     }
 
+    /** 画布缓存按目标车机分键（BT MAC 大写；未指定目标返回 null = 用全局键）。 */
+    private fun carKey(): String? =
+        appContext?.let { TargetDevicePrefs.get(it)?.address?.uppercase() }
+
     /**
      * 开始守候本机 CarLife+（**不拉起任何应用**，也不需要视频会话）。
      *
@@ -873,8 +878,10 @@ object CarLifeHijack {
         logSink = log
         appContext = context.applicationContext
         // 上次连过的车机画布：首轮 98311 就按它申请，引擎才有可能在建编码器时就用对尺寸
-        // （详见 CarCanvasMemory 的说明）。没有缓存 = 首次连这台车，只能先用默认 1280×720。
-        val cachedCanvas = CarCanvasMemory.last(context)
+        // （详见 CarCanvasMemory 的说明）。按目标车机（BT MAC）分键读取，没有则回落全局键，
+        // 都没有 = 首次连这台车，只能先用默认 1280×720（1.2.102：换车不再互相污染缓存，
+        // 同一台车装过一次永久命中，不再出现「本轮降档 1280、断开重连才回 1920」）。
+        val cachedCanvas = CarCanvasMemory.last(context, carKey())
         initialCanvasW = cachedCanvas?.first ?: CarCanvasMemory.DEFAULT.first
         initialCanvasH = cachedCanvas?.second ?: CarCanvasMemory.DEFAULT.second
         log(
@@ -1127,7 +1134,7 @@ object CarLifeHijack {
             portOpenDetected = true
             announcedWait = false
             val preferCarWith = shouldPreferEncryptedCarWith(appContext) && !forcePlaintextNextRound
-            val trustedCanvas = (requestedW > 0 && requestedH > 0) || CarCanvasMemory.last(appContext) != null
+            val trustedCanvas = (requestedW > 0 && requestedH > 0) || CarCanvasMemory.last(appContext, carKey()) != null
             // CarWith 虚拟屏模式下，第三方音乐 App 的 MediaSession playing 状态频繁抖动
             // （2-7 秒一次 true→false），触发 setPlaybackPaused(true) 导致 ~47% PCM 被丢弃，
             // 车机 jitter buffer 被饿空后静音。禁用暂停丢弃：引擎自管理播放状态，宁可偶尔
@@ -1682,7 +1689,7 @@ object CarLifeHijack {
     ) {
         requestedW = width
         requestedH = height
-        if (CarCanvasMemory.remember(appContext, width, height)) {
+        if (CarCanvasMemory.remember(appContext, width, height, carKey())) {
             logSink?.invoke(
                 "CARLIFE: 已记住车机画布 ${width}×${height}（下次开机首轮 98311 就按它申请）" +
                     "——引擎只在建编码器前认这个值：想让当前这轮也生效，" +

@@ -77,6 +77,10 @@ object ConnectionPreflight {
         CARLIFE_SOURCE("本机 CarWith / CarLife 画面源", Severity.WARNING),
         NOTIFICATIONS("通知权限", Severity.INFO),
         NOTIFICATION_ACCESS("通知使用权（媒体会话）", Severity.INFO),
+        CAR_NETWORK(
+            "已连上车机 WiFi（热点/直连）",
+            Severity.WARNING,
+        ),
 
         /**
          * 「显示在其他应用上层」（悬浮窗）——**靠车机自动拉起的唯一命门**（2026-11-21 加）。
@@ -292,6 +296,30 @@ object ConnectionPreflight {
                     .contains(app.packageName)
             }.getOrDefault(false)
 
+        // 车机 WiFi 就绪检查（2026-11-23 用户实测定谳）：**手机必须挂在一张 WiFi 网上**
+        // CarWith 直连才能出帧——引擎在无 WiFi 路由域时协议层静默（端口照开、MD_INFO
+        // 都不发）。这里不要求「必须是车机热点」：挂在家庭 WiFi 上同样满足 CarWith
+        // 的 P2P 前置（其对端是本机），真正连车机热点发生在 BT/iAP2 邀请之后。
+        // 读不到 SSID（缺「附近的设备」/位置权限）时不判失败，只提示无法确认。
+        val carNetworkReady =
+            runCatching {
+                val wm = app.getSystemService(android.net.wifi.WifiManager::class.java)
+                if (wm == null || !wm.isWifiEnabled) {
+                    false
+                } else {
+                    val info = runCatching { wm.connectionInfo }.getOrNull()
+                    val ssid = info?.ssid?.removeSurrounding("\"")
+                    // <unknown ssid> = 系统脱敏（缺位置权限），此时 WiFi enabled + 有 IP
+                    // 即视为就绪，避免权限场景误报。
+                    when {
+                        ssid == null -> false
+                        ssid == "<unknown ssid>" ->
+                            info.ipAddress != 0
+                        else -> info.ipAddress != 0 && ssid != "0x"
+                    }
+                }
+            }.getOrDefault(false)
+
         // 悬浮窗：后台 `startActivity` 的通用豁免（见 [Requirement.OVERLAY]）。
         // 只读查询，不需要任何权限；读失败按「未允许」处理，与 `CarApproachReceiver` 的判据一致。
         val overlayAllowed =
@@ -404,6 +432,19 @@ object ConnectionPreflight {
                             "未授权——车机音乐卡与 0x5001 NowPlaying 拿不到歌名（不影响连接与推流）。" +
                                 "这项**没有系统授权弹窗**（不是运行时权限），只能到「设置 → 通知使用权」" +
                                 "手动打开；本页「一键获取」会直接跳到那一项"
+                        },
+                    ),
+                )
+                add(
+                    Check(
+                        Requirement.CAR_NETWORK,
+                        carNetworkReady,
+                        if (carNetworkReady) {
+                            "✓ 手机已挂在 WiFi 网络上——CarWith 直连的网络前置满足"
+                        } else {
+                            "**手机没有挂在任何 WiFi 网络上**——CarWith 直连引擎在无 WiFi 路由域时" +
+                                "协议层静默（端口照开但不出帧，2026-11-23 实测 + CarWith 官方状态机日志" +
+                                " MSG_WIFI_P2P_CONNECT_FAILURE 定谳）。请先连上任意 WiFi（车机热点或家庭网络均可）"
                         },
                     ),
                 )
