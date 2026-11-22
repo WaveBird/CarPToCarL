@@ -1313,17 +1313,15 @@ object CarLifeHijack {
                             logSink?.invoke("CARLIFE: 已附着七口超过 5s 无视频帧——补请求 CarWith 公开虚拟屏入口")
                             CarLifeLauncher.launchXiaomiCarWithDirect(ctx)
                         } else if (android.os.SystemClock.uptimeMillis() - handshakeAtMs > 10_000L) {
-                            // 第二级（1.2.99，2026-11-23 实车日志 000616 定谳）：温和补请求
-                            // 之后仍零帧 = 编码器卡死（握手成功、端口活着、协议不应答）。
-                            // 「停止→快速再启动」的用户操作节奏会绕过 Coordinator 的守候
-                            // 窗口（出帧即 disarm），必须在这里跟着连接循环本身兜底——
-                            // killBackgroundProcesses 回收 CarWith 进程 + 重新调起，
-                            // 等价用户手动重启。每轮连接最多一次（handshakeAtMs 在本轮
-                            // 结束时归零，下一轮自动重新武装）。
+                            // 第二级（10s）：补请求后仍零帧。归因修正（1.2.101，CarWith
+                            // 官方状态机日志）：快速启停场景多为 WLAN 直连（P2P）未释放完
+                            // 或本次 P2P 失败——killBackgroundProcesses 对 CarWith 前台
+                            // 服务是 no-op，回收无效；如实记录并建议等几秒重试。
                             carWithWakeSent = true
                             logSink?.invoke(
-                                "CARLIFE: 补请求后仍无帧（握手已成功 ≥10s）——CarWith 编码器疑似卡死，" +
-                                    "回收进程并重新调起（等价手动重启）",
+                                "CARLIFE: 补请求后仍无帧（握手已成功 ≥10s）——WLAN 直连（P2P）可能未释放完或已失败" +
+                                    "（CarWith 官方状态机 MSG_WIFI_P2P_CONNECT_FAILURE）——等 3~5s 再试；" +
+                                    "若反复失败请确认 WLAN 开关已打开",
                             )
                             CarLifeLauncher.restartCarWithProcess(ctx)
                         }

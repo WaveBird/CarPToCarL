@@ -85,26 +85,32 @@ object CarLifeLauncher {
     }
 
     /**
-     * 回收 CarWith 进程并重新调起直连入口（等价用户手动「停止再启动」）。
+     * 重新调起 CarWith 直连入口；root 机型先 `su -c am force-stop` 真正回收进程。
      *
-     * 2026-11-22/23 实车定谳（三份日志）：CarWith 编码器初始化偶发卡死时，进程进入
-     * 「7240 照常监听但协议层不响应」的坏状态——重发入口无效（同一个坏进程再应答一次），
-     * 唯一恢复路径是进程冷启动。`killBackgroundProcesses` 是 normal 级权限，无需 root。
+     * 1.2.101 归因修正：`killBackgroundProcesses` 对 CarWith（CarlinkService 是前台
+     * 服务）是 **no-op**（本机 adb 实验：kill 后 pid 不变；`am force-stop` 才有效但
+     * 需系统权限）——1.2.98~1.2.100 的「回收」均未生效。这里改为：
+     *  - 有 root（su 可用）：`su -c am force-stop` 真正回收 → 重新调起 = 干净冷启动；
+     *  - 无 root：只重发入口（对应「P2P 未释放完」场景有效），并在调用方日志里
+     *    如实说明限制。
      *
-     * @return 是否至少发起了「杀进程」动作（重新调起的结果看日志，两者都可能被 ROM 拦）
+     * @return 是否执行了真正的进程回收（root 路径）
      */
     fun restartCarWithProcess(context: Context?): Boolean {
         val ctx = context ?: return false
-        val killed =
+        val killedViaSu =
             runCatching {
-                ctx.getSystemService(ActivityManager::class.java)
-                    ?.killBackgroundProcesses(CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH)
-                true
+                val result =
+                    io.github.shaonialife.carptocar.util.SysShell.exec(
+                        "su -c am force-stop ${CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH}",
+                        timeoutMs = 4_000,
+                    )
+                result.ok
             }.getOrDefault(false)
-        // 给系统一点落账时间，否则紧跟的 startActivity 可能命中尚未清完的旧进程状态
-        Thread.sleep(300)
+        // 给系统落账时间，否则紧跟的 startActivity 可能命中尚未清完的旧进程状态
+        Thread.sleep(if (killedViaSu) 500 else 300)
         launchXiaomiCarWithDirect(ctx)
-        return killed
+        return killedViaSu
     }
 
     /**

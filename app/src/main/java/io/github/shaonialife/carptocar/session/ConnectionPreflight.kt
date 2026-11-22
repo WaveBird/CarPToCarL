@@ -324,7 +324,16 @@ object ConnectionPreflight {
                     Check(
                         Requirement.WIFI_ENABLED,
                         wifiEnabled,
-                        if (wifiEnabled) null else "已关闭——AirPlay 走 WiFi，视频/音频都发不出去",
+                        // 2026-11-23 CarWith 官方状态机日志定谳：直连入口走 WirelessSM 的
+                        // WiFi P2P（WLAN 直连）通道，WiFi 关闭时 P2P 必然失败
+                        // （MSG_WIFI_P2P_CONNECT_FAILURE → MSG_CASTCONTROLLER_CAST_FAILURE，
+                        // 引擎协议层静默）。文案覆盖两条路径的影响面。
+                        if (wifiEnabled) {
+                            null
+                        } else {
+                            "已关闭——CarWith 直连走 WLAN 直连（P2P）会直接失败；AirPlay 也发不出去。" +
+                                "无需连接任何热点，只要把 WLAN 开关打开"
+                        },
                     ),
                 )
                 add(

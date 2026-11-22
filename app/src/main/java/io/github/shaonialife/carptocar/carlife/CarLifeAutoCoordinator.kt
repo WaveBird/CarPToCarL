@@ -163,18 +163,14 @@ object CarLifeAutoCoordinator {
                     }
                 if (CarLifeHijack.handshakeSeen && !CarLifeHijack.isZeroFrameStalled) return
 
-                // 2026-11-22 夜间实车日志定谳（235301 失败 vs 235939 成功）：坏状态下
-                // CarWith「应答了端口却不应答协议」——7240 TCP 能连上但瞬间被关闭，
-                // 版本协商无应答。此时**重发入口无效**（同一个坏进程再应答一次而已，
-                // 日志里重发 3 次全灭），唯一有效的是让进程冷启动（成功轮=间隔数分钟后
-                // 进程被系统回收，下一次 startActivity 才正常）。所以这里升级为：
-                // force-stop CarWith → 重新调起，等价于用户手动「停止再启动」。
-                val killed =
-                    runCatching {
-                        val am = app.getSystemService(android.app.ActivityManager::class.java)
-                        am?.killBackgroundProcesses(CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH)
-                        true
-                    }.getOrDefault(false)
+                // 归因修正（1.2.101，CarWith 官方状态机日志定谳）：零握手/零帧的真实
+                // 原因是 WirelessSM 的 WiFi P2P（WLAN 直连）连接失败——
+                // MSG_WIFI_P2P_CONNECT_FAILURE → MSG_CASTCONTROLLER_CAST_FAILURE，
+                // 协议静默只是下游表现；快速启停时 P2P 未释放完也会失败。
+                // killBackgroundProcesses 对 CarWith（前台服务）是 no-op（本机 adb
+                // 实验：kill 后 pid 不变；am force-stop 才有效但需系统权限）——
+                // 1.2.98~1.2.100 的「已强制回收」均为假成功，这里不再假装 kill，
+                // 只重发入口并给出真实归因与可行动建议。
                 val startOk =
                     runCatching {
                         val intent =
@@ -190,18 +186,30 @@ object CarLifeAutoCoordinator {
                         true
                     }.getOrDefault(false)
                 synchronized(lock) { armedDeadlineMs = snapshot + CONNECT_GUARD_RETRY_AT_MS }
+                // 归因修正（1.2.101，CarWith 官方状态机日志定谳）：零握手轮的真实原因是
+                // CarWith WirelessSM 的 WiFi P2P（WLAN 直连）连接失败——
+                // MSG_WIFI_P2P_CONNECT_FAILURE → MSG_CASTCONTROLLER_CAST_FAILURE，
+                // 协议层静默只是它的下游表现；killBackgroundProcesses 对前台服务进程
+                // 是 no-op（本机 adb 实验），所以 kill 语句如实说明只对部分状态有效。
+                val wifiOn =
+                    runCatching {
+                        (app.getSystemService(android.net.wifi.WifiManager::class.java))
+                            ?.isWifiEnabled == true
+                    }.getOrDefault(true)
                 SessionController.appendLog(
                     "CARLIFE-AUTO: 直连入口调起后 ${CONNECT_GUARD_RETRY_AT_MS / 1000}s 未出帧" +
                         (if (CarLifeHijack.handshakeSeen) {
                             "（已有协议握手但零帧）"
+                        } else if (!wifiOn) {
+                            "（CarWith 官方状态机：WLAN 关闭时 WiFi P2P 连接必然失败——请打开 WLAN 开关，无需连接任何热点）"
                         } else {
-                            "（端口应答但协议无响应——CarWith 编码器初始化疑似卡死）"
+                            "（端口应答但协议无响应——CarWith WLAN 直连（P2P）失败或快速启停未释放完，等 3~5s 再试）"
                         }) +
-                        "——已" + (if (killed) "强制回收 CarWith 进程并" else "") + "重新调起（等价手动重启）" +
+                        "——已重新调起入口" +
                         (if (launchedInBackground) {
                             "（本应用当时在后台，若仍无画面请到 系统设置→应用→CarPToCarL 允许「后台弹出界面」）"
                         } else {
-                            "（若仍无画面请手动到系统设置强行停止 CarWith 后重试）"
+                            "（若仍无画面请检查 WLAN 开关，或等几秒再试）"
                         }),
                 )
             }
