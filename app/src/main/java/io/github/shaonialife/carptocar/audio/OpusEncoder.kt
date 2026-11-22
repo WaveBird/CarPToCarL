@@ -17,12 +17,14 @@ import android.media.MediaFormat
  * 一包一帧，与 AAC-LC 同构。
  *
  * 帧长与时间戳：
- *  - CSD 配置帧（codec-config）在首帧前单独发出（部分车机要求带 OpusHead，
- *    见 [configFrame]）。
- *  - 普通帧 20ms（960 样本 @48kHz）——Opus 帧长可变，但 MediaCodec c2.android
- *    opus.encoder 固定 20ms 一帧，RTP 时间戳按 960 步进。
- *  - 输入 PCM 必须 48kHz（MediaCodec Opus 编码器只认 48k）；16kHz 的 TTS 由
- *    AudioSender 的重采样对齐到 48k 后喂入（对齐逻辑与 AAC 通路共用）。
+ *  - CSD 配置帧（codec-config，OpusHead）被捕获到 [configFrame]，但**目前没有
+ *    任何发送点**——先不发（2026-11-22 审计 A5-B：盲目加 CSD 首包会引入新的时序
+ *    风险）。若实车 SETUP 200 仍无声，第一步就是把它当首包发出去再试。
+ *  - 普通帧 20ms（960 样本 @48kHz 或 480 样本 @24k / 320 样本 @16k）——
+ *    MediaCodec c2.android opus.encoder 固定 20ms 一帧，RTP 时间戳按
+ *    「20ms × 本档采样率」步进（见 AudioSender.samplesPerPacket）。
+ *  - 输入采样率由格式位决定（bit28/29/30 = 16/24/48k）；AudioSender 负责把
+ *    CarLife 引擎的源 PCM 重采样对齐到该值（与 AAC 通路共用同一套对齐逻辑）。
  */
 class OpusEncoder(
     /** 编码输入采样率，固定 48kHz（MediaCodec Opus 编码器限制）。 */
@@ -34,8 +36,11 @@ class OpusEncoder(
     private val log: (String) -> Unit,
 ) {
     companion object {
-        /** Opus 20ms 帧长（每声道样本数 @48kHz）。 */
+        /** Opus 一帧固定 20ms；@48kHz 时每声道 960 样本（16k→320，24k→480）。 */
         const val FRAME_SAMPLES_PER_CHANNEL = 960
+
+        /** 按本档采样率换算的 20ms 帧长（每声道样本数）。 */
+        fun frameSamplesFor(sampleRate: Int): Int = sampleRate / 50
 
         /**
          * 设备上的 MediaCodec 是否支持**指定采样率**的 Opus 编码。
@@ -102,6 +107,7 @@ class OpusEncoder(
                 log(
                     "AUDIO: Opus 编码器就绪（${sampleRate}Hz ${if (channels == 1) "单声道" else "立体声"} " +
                         "${bitRate / 1000}kbps，帧=${FRAME_SAMPLES_PER_CHANNEL}样本/20ms，codec=${encoder.name}）",
+                    // 注：编码器本身固定按 20ms 组帧，实际样本数随 sampleRate 变化
                 )
                 true
             } catch (error: Exception) {

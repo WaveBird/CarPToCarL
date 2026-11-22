@@ -105,10 +105,12 @@ class ConnectionPreflightReportTest {
         // 14 项:1.2.76 的 13 项 + 上游 1.2.79 并入的 OVERLAY(悬浮窗,车机自动拉起 App 的命门)。
         // 注意不含投屏授权(MediaProjection)——本版本画面走双屏虚拟屏、声音走 CarLife 引擎
         // PCM 直通,都不过 MediaProjection(2026-11-11 核对)。
-        assertEquals(14, Requirement.values().size)
+        assertEquals(15, Requirement.values().size)
         assertTrue(Requirement.values().any { it.name == "NOTIFICATION_ACCESS" })
         assertTrue(Requirement.values().any { it.name == "BACKGROUND_SURVIVAL" })
         assertTrue(Requirement.values().any { it.name == "OVERLAY" })
+        // 2026-11-22（C5）：兼容模式开关纳入体检——关掉后会被当成非 CarPlay 设备跳过
+        assertTrue(Requirement.values().any { it.name == "BT_COMPAT_MODE" })
         assertFalse(Requirement.values().any { it.name == "PROJECTION" })
     }
 

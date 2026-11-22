@@ -4720,8 +4720,9 @@ object SessionController {
         }
         navAudioSender = nav
         activeNavAudioProfile = chosen
-        // 成功变体进车机记忆:下轮 startNavAudioChannel 不再盲试被拒方案
-        // (与媒体档 AudioProfileMemory 同一套记忆,按 profile.key 去重)。
+        // A4 修正：此前这里注释写"成功变体进车机记忆"，实际只打了日志——导航档
+        // 没有接 AudioProfileMemory（记忆目前在媒体路径）。A3 之后一个格式位只对应
+        // 唯一参数，本就不存在"盲试组合"要记忆；保留日志记录本轮定型的档位即可。
         appendLog("AUDIO: ✓ 导航流方案定型: ${chosen.label}")
         // 导航流建好后才启用压低：车机只有看到 101 上有独立流 + duckAudio 才把它当导航音轨。
         // 捕获 client 快照，会话切换后旧状态机的命令不会打到新连接。
@@ -6874,6 +6875,33 @@ object SessionController {
                                             pendingScreenRequestFromCarUi.set(true)
                                             appendLog("RESOURCE: 收到车机 requestUI，解除借用限制并申请取回主屏")
                                             resourceStreams?.requestScreen(fromRequestUi = true)
+                                        }
+
+                                        // C3：车机（配件侧）下发的昼夜状态——上游 1.2.79
+                                        // 的分支在合并时被整个丢掉，CarNightMode 从来没有写入点，
+                                        // 于是「引擎就绪后回放日夜模式」那段永远是 hasValue=false 的死代码。
+                                        // 报文：POST /command, plist { type=setNightMode,
+                                        //   params={ nightMode=<bool> } }；事件通道的 200 已由
+                                        // AirPlayClient.respondEventRequest 回过，这里不再应答。
+                                        "setNightMode" -> {
+                                            val params = command["params"] as? Map<*, *>
+                                            val raw = params?.get("nightMode") ?: command["nightMode"]
+                                            val night = io.github.shaonialife.carptocar.session.CarNightMode.parse(raw)
+                                            if (night == null) {
+                                                appendLog("EVENT: setNightMode 参数无法识别（raw=$raw params=$params）")
+                                            } else {
+                                                io.github.shaonialife.carptocar.session.CarNightMode.apply(night, "AirPlay /command")
+                                                // 送进手机 CarLife+ 引擎（0x18078）：走专用命令线程池，
+                                                // 绝不在 iAP2 事件线程做本地 socket 写。
+                                                carLifeCommandSender.execute {
+                                                    val sent = CarLifeHijack.sendThemeChange(night)
+                                                    appendLog(
+                                                        "EVENT: 车机日夜模式 → ${if (night) "夜间" else "日间"}" +
+                                                            " → CarLife+ 引擎 0x18078 " +
+                                                            if (sent) "已送达" else "未送达（引擎未连接）"
+                                                    )
+                                                }
+                                            }
                                         }
 
                                     else ->

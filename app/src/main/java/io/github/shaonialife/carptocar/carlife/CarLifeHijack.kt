@@ -1194,6 +1194,20 @@ object CarLifeHijack {
                     },
                     onMediaInfo = { info -> onMediaInfo(info) },
                     onMediaProgress = { ms -> onMediaProgress(ms) },
+                    // C4：加密通道就绪（0x1006E）后再回放日夜模式。原位置在 start()
+                    // 刚返回时发，那一刻 payloadCipher 仍是 null，0x18078 会以明文
+                    // 混进 AES 握手序列。
+                    onEncryptReady = {
+                        if (CarNightMode.hasValue) {
+                            val replayNight = CarNightMode.isNight
+                            val replayOk = client?.sendThemeChange(replayNight) == true
+                            logSink?.invoke(
+                                "CARLIFE: 加密通道就绪后回放车机日夜模式" +
+                                    " ${if (replayNight) "夜间" else "日间"} → " +
+                                    if (replayOk) "已送达" else "未送达",
+                            )
+                        }
+                    },
                     requestedFps = if (preferCarWith) 30 else requestedFps,
                     initialConnectType = connectType,
                     mediaSampleRate = AudioRatePreference.load(appContext).mediaSampleRateFeatureValue,

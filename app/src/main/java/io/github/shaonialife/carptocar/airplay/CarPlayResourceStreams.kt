@@ -140,9 +140,12 @@ internal class CarPlayResourceStreams(
         // 全部无跳变，车机停在原车界面）。顺序刻意不重发 RECORD：这台车对
         // 重复 RECORD 过敏（补发后 1.79~2.03s 拆链）。
         if (fromCarUiNow && client.phoneOwnsScreen) {
-            client.retakeScreenForUiRequest()
+            // C1：返回值必须赋给 published（1.2.76 就是这么写的）。否则后面
+            // `if (!published) client.republishModes()` 会再发一次，车机收到
+            // 2→1→1 三次归属变化。
+            published = client.retakeScreenForUiRequest()
             sender?.requestKeyFrame()
-            log("MODE: requestUI 且主屏在本机——已执行让出再拿回跳变 + 补关键帧")
+            log("MODE: requestUI 且主屏在本机——已执行让出再拿回跳变（ok=$published）+ 补关键帧")
         }
         val owned = client.phoneOwnsScreen
         val warmAlive = screenStreaming && sender?.isRunning == true

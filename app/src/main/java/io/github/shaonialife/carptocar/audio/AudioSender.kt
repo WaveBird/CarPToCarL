@@ -244,7 +244,8 @@ class AudioSender(
         get() =
             when (codec) {
                 AudioCodec.AAC_LC -> AacLcEncoder.pcmBytes(channelCount)
-                AudioCodec.OPUS -> OpusEncoder.FRAME_SAMPLES_PER_CHANNEL * channelCount * 2
+                // Opus 一帧 20ms：按本档采样率换算（48k→960、24k→480、16k→320）
+                AudioCodec.OPUS -> OpusEncoder.frameSamplesFor(sampleRate) * channelCount * 2
                 else -> packetBytes
             }
 
@@ -253,7 +254,7 @@ class AudioSender(
         get() =
             when (codec) {
                 AudioCodec.AAC_LC -> AacLcEncoder.FRAME_SAMPLES.toLong()
-                AudioCodec.OPUS -> OpusEncoder.FRAME_SAMPLES_PER_CHANNEL.toLong()
+                AudioCodec.OPUS -> OpusEncoder.frameSamplesFor(sampleRate).toLong()
                 else -> SAMPLES_PER_PACKET.toLong()
             }
 
@@ -759,7 +760,9 @@ when (codec) {
             if (payloads.isEmpty()) return
             // 一次性自检只对**真实音频**做：拿静音帧去自检只会得到「⚠ 解码为全零」，
             // 把「编码器坏了」误报成事实。
-            if (!selfChecked && !isAllZero(pcm)) {
+            if (!selfChecked && !isAllZero(pcm) && codec != AudioCodec.OPUS) {
+                // 自检用 AAC-LC 解码器验证比特流;OPUS 没有 AAC 解码器,跳过
+                // (避免每帧刷「解码异常」误导排查;OPUS 有效性由实车 SETUP/出声判定)
                 selfChecked = true
                 verifyEncodedFrame(payloads.first())
             }
@@ -1349,9 +1352,10 @@ when (codec) {
         // byteSwapS16 转回小端再喂 AudioTrack（DiPlay AndroidMediaSink.kt:1687）。
         // Android 采集是原生小端，因此这里必须换序；漏掉会得到「沙沙声」（2026-10-10 实测）。
         //
-        // AAC 通路不做换序：AAC 比特流是字节流，不是 16bit 样本序列，换序会直接把
-        // 比特流搅烂（车机解码失败 → 有包无声）。
-        val wirePayload = if (codec == AudioCodec.AAC_LC) pcm else bigEndianS16(pcm)
+        // AAC/Opus 通路不做换序：它们都是字节流，不是 16bit 样本序列，换序会直接把
+        // 比特流搅烂（车机解码失败 → 有包无声）。只有 PCM 才需要大端化。
+        // （2026-11-22 审计 A1:此前 OPUS 落进 else 被 bigEndianS16 搅烂——致命。）
+        val wirePayload = if (codec == AudioCodec.PCM) bigEndianS16(pcm) else pcm
         val sealed = AirPlayCrypto.chachaSeal(streamKey, AirPlayCrypto.nonce64(nonceCounter), wirePayload, aad)
         val wire = ByteArray(RTP_HEADER_LEN + sealed.size + NONCE_SIZE)
         header.copyInto(wire, 0)

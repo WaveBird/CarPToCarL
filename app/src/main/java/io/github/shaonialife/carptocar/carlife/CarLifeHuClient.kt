@@ -83,6 +83,15 @@ class CarLifeHuClient(
     /** 收到媒体播放进度（0x10036，ms，约每秒一条）。 */
     private val onMediaProgress: (progressMs: Int) -> Unit = {},
     /**
+     * AES 加密通道就绪（`0x1006E ENCRYPT_READY`）后回调一次。
+     *
+     * 存在的理由（2026-11-22 审计 C4）：CarLife 的加密码流要等种子交换完成才建立
+     * （[payloadCipher] 在 `0x10064` 处理里才赋值）。任何**握手完成前**发出的业务命令
+     * 都会被当成明文塞进加密握手序列——车机侧多半直接丢弃或判协议错。所以需要
+     * 「能安全下发业务命令」的信号点，日夜模式回放就挂在这里。
+     */
+    private val onEncryptReady: () -> Unit = {},
+    /**
      * 引擎是否处于**语音会话**（`语音(4)` 模块从 0 变非 0，以及反向）。
      *
      * 这是「0x68008 `0x21` 到底有没有被引擎接住」的同一份证据，也是上层唯一能拿到的
@@ -1224,6 +1233,8 @@ class CarLifeHuClient(
                 carWithEncryptReady = true
                 log("CARLIFE: ✓ 收到 ENCRYPT_READY（0x1006E）——AES 加密通道就绪")
                 maybeSendCarWithVideoInit()
+                // 加密通道就绪：此刻起业务命令才是「密文」而非混进握手序列的明文。
+                runCatching { onEncryptReady() }
             }
 
             else -> {

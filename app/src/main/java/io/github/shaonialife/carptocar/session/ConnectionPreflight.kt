@@ -107,6 +107,16 @@ object ConnectionPreflight {
          * RARE/RESTRICTED。真被限制时，光靠前台服务 + 唤醒锁是救不回来的。
          */
         BACKGROUND_SURVIVAL("后台存活未被限制", Severity.INFO),
+
+        /**
+         * 「车机只认苹果设备」兼容模式（[io.github.shaonialife.carptocar.bt.BtCompatPrefs]）。
+         *
+         * 默认开启，但它是个可关的开关：关掉后若目标车机的 SDP 里没有 iAP2 服务，
+         * 我们会按「非 CarPlay 设备」跳过，而体检 14/14 全绿——用户完全看不出问题
+         * 出在自己关了这个开关（2026-11-22 审计 C5）。这里只报告状态，降级为 INFO：
+         * 关掉在部分车机上反而是对的，不能判成阻塞。
+         */
+        BT_COMPAT_MODE("「车机只认苹果设备」兼容模式", Severity.INFO),
     }
 
     /**
@@ -401,6 +411,7 @@ object ConnectionPreflight {
                         },
                     ),
                 )
+                add(checkBtCompatMode(app))
                 add(
                     Check(
                         Requirement.BATTERY_OPTIMIZATION,
@@ -484,5 +495,23 @@ object ConnectionPreflight {
                         "请把「电池/耗电管理」改成「不限制」并允许自启动"
             }
         return Check(Requirement.BACKGROUND_SURVIVAL, ready, detail)
+    }
+
+    /**
+     * C5：兼容模式状态。关掉时给出「可能被当成非 CarPlay 设备跳过」的提示，
+     * 避免「关了开关试一下然后忘了」变成一轮莫名其妙的连不上。
+     */
+    private fun checkBtCompatMode(context: Context): Check {
+        val enabled = io.github.shaonialife.carptocar.bt.BtCompatPrefs.enabled(context)
+        return Check(
+            Requirement.BT_COMPAT_MODE,
+            ready = enabled,
+            detail =
+                if (enabled) {
+                    "已开启——SDP 探针 + 监听常开；关掉后若车机不广播 iAP2 会被跳过"
+                } else {
+                    "已关闭——若这台车机 SDP 里没有 iAP2 服务，会被当成非 CarPlay 设备跳过"
+                },
+        )
     }
 }

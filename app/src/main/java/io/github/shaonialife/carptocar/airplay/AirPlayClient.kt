@@ -2584,10 +2584,17 @@ class AirPlayClient(
         const val AUDIO_FORMAT_AAC_LC_44K_STEREO = 1L shl 22
 
         /**
-         * Opus 48kHz（bit30, 0x40000000）——宝马 MGU 全系 alert/default/telephony
-         * 档的**唯一**声明位（2026-11-22 /info 实测六档全带 bit30，无任何 PCM/AAC 位）。
-         * ct=32（AirPlay 压缩类型表）。帧长 20ms（960 样本@48k）。
+         * Opus 单声道三档：bit28/29/30 = 16000 / 24000 / 48000 Hz（见
+         * docs/CARPLAY-WIRELESS-HEADUNIT-SPEC.md:829「28~30 OPUS 16000/24000/48000 单声道」）。
+         *
+         * ct=32（AirPlay 压缩类型表）。**协议里 Opus 只有单声道位，没有立体声位**——
+         * 2026-11-22 审计 A3：此前把 16k 与立体声都塞进 bit30，前者会让车机按 48k
+         * 解读 16k 帧（3 倍速人声），后者协议里根本没有对应位。
+         *
+         * 宝马 MGU-55-J 的 alert/default/telephony 六档只声明 bit30（=48k mono）。
          */
+        const val AUDIO_FORMAT_OPUS_16K = 1L shl 28
+        const val AUDIO_FORMAT_OPUS_24K = 1L shl 29
         const val AUDIO_FORMAT_OPUS_48K = 1L shl 30
 
         /** AAC-LC 48000Hz 立体声（1<<23；catplay `AAC_LC_48000_STEREO`）。 */
@@ -2807,9 +2814,13 @@ class AirPlayClient(
         // 随机正 i64：BinaryPlist 按有符号整数编码，掩掉符号位避免负数
         val connectionId = (SecureRandom().nextLong() and Long.MAX_VALUE).coerceAtLeast(1L)
         // spf 取值：AAC 一帧 1024 采样；PCM 与发送端每包 352 帧保持一致
+        // spf 按 codec 分派（2026-11-22 审计 A2）：此前非 AAC 一律 352，
+        // 而 Opus 一帧是 960 采样——车机按 352 排播会把时间轴拉歪。
         val spfValue =
-            tuning.spf?.let {
-                if (profile.codec == AudioCodec.AAC_LC) it.toLong() else AudioSender.SAMPLES_PER_PACKET.toLong()
+            when (profile.codec) {
+                AudioCodec.AAC_LC -> tuning.spf?.toLong()
+                AudioCodec.OPUS -> OpusEncoder.frameSamplesFor(profile.sampleRate).toLong()
+                else -> tuning.spf?.let { AudioSender.SAMPLES_PER_PACKET.toLong() }
             }
         log(
             "AIRPLAY: 音频协商 → audioType=${profile.audioType} " +
@@ -3252,6 +3263,24 @@ class AirPlayClient(
      * 所以同一 bit30 生成多个变体逐个试：被拒自动切下一个，成功变体写进车机记忆，
      * 下次直用。其他格式位（PCM/AAC 位图自带采样率语义）保持单变体不变。
      */
+    /** Opus 单声道档的构造（A3：采样率由格式位唯一决定，见 [AUDIO_FORMAT_OPUS_16K] 注释）。 */
+    private fun opusVariant(
+        audioType: String,
+        bit: Long,
+        sampleRate: Int,
+        streamType: Long,
+        latencyMs: Long,
+    ): AudioProfile =
+        AudioProfile(
+            audioType = audioType,
+            formatBit = bit,
+            sampleRate = sampleRate,
+            latencyMs = latencyMs,
+            streamType = streamType,
+            codec = AudioCodec.OPUS,
+            channels = 1,
+        )
+
     fun audioProfileVariantsForType(audioType: String): List<AudioProfile> {
         val wanted = audioType.trim().lowercase()
         if (wanted.isEmpty()) return emptyList()
@@ -3269,7 +3298,11 @@ class AirPlayClient(
         // 与 audioProfileForType 相同的命中逻辑，但命中的是 (streamType, bit) 组合
         val ordered =
             listOf(
+                // Opus 三档（bit28/29/30 = 16k/24k/48k 单声道）：声明了哪档才会被选中。
+                // 宝马只声明 bit30；声明多档的车机按 48k→24k→16k 优先（越高越省重采样）。
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_OPUS_48K,
+                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_OPUS_24K,
+                AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_OPUS_16K,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_STEREO,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_48K_MONO,
                 AUDIO_STREAM_TYPE_ALT to AUDIO_FORMAT_PCM_44K_STEREO,
@@ -3300,47 +3333,13 @@ class AirPlayClient(
         val variants = mutableListOf<AudioProfile>()
         for ((streamType, bit) in hits) {
             when (bit) {
-                AUDIO_FORMAT_OPUS_48K -> {
-                    // 变体 1：16kHz 直编（TTS 源即 16k，零重采样；RTP 时间轴 16k）。
-                    // 仅当设备 MediaCodec 真支持 16k Opus 编码才列入——多数 c2 编码器
-                    // 只配 48k,探测不到就剔除,免得 SETUP 成功后编码器立不起来。
-                    if (OpusEncoder.supportsSampleRate(16_000)) {
-                        variants +=
-                        AudioProfile(
-                            audioType = wanted,
-                            formatBit = bit,
-                            sampleRate = 16_000,
-                            latencyMs = latency(streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.OPUS,
-                            channels = 1,
-                        )
-                    }
-                    // 变体 2：48kHz 重采样（MediaCodec audio/opus 原生采样率，
-                    // 编码器零配置直吃；RTP 时间轴 48k）——若变体 1 被拒，这条是主路径
-                    variants +=
-                        AudioProfile(
-                            audioType = wanted,
-                            formatBit = bit,
-                            sampleRate = 48_000,
-                            latencyMs = latency(streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.OPUS,
-                            channels = 1,
-                        )
-                    // 变体 3：48kHz 立体声（若车机 Opus 链只认立体声帧——个别实现
-                    // 单声道输入按双声道拷贝；最后一级兜底）
-                    variants +=
-                        AudioProfile(
-                            audioType = wanted,
-                            formatBit = bit,
-                            sampleRate = 48_000,
-                            latencyMs = latency(streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.OPUS,
-                            channels = 2,
-                        )
-                }
+                // A3：每个 Opus 位对应**唯一**确定的采样率、单声道（协议如此）。
+                // 多变体不体现在「同一个位上换参数」，而体现在「车机声明了几个位就试几档」：
+                // 声明 bit28/29/30 的车机会得到 16k→24k→48k 三档；宝马只声明 bit30，
+                // 就只有 48k mono 一档——不再盲试不存在的组合。
+                AUDIO_FORMAT_OPUS_16K -> variants += opusVariant(wanted, bit, 16_000, streamType, latency(streamType))
+                AUDIO_FORMAT_OPUS_24K -> variants += opusVariant(wanted, bit, 24_000, streamType, latency(streamType))
+                AUDIO_FORMAT_OPUS_48K -> variants += opusVariant(wanted, bit, 48_000, streamType, latency(streamType))
                 AUDIO_FORMAT_PCM_48K_STEREO ->
                     variants += AudioProfile(wanted, bit, 48_000, latency(streamType), streamType, AudioCodec.PCM, channels = 2)
                 AUDIO_FORMAT_PCM_48K_MONO ->

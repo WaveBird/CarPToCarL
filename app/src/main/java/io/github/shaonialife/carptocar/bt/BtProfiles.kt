@@ -198,6 +198,17 @@ object BtProfiles {
                 onEvent("BT-GUARD: ${stopLabel()} → 立即收工（本次共断开 $drops 次）")
                 return drops
             }
+            // B3：超时判断必须在 shouldPause 之前。此前 pause 分支直接 continue，
+            // 会话长期处于握手态时会永久跳过这个上限判断——守卫线程永不结束、
+            // audioGuardRunning 卡在 true，下一轮再也起不来守卫（1.2.76 的排法是对的）。
+            val elapsedPaused = SystemClock.uptimeMillis() - started
+            if (!AudioProfileGuardPolicy.shouldKeepGuarding(elapsedPaused)) {
+                onEvent(
+                    "BT-GUARD: 已盯满 ${AudioProfileGuardPolicy.MAX_MILLIS / 1000}s，" +
+                        "停止（断开 $drops 次）——仍未建立 iAP2 会话",
+                )
+                return drops
+            }
             if (shouldPause()) {
                 // iAP2 握手进行中：这轮不踢（宝马实测握手期踢 HFP/A2DP 会带着 ACL 一起断）。
                 idlePolls = 0
@@ -243,6 +254,17 @@ object BtProfiles {
                                 "收工（本次共断开 $drops 次）",
                         )
                         return drops
+                    }
+                    // B2：断开前再复查一次握手态（1.2.76 有这一步，合并时丢了）。
+                    // connectedNames() 这几百毫秒里车机可能刚进 RFCOMM，此时再踢
+                    // 会把刚建起来的控制链路连同 ACL 一起打断。
+                    if (shouldPause()) {
+                        onEvent(
+                            "BT-GUARD: iAP2 正在握手 → 暂不断开" +
+                                "（${before.joinToString("/")}），避免误杀蓝牙链路",
+                        )
+                        Thread.sleep(AudioProfileGuardPolicy.POLL_MILLIS)
+                        continue
                     }
                     val dropped = disconnectAddress(context, address)
                     if (dropped.isNotEmpty()) {
