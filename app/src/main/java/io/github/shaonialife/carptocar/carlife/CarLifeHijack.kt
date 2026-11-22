@@ -1227,6 +1227,19 @@ object CarLifeHijack {
                     encryptedCarWith = preferCarWith,
                     hasTrustedCanvas = trustedCanvas,
                     onReturnToCar = { onReturnToCar?.invoke() },
+                    // 加密握手僵死（0x18052 后引擎无回音，1.2.100）：趁 socket 还活着
+                    // 回收 CarWith 进程并重新调起，随后 stop 本次连接——下一轮守候循环
+                    // 会接管新进程的 7240（等价用户手动重启，但抢在 Connection reset
+                    // 之前动手，省掉 ~12s 死等）。
+                    onCarWithHandshakeStalled = {
+                        val ctx = appContext
+                        if (ctx != null && CarLifeAutoPrefs.autoLaunchOnConnect(ctx)) {
+                            CarLifeLauncher.restartCarWithProcess(ctx)
+                        }
+                        // client 字段此刻已指向本实例（构造后立即赋值）；若早于赋值触发
+                        // （理论上不可能——看门狗线程 start 在构造之后），runCatching 兜底。
+                        runCatching { client?.stop() }
+                    },
                     onProbeResult = { line ->
                         logSink?.invoke("CARLIFE: [探测] $line")
                         appContext

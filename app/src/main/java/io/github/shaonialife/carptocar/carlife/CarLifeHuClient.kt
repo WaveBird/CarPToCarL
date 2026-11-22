@@ -211,6 +211,17 @@ class CarLifeHuClient(
     var hasTrustedCanvas: Boolean = true,
     /** 用户在 CarWith 内点击「返回原车」（0x10021）时回调。 */
     private val onReturnToCar: () -> Unit = {},
+    /**
+     * CarWith 加密握手**僵死**回调（1.2.100，2026-11-23 实车日志 000744 定谳）。
+     *
+     * 失败轮指纹：0x18052 功能响应下发后引擎**再无任何回音**——RSA 请求（0x1006A）、
+     * 特征确认、版本 ACK 全无，直到 ~12s 后 Connection reset。这是快速「停止→再启动」
+     * 节奏下 CarWith 的另一种坏状态（区别于「端口应答协议不响应」）。此刻本类的连接
+     * 循环还活着（socket 未断），是**唯一能及时**发起「回收 CarWith 进程」的位置——
+     * 等 Connection reset 再恢复就太晚且看门狗已退出。上层收到回调后执行
+     * `CarLifeLauncher.restartCarWithProcess` 并重连。
+     */
+    private val onCarWithHandshakeStalled: () -> Unit = {},
     private val monotonicMillis: () -> Long = { android.os.SystemClock.uptimeMillis() },
     private val connectSocket: ((Int) -> Socket)? = null,
 ) {
@@ -234,6 +245,20 @@ class CarLifeHuClient(
     private var carWithPeerAuthAccepted = false
     private var carWithFeatureRequested = false
     private var carWithFeatureSent = false
+
+    /**
+     * 加密握手僵死看门狗的状态（1.2.100）。
+     *
+     * 记录 [maybeSendCarWithFeatures] 下发 0x18052 的时刻；无帧重发线程每秒核对一次：
+     * 若此后 [CARWITH_STALL_TIMEOUT_MS] 内引擎没有给出任何下一步（RSA 请求/加密就绪/
+     * 特征确认，以 [carWithEncryptReady] 或 [carWithRsaSent] 任一置位为准），判僵死并
+     * 触发 [onCarWithHandshakeStalled]。每个会话最多触发一次；连接重开时全部状态归零。
+     */
+    @Volatile
+    private var carWithFeatureSentAtMs: Long = 0L
+
+    @Volatile
+    private var carWithStallReported = false
     private var carWithRsaSent = false
     private var carWithSeedAccepted = false
     private var carWithEncryptReady = false
@@ -583,6 +608,9 @@ class CarLifeHuClient(
         carWithSeedAccepted = false
         carWithEncryptReady = false
         carWithVideoInitSent = false
+        // 僵死看门狗状态随会话归零（1.2.100）
+        carWithFeatureSentAtMs = 0L
+        carWithStallReported = false
         lastFrameAt = monotonicMillis()
         // 首轮有序初始化的闸门：每条新会话都要从「98386 还没确认、首条 98311 还没发」开始。
         firstInitSent = false
@@ -1249,6 +1277,8 @@ class CarLifeHuClient(
     private fun maybeSendCarWithFeatures() {
         if (!encryptedCarWith || !carWithAuthVerified || !carWithFeatureRequested || carWithFeatureSent) return
         carWithFeatureSent = true
+        // 僵死看门狗起表：从这条 0x18052 出门开始计时（1.2.100，见字段 KDoc）
+        carWithFeatureSentAtMs = monotonicMillis()
         val preferVehicleRes = hasTrustedCanvas
         log(
             "CARLIFE: 下发 CarWith 0x18052 功能响应（CONTENT_ENCRYPTION=1" +
@@ -1537,6 +1567,22 @@ class CarLifeHuClient(
                 continue
             }
             if (!versionMatched) continue
+            // 加密握手僵死检查（1.2.100）：0x18052 发出后引擎迟迟不回下一步。
+            // 失败轮指纹（000744 日志）：下发后 RSA/ACK 全无，~12s 后 Connection reset
+            // ——但等 reset 再恢复就太晚（看门狗已随连接退出）。这里趁 socket 还活着
+            // 主动判死，上层回收 CarWith 进程并重新调起。每会话最多一次。
+            val featureSentAt = carWithFeatureSentAtMs
+            if (featureSentAt > 0L && !carWithStallReported && !carWithEncryptReady && !carWithRsaSent) {
+                val stallMs = monotonicMillis() - featureSentAt
+                if (stallMs >= CARWITH_STALL_TIMEOUT_MS) {
+                    carWithStallReported = true
+                    log(
+                        "CARLIFE: ⚠ 0x18052 下发后 ${stallMs / 1000}s 引擎无任何回音（RSA/ACK 全无）" +
+                            "——加密握手僵死，请求上层回收 CarWith 进程",
+                    )
+                    runCatching { onCarWithHandshakeStalled() }
+                }
+            }
             val idle = android.os.SystemClock.uptimeMillis() - lastFrameAt
             // 重发次数越多间隔越长（10s → 20s → 30s … 封顶 60s）：引擎卡住时
             // 高频重发只会自己也变成负担，而间隔内一旦来帧 reinitCount 会被清零。
@@ -2479,6 +2525,13 @@ class CarLifeHuClient(
 
         /** 视频通道连上但多久不出帧就重发编码初始化。 */
         private const val NO_FRAME_REINIT_MS = 10_000L
+
+        /**
+         * CarWith 加密握手僵死判定窗口：0x18052 下发后等这么久仍无 RSA/ACK 即判死
+         * （1.2.100）。实车失败轮（000744）的 Connection reset 出现在 ~12s——判定窗
+         * 取 8s，抢在 reset 前动手；成功轮 RSA 请求在 0x18052 后 <200ms 就来，不会误报。
+         */
+        private const val CARWITH_STALL_TIMEOUT_MS = 8_000L
 
         /**
          * 98311 去重时间窗（毫秒）。
