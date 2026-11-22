@@ -131,6 +131,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mockSinkInput: EditText
     private lateinit var preflightSummary: TextView
     private lateinit var tvMacHint: TextView
+
+    /** 获取指引（tvMacGuide）：说明为什么需要手填 + 系统里在哪复制，未填写时显示。 */
+    private lateinit var tvMacGuide: TextView
     private lateinit var btDesc: TextView
     private lateinit var btBadge: TextView
     private lateinit var btnPickTarget: TextView
@@ -729,6 +732,10 @@ class MainActivity : AppCompatActivity() {
                 tvMacHint.text = if (DeviceIdentity.hasOverride(this)) "已保存（手填）：$mac" else "自动解析：$mac"
             }
         }
+        // 获取指引跟着门禁走：未填写（或手填来源）时展示，自动解析成功就收起。
+        if (::tvMacGuide.isInitialized) {
+            tvMacGuide.visibility = if (mac == null || DeviceIdentity.hasOverride(this)) View.VISIBLE else View.GONE
+        }
         if (heroState == HeroState.IDLE) {
             ctaButton.alpha = if (mac == null) CTA_BLOCKED_ALPHA else 1f
             if (pendingResidualDisplays == null) {
@@ -971,6 +978,7 @@ class MainActivity : AppCompatActivity() {
         mockSinkInput = findViewById(R.id.mockSinkInput)
         preflightSummary = findViewById(R.id.preflightSummary)
         tvMacHint = findViewById(R.id.tvMacHint)
+        tvMacGuide = findViewById(R.id.tvMacGuide)
         btDesc = findViewById(R.id.btDesc)
         btBadge = findViewById(R.id.btBadge)
         btnPickTarget = findViewById(R.id.btnPickTarget)

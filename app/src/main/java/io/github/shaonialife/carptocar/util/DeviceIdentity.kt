@@ -96,8 +96,16 @@ object DeviceIdentity {
             // 顺序按「免特权可行性」排：Shizuku 移除后 shell 只等同 adb shell 的普通
             // 应用身份，`content query settings/secure` 多数机型直接拒绝，所以必须
             // 先试不依赖任何特权的来源（sysfs / 适配器反射）。
+            // resolveViaSu 兜底：root 设备（KernelSU/Magisk）上 su 可直读 sysfs——
+            // 普通 shell 读不到的节点 root 读得到（2026-11-22 17PM 实测 app uid 全被
+            // SELinux 拦，但那是无 root 机型；有 root 的机型这一步就能全自动）。
             val resolved =
-                resolveViaSysfs() ?: resolveViaSettings(context) ?: resolveViaAdapter(context) ?: resolveViaShell() ?: PLACEHOLDER_MAC
+                resolveViaSysfs()
+                    ?: resolveViaSettings(context)
+                    ?: resolveViaAdapter(context)
+                    ?: resolveViaShell()
+                    ?: resolveViaSu()
+                    ?: PLACEHOLDER_MAC
             if (resolved != PLACEHOLDER_MAC) cachedMac = resolved
             return resolved
         }
@@ -277,6 +285,28 @@ object DeviceIdentity {
                     timeoutMs = 4_000,
                 )
             MAC_REGEX.find(result.output)?.value?.uppercase()
+        } catch (_: Exception) {
+            null
+        }
+
+    /**
+     * root 兜底：`su -c cat /sys/class/bluetooth/hci0/address`。
+     *
+     * 只有 KernelSU/Magisk 机型能走通（`su` 不存在时 `exec` 快速失败，无副作用）；
+     * 2026-11-22 实测（小米 17PM，无 root）：普通 app uid 对全部 sysfs/secure 设置
+     * 都被 SELinux 拦死——有 root 的机型这一步能把「手动填」变成全自动。
+     */
+    private fun resolveViaSu(): String? =
+        try {
+            val result =
+                SysShell.exec(
+                    "su -c cat /sys/class/bluetooth/hci0/address",
+                    timeoutMs = 4_000,
+                )
+            result.output
+                .trim()
+                .takeIf { result.ok && MAC_REGEX.matches(it) && it != PLACEHOLDER_MAC }
+                ?.uppercase()
         } catch (_: Exception) {
             null
         }

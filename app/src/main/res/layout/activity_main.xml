@@ -959,6 +959,19 @@
                             android:textColor="@color/m3_error"
                             android:textSize="11.5sp"
                             android:visibility="gone" />
+
+                        <!-- 获取指引（2026-11-22）：为什么需要手填 + 在哪找。厂商脱敏时
+                             所有自动来源被系统堵死（mcarplay 同样手填），指引放这里让
+                             用户不用再猜。 -->
+                        <TextView
+                            android:id="@+id/tvMacGuide"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="3dp"
+                            android:text="获取方法：设置 → 蓝牙 → 本机名称旁的 ⋮ → 设备名称/地址，或在系统蓝牙详情页复制本机地址"
+                            android:textColor="@color/m3_on_var"
+                            android:textSize="11sp"
+                            android:visibility="gone" />
                     </LinearLayout>
 
                     <TextView
