@@ -559,6 +559,15 @@ object CarLifeHijack {
     @Volatile
     private var handshakeAtMs: Long = 0L
 
+    /**
+     * 自守候以来 7240 是否发生过**协议握手**（≥1 次即 true；断开/停用归零）。
+     *
+     * 供 `CarLifeAutoCoordinator` 区分「入口没收到请求（一次握手都没有 → MIUI 静默
+     * 拦截，值得自动重发入口）」与「入口收到但引擎零帧（同样值得重发：2026-11-22 实车日志
+     * `已附着七口超过 5s 无视频帧——补请求入口` 后仍未恢复，用户手动重启才出帧）」。
+     */
+    val handshakeSeen: Boolean get() = handshakeAtMs > 0L
+
     /** 收到真实视频首帧时的轻量回调（供 `CarLifeAutoCoordinator` 立即把 CarWith/CarLife 退入后台）。 */
     @Volatile
     var onSourceReady: (() -> Unit)? = null

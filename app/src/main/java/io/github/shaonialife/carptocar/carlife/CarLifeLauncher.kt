@@ -1,5 +1,6 @@
 package io.github.shaonialife.carptocar.carlife
 
+import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -81,6 +82,24 @@ object CarLifeLauncher {
             true
         }.getOrDefault(false)
     }
+
+    /**
+     * 本应用当前是否在前台（mcarplay 同款 `ActivityManager.getMyMemoryState` 判定）。
+     *
+     * 为什么需要它（2026-10-26 小米实测，mcarplay `CarLifeLauncher.isAppInForeground` 原注释）：
+     * **后台发起的 `startActivity` 可能被 MIUI「后台弹出界面」静默丢弃且不抛异常**——
+     * `CarlifeAdbActivity` 从未创建，7240 一直 ECONNREFUSED，表现成「CarWith 有时启动失败」。
+     * 调起方拿到 true 返回值不能证明入口真的收到请求；结合本方法把「本应用在后台」这一
+     * 风险条件亮出来，才能给用户一句可行动的告警（去允许「后台弹出界面」）。
+     *
+     * importance=0（系统未填充）按前台处理，避免误报。
+     */
+    fun isAppInForeground(): Boolean =
+        runCatching {
+            val info = ActivityManager.RunningAppProcessInfo()
+            ActivityManager.getMyMemoryState(info)
+            info.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        }.getOrDefault(true)
 
     /** 探测本机已安装且可合法调起的 CarWith / CarLife 应用列表（按推荐顺序）。 */
     fun detectInstalled(context: Context): List<DetectedApp> {
