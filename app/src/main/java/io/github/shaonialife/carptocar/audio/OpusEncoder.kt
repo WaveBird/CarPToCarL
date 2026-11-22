@@ -1,7 +1,6 @@
 package io.github.shaonialife.carptocar.audio
 
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.MediaFormat
 
 /**
@@ -114,7 +113,10 @@ class OpusEncoder(
      * 编码一帧 PCM，返回 0..n 个 Opus 帧（首帧可能空——编码器有 1~2 帧延迟）。
      * 帧内含 CSD 首位的话会先填 [configFrame]。
      */
-    fun encode(pcm: ByteArray, size: Int): List<ByteArray> =
+    fun encode(
+        pcm: ByteArray,
+        size: Int,
+    ): List<ByteArray> =
         synchronized(lock) {
             val encoder = codec
             if (encoder == null || !started) {
@@ -159,7 +161,10 @@ class OpusEncoder(
             output
         }
 
-    private fun drain(encoder: MediaCodec, output: MutableList<ByteArray>) {
+    private fun drain(
+        encoder: MediaCodec,
+        output: MutableList<ByteArray>,
+    ) {
         while (true) {
             val info = MediaCodec.BufferInfo()
             val index = encoder.dequeueOutputBuffer(info, 0)

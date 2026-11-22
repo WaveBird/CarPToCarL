@@ -483,7 +483,7 @@ class AudioSender(
             val client = openDataSocket()
             socket = client
 
-when (codec) {
+            when (codec) {
                 AudioCodec.AAC_LC -> {
                     val encoder = AacLcEncoder(sampleRate, channelCount, wrapAdts = adtsFrames, log = log)
                     if (!encoder.start()) {

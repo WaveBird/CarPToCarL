@@ -6,8 +6,8 @@ import io.github.shaonialife.carptocar.audio.AudioCodec
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
 import io.github.shaonialife.carptocar.audio.AudioSender
-import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.audio.AudioTuning
+import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.CarPlayUplinkHealth
 import io.github.shaonialife.carptocar.iap2.Iap2Csm
@@ -3230,6 +3230,7 @@ class AirPlayClient(
      * 是 AAC-ELD，我们没有那个编码器，所以「照 iPhone 用 AAC」在这里不成立。
      * 位图里没有 PCM 才退到 AAC-LC。
      */
+
     /**
      * 指定 audioType 的**全部候选变体**，按优先序返回（空表 = 车机没声明该档）。
      *
@@ -3293,15 +3294,15 @@ class AirPlayClient(
                     // 只配 48k,探测不到就剔除,免得 SETUP 成功后编码器立不起来。
                     if (OpusEncoder.supportsSampleRate(16_000)) {
                         variants +=
-                        AudioProfile(
-                            audioType = wanted,
-                            formatBit = bit,
-                            sampleRate = 16_000,
-                            latencyMs = latency(streamType),
-                            streamType = streamType,
-                            codec = AudioCodec.OPUS,
-                            channels = 1,
-                        )
+                            AudioProfile(
+                                audioType = wanted,
+                                formatBit = bit,
+                                sampleRate = 16_000,
+                                latencyMs = latency(streamType),
+                                streamType = streamType,
+                                codec = AudioCodec.OPUS,
+                                channels = 1,
+                            )
                     }
                     // 变体 2：48kHz 重采样（MediaCodec audio/opus 原生采样率，
                     // 编码器零配置直吃；RTP 时间轴 48k）——若变体 1 被拒，这条是主路径
