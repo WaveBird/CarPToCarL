@@ -19,17 +19,17 @@
 
 **最新正式版**（免编译，直接装）：
 
-> **[`CarPToCarL-1.2.75.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.75/CarPToCarL-1.2.75.apk)**
-> —— 主线固定直链（当前 1.2.75，14.1 MB）。**刻意不用 `releases/latest`**：那个指针
+> **[`CarPToCarL-1.2.80.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.80/CarPToCarL-1.2.80.apk)**
+> —— 主线固定直链（当前 1.2.80，14.2 MB）。**刻意不用 `releases/latest`**：那个指针
 > 按发布时间算，`-switchpool` 分支包一发布就会把它抢走，主线的 `latest` 直链随之 404
 
 | 项        | 值                                                                              |
 | -------- | ------------------------------------------------------------------------------ |
 | 全部版本     | [Releases 页面](https://github.com/jjuugk/CarPToCarL/releases)（含更新日志与历史版本）        |
-| 本版固定包    | [`CarPToCarL-1.2.75.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.75/CarPToCarL-1.2.75.apk) |
+| 本版固定包    | [`CarPToCarL-1.2.80.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.80/CarPToCarL-1.2.80.apk) |
 | 系统要求     | Android 12 及以上（minSdk 31）                                                      |
-| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 ~ 1.2.75，但不要与其它来源的包混装                    |
-| 安装       | 系统安装器直接装，或 `adb install -r CarPToCarL-1.2.75.apk`                              |
+| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 ~ 1.2.80，但不要与其它来源的包混装                    |
+| 安装       | 系统安装器直接装，或 `adb install -r CarPToCarL-1.2.80.apk`                              |
 | 前置       | 手机需装 **CarLife+**（荣耀机型为 `com.baidu.carlife.honor`）                             |
 
 首次启动会弹出免责声明，需手动同意。装好后怎么配、常见故障怎么查，见
@@ -41,8 +41,8 @@
 
 | 项    | 值                                                                             |
 | ---- | ----------------------------------------------------------------------------- |
-| 当前版本 | `1.2.75`（正式版；新增「触摸域自适应」开关（设置→显示，默认关），专治车机 HID 上报坐标域大于画面导致的触摸漂移——开启后按实测上报上限把坐标缩到视图，域按手势锁定，换分辨率自动作废。默认关时不改变任何既有行为。未实车验证。详见「十一、版本历史」。版本号唯一来源：`app/build.gradle.kts` 的 `appVersionName`） |
-| 下载   | **[`CarPToCarL-1.2.75.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.75/CarPToCarL-1.2.75.apk)**（见上方「立即下载」）       |
+| 当前版本 | `1.2.80`（正式版；并入 BMW MGU-50-J 实车 fork 的 **P1/P2/P4**：新增「连上后主动取主音频」开关（默认关，按车型自行开启）、切歌不再永久静音、车机点 CarPlay 图标无响应时补关键帧 + 复述归属。不会重发 RECORD——该车对重复 RECORD 过敏。详见「十一、版本历史」。版本号唯一来源：`app/build.gradle.kts` 的 `appVersionName`） |
+| 下载   | **[`CarPToCarL-1.2.80.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.2.80/CarPToCarL-1.2.80.apk)**（见上方「立即下载」）       |
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                            |
@@ -830,6 +830,204 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 > 也就是说 `1.2.44` 不用、直接发 `1.2.45`（单个 `4` 不违规，`1.2.43` 合法）。
 > `app/build.gradle.kts` 里有一段 `require` 强制执行：撞号时构建立刻失败，
 > 不会出现「发完版才发现号码犯忌」。
+
+### 1.2.80 —— 2026-11-21（并入 MGU-50-J fork 的 P1/P2/P4，正式版）
+
+来源：资料库 PR《CarPToCarL-PR-宝马MGU50J修复说明》，基于 v1.2.77、一加 PLK110 +
+宝马 MGU-50-J（iDrive 7）实车验证。按用户决定合入 **1/2/4，P3（通话档退避）未合**
+（文档代码片段有明显语法错误，且作者自己标为推测性修复）。**本次三项均未在本仓车型上实车验证**。
+
+**一、P1 连上后主动取主音频（用户开关，默认关）**
+
+MGU-50-J 的脾气：视频在送、车机 ACK 正常，但「没有音频会话就不交屏」，停在自家主页；
+只有用户手动放首歌才切进 CarPlay。根因是死锁：手机等播放意图才申请主音频，车机等音频会话才交屏。
+
+- 设置面板新增 **「连上后主动取主音频」**，键 `proactive_audio_on_link`，默认 `false`，**按车型由用户自行开启，不做车机指纹判定**（部分车机确实需要这一步才出画面）。
+- 打开后 RECORD 完成 1.5 秒（首帧已出、控制会话已就绪），若没有音频流且主音频不在手机手里，置一次播放意图并走既有 `modesChanged → SETUP → RECORD`。
+- 每轮会话只排一次，退役复位。日志：`AUDIO: 主动申请主音频（实验开关开）`。
+- 关掉即完全恢复旧行为；下次连接生效。
+
+**二、P2 切歌后不再永久静音**
+
+切歌瞬间 CarLife 引擎必然发 `FOCUS_RELEASED`。旧实现把它当成「车机接管了音源」置 `pausedByCar=true`，
+PCM 门禁变成无限期，只能通过车机按播放键/`onCarResume` 解除——而用户在手机上切歌时车机根本没参与，
+于是切歌之后永久静音，只能断开重连。
+
+现在 `FOCUS_RELEASED` 只标记 `sourcePaused`，门禁按常规 15 秒窗口自恢复。**真正的车机接管仍走
+`onCarPause()`（资源层 transfer / 静音键），那条路径一字未改**。新增单测锁住这个边界。
+
+**三、P4 `requestUI` 时主屏已在本机就补一次激活**
+
+车机点 CarPlay 图标会发 `requestUI`，但此时主屏本来就在手机手里、视频也在推——`applyScreen()`
+命中「已持有 + 正在推流」直接 return，车机等的「一次新的画面激活」始终没来。
+
+现在强制关键帧 + 复述资源归属（`republishModes()`），**刻意不重发 RECORD**——MGU-50-J 对重复
+RECORD 过敏（补发后 1.79~2.03 秒拆链）。日志：`RESOURCE: requestUI 时主屏已在本机——已强制关键帧并复述资源归属`。
+
+**验证要点**：打开 P1 后不手动放歌能否进 CarPlay；连上后切歌是否一直有声；点车机 CarPlay 图标能否恢复。
+P1 关掉即为 A/B 基线。
+
+正式包 14,168,165 B，sha256 `702d83ee296e423c5848afd3ec75110247581f07411ce0589db38717233311c7`；968 例单测 0 失败（versionCode 10280）。
+
+### 1.2.79 —— 2026-11-21（蓝牙问题日志监控，正式版）
+
+**本版不含功能改动，只为定位「蓝牙为什么一直反复断开」加观测日志。** 纯记录，不改变任何连接行为。
+
+背景：无线 CarPlay 建链期，我们会反复断开车机的 HFP/A2DP——因为部分车机（奥迪 MIB3、宝马 NBT EVO）只要这两个配置文件在线就不开放 iAP2 窗口。断开是协议要求，但真车机固件能保证不把配置文件拉回来、断一次即可；第三方车机蓝牙栈会自己拉回，于是形成「拉回 → 踢掉 → 再拉回」的循环。进一步怀疑：**在部分手机上，这种高频断开会把整机蓝牙栈踢崩**（`com.android.bluetooth` 重启 / 适配器 TURNING_OFF），连带我们自己的 iAP2 RFCOMM 一起断，会话失效后又触发下一轮重连——表现为「越断越停不下来」。
+
+本版新增三类日志，全部写进 `main_debug.log`，与已有的 `BT-GUARD` / `BT-C` 动作日志**共用同一把毫秒时钟**，可直接按时间戳对齐因果链：
+
+- `BT-STATE: 适配器 ON(12) → TURNING_OFF(13)`：新增 `BluetoothStateReceiver`，在 `SenderApp` 动态注册，记录蓝牙适配器状态翻转。这是「手机蓝牙是否真的重启」的直接证据；
+- `BT-PROFILE: profile 服务断开（…）——蓝牙栈重启信号`：`onServiceDisconnected` 原本静默清代理缓存，现在节流 3 秒记一行，作为间接信号；
+- `BT-PROFILE: 请求断开 … · 适配器态=…`：断开动作发生时记下适配器当前状态；配置级断开超时升级为设备级 `disconnect()` 时单独记一行（这一步是「断 HFP 却把整机蓝牙带崩」的最大嫌疑点）。
+
+**判读标准**：若断开动作后紧跟 `BT-STATE` 的 TURNING_OFF / TURNING_ON 与服务断开 → 假设成立，下一步降踢的频率或去掉设备级兜底；若只有 `BT-GUARD: 车机把 … 拉回来了` 而始终没有 `BT-STATE` 翻转 → 排除手机整机重启，问题回到车机侧的拉锯循环。需要在**问题手机**上抓日志，最好与一台正常手机对照。
+
+单测 967 例 0 失败（含新增 2 例状态名格式化测试）。**本版未实车验证。**
+
+### 1.2.78 —— 2026-11-21（语音键换通路 + 悬浮窗进体检，正式版）
+
+修 2026-11-21 20:37 实车（奥迪 MIB3 / 荣耀 Magic7 Pro / 1.2.77）报的两件事：
+**「方向盘语音键唤不起小度」** 与 **「车机靠近了手机毫无反应（不静默启动）」**。
+本版**未实车验证**。
+
+#### 一、语音键：`0x68008 0x21` → `0x10066`
+
+`0x68008 keycode=0x21 (VR_START)` 这条通路在 CarLife+ 8.8.5 上是**死的**：
+
+- 20:36:45.712 发出去，之后 **8.5 秒**引擎毫无反应；20:36:54.290 才报 `语音=1`，
+  而它前 231 ms 正好有一次界面点击（`EVENT: 触摸 #0(36,486)↓`），引擎是被点的，不是被硬键叫起来的；
+- 11-20 另一台车的日志里，21:38:22 发 `0x21`，之后 **25 分钟**一次 `语音=1` 都没有；
+- 同一通路的媒体硬键（`0x10` / `0x0F`）在 11-16 已被证实「写出成功、无 `0x10035` 回执」。
+
+改为官方语音控制消息 `MSG_CMD_HU_VOICE_CONTROL (0x10066)`，载荷
+`CarlifeVoiceControlRequest{command, opt}`（dex 实证两字段均 `required int32`）：
+首次尝试 `command=1`、`opt=2`，两个值抽成
+`CarLifeProtocol.VoiceControl.START_COMMAND / START_OPT`——实车无效只改这两个常量。
+
+`VR_STOP`（长按 PTT 松手收尾）**仍走 `0x68008 0x22`**：`0x10066` 的「停」语义没有任何实证，
+而未起识别时的 `VR_STOP` 是无害空操作。日志改成可对账的两行：
+
+```
+EVENT: 车机语音键（requestSiri 按下）→ CarLife 0x10066 语音控制（起识别）
+CARLIFE: 语音控制 0x10066 command=1 opt=2 已送达（等引擎「语音=1」确认）
+```
+
+**判据是引擎自己回的 `引擎模块状态 … 语音=1`**，`已送达` 只代表 socket 写成功。
+
+#### 二、悬浮窗权限纳入连接体检（12 项 → 13 项）
+
+同一份日志 20:34:50.784 写着「未授予『显示在其他应用上层』」，而体检 12 项**全绿**、
+界面上一个字都没提。Android 10+ 后台 `startActivity` 的通用豁免就是它，缺了 MagicOS
+**静默拦掉**（不抛异常、界面不出现）——这正是「车机蓝牙都连上了，手机还停在桌面」。
+
+- 新增 `Requirement.OVERLAY`（`Settings.canDrawOverlays`），严重度 **WARNING** 而非
+  BLOCKING：手动打开 App 照样能连，只是不会自动弹前台；
+- `PermissionRepair` 增 `Step.OVERLAY`：`ACTION_MANAGE_OVERLAY_PERMISSION` 带
+  `package:` 直达本应用，跳不过去退列表页、再退应用详情页；「一键获取」现在能真补上。
+
+顺带记一条 1.2.77 的实车反馈：20:19:47 车机 reset 那次出现 `PortUnreachableException`，
+新代码打出发包失败现场（`wlan0 mtu=1500`）后**重开数据口重发同一包**，全程没有 `Message too long`、
+音频也没被拆通路——发包容错按预期工作。
+
+### 1.2.77 —— 2026-11-21（音频断流容错 + 自愈，正式版）
+
+修 2026-11-21 实车（奥迪 MIB3 / 荣耀 Magic7 Pro / 1.2.74）**「音频突然没声音，必须重启才有声音」**。
+本版**未实车验证**。
+
+日志证据：17:17:14、17:27:14、17:37:14 三次 `AUDIO: UDP 发送失败 - Message too long`
+（内核 `EMSGSIZE`），**间隔恰好 600 秒**，与各自音频流的起跑时间无关；同一秒视频照常送帧、
+`WIFI: 状态心跳` 无任何网络事件——链路是好的，只有音频这条 UDP 发不出去。
+
+**为什么断了回不来**：`AudioSender.sendPayload` 把单次 `IOException` 当致命错误，`dispatchPcm`
+随即 `stop()` 拆掉整条音频通路（关 socket、释放编码器、`running=false`、体检线程 interrupt），
+而**没有任何重建路径**。之后引擎每 10 秒推一次 PCM、每 10 秒被丢弃（`音频流已停…已丢弃`），
+车机只反复重协商主屏流 `type=110`，不会顺带把音频拉起来；手动「重启音频」被
+`restartPipeline` 开头的 `if (!running) return` 直接忽略。
+
+**为什么只有 PCM 直通中招**：音频包固定 1444 B（12 RTP + 1408 PCM + 16 tag + 8 nonce），
+加 IP/UDP 头 1472 B，距 1500 MTU 只剩 **28 字节**余量；AAC 一帧约 300 B，永远碰不到这条线。
+
+四项改动：
+
+- **发包容错**（`AudioSender.sendPayload`）：单次 `IOException` 不再致命。先打失败现场，
+  再 `reopenDataSocket()` 重开数据口补发**同一个 wire**（`seq` / `timestamp` 只推进一次，
+  时间轴不会重复或跳空）；连续 3 包（≈24 ms）全败才放弃数据口。`EMSGSIZE` 这类
+  「这一刻发不出去」的错误重开即恢复。
+- **音频自愈看门狗**（`SessionController.startAudioSelfHealWatchdog`，`ensure()` 里启动）：
+  判据三件事同时成立才动手——`audioSender != null && !isRunning`（建成过又停了；
+  `null` 表示本轮没勾声音，属用户意图，绝不自动重建）、`CarLifeHijack.audioDeadDrops`
+  仍在涨（引擎真在推 PCM，用户暂停就不涨）、`phoneOwnsAudio && !audioInCallMode`
+  （不抢车机借用的主音频）。动作走手动「重启一次」同一条补建路径，退避 1/2/3/4/5 分钟、
+  上限 5 次，音频跑起来即清零；**不恢复媒体播放**（用户可能自己暂停了）。
+- **手动重启不再假装**：`restartPipeline` / `restartAudioNow` 改返回 `Boolean`，发送端没在跑时
+  明确报 false 并升级为整条流补建，日志从误导人的「重启音频被忽略」改成
+  「发送端没在运行 → 按补建处理」。
+- **失败现场诊断**：`AUDIO: 发包失败现场 —— 目标 …，包长 1444B（含 IP/UDP 头 1472B），
+  本机接口 wlan0 mtu=1500 …，发送缓冲 256KB，错误=…`，一次打全，用来坐实/推翻 PMTU 假设。
+
+配套 `CarLifeHijack` 新增 `audioDeadDrops` / `audioDeadDropAtMillis` / `resetAudioDeadDrops()`
+作为自愈信号源（只在 `sender != null` 时计数，与「本轮没要声音」区分开）。
+
+单测 **961 例 0 失败**（新增 1 例：`restartPipeline` 在未运行时返回 false）。
+
+### 1.2.76 —— 2026-11-21（占屏保留流开关 + 资源诊断 + 蓝牙守卫收敛，正式版）
+
+本版含 1.2.75 之后的 5 个功能提交。以下四项**均未实车验证**。
+
+**一、车机占屏时保留视频流（实验开关，默认关）**
+
+2026-11-21 别克 6369 日志：关掉转向后在车机上点 CarPlay，车机还屏 143ms 又夺回，
+之后连续 9 轮「抢到 → 100~172ms 被夺 → 重申请」，每轮都白做一次
+`TEARDOWN → SETUP → RECORD`，一帧留不住，界面永久等待。而同源的 link_plus
+（别克可用）与 carvex 都**不拆流**：归属变了只改状态，画面回来补关键帧。
+
+- 设置 →「显示」最下方新增 **车机占屏时保留视频流**，键 `keep_screen_stream_on_take`，默认 `false`，切换即时生效。
+- 打开后车机占屏只置 `softHold`：**不 TEARDOWN、不停编码器、不 detach 采集**；
+  归还时沿用现有 `VideoSender`，补关键帧 + 重发 `hidSetInputMode`（车机会复位 HID 输入模式，不重发则触摸静默失效）。
+- 同时尊重借用：`requestUI` 到来时若车机仍借着屏（`borrowers` 非空）不再 `overrideBorrow` 硬抢，
+  等它自己发 `transferType=4` 结束借用。
+- 关闭即完全回到旧行为。日志：`MODE: 车机占屏策略=…`、`MODE: 车机占用主屏——保留视频流（实验开关…）`、
+  `RESOURCE: 主屏归还——沿用现有视频流（实验开关），补关键帧 + 重武装 HID（N 个设备）`。
+
+**二、资源仲裁报文一次抓全**
+
+- `changeModes` 原有日志只打 `reasonStr` 键名，别克实测 14/14 全是空串，靠它判断抢屏原因这条路断了。
+  现在每轮多打一行**完整原文**：`params` 逐层摊平，含 `resources[]` 的 `transferType`/`borrowID`/约束、
+  `appStates[]` 和未知键；`/info.modes` 初始快照、`requestUI` 参数同样留原文。
+- `describe()` 借用信息带身份（`借用 phoneCall@解借1000`）。
+- 新增让屏/起流计时：`本轮第 N 次让屏 · 这次送流活了 Xms` / `车机占屏 Xms` / 被抢时 `本次送流 N 帧`。
+
+**三、车机不发 0x4301 时复用上次网络信息**
+
+四次 0x4301 的 SSID/密码/信道/地址逐字节相同（BUICK_6369），但 `lastGoodEndpoint` 只在内存里，
+进程重启即丢，于是第二次连同一台车要干等 90 秒空端点窗口。
+
+- 新增 `net/NetworkMemory.kt`：按 SSID 把 SSID/密码/信道/安全类型/端口/地址/公钥落盘到
+  `shared_prefs/carplay_network.xml`，TTL 30 天、最多 5 条。
+- 首帧成功送达才记录（`startFirstFrameGate`），失败不写；空端点分支先复用上次记录直接建链，
+  若密码变了则清除该条并回退原流程（不会拿坏凭据反复撞墙）。
+- `CURRENT_WIFI_LABEL` 收敛到 `NetworkMemory` 单一定义。10 例单测。
+- **只在车机本轮没发 0x4301 时启用**；发了就用车机新数据。
+
+**四、蓝牙守卫不再长跑**
+
+- 旧守卫等 `iap2Ready`（完整 bring-up）才收工。别克 08:17 那轮 RFCOMM 0.4s 就连上，
+  但控制会话卡在 `0x4300` ACK，`iap2Ready` 一直不来，守卫**连踢 HFP 6 次、跨 90 秒**；
+  踢 HFP 会带 ACL 一起断，只会加剧抖动。
+- 现改为 **RFCOMM 一连入即收工**（bmw134 的收敛结论），用 `controlConnectCount` 区分本轮新连入与
+  上一轮残留，另留「连入后最多再踢 1 次」兜竞态。日志：
+  `BT-GUARD: RFCOMM 已连入 → 立即收工（本次共断开 N 次）`。
+
+**五、验证要点**
+
+1. 打开新开关后打转向再关掉：期望画面几秒内自行恢复，`MODE: 停止屏幕流` 与 `StopHID`/`DETECT 重启` 那一串消失。
+2. `BT-GUARD: …再次断开（第 N 次）` 的 N 应始终 ≤1；出现第 2 次必是 bug。
+3. 对照 `changeModes 原文=` 里的 `borrowID`，确认转向影像到底用哪个借用身份。
+4. 同一台车第二次连接（车机未发 0x4301）应直接出现
+   `复用上次成功建链的网络信息：SSID=BUICK_6369…`，不再走 90 秒空端点等待。
+
+正式包 14,151,205 B，sha256 `3a174926e4480537832614b48dc92af6713c5b700da5b13ccb76b76d691e2526`；960 例单测 0 失败（versionCode 10276）。
 
 ### 1.2.75 —— 2026-11-21（触摸域自适应开关，正式版）
 

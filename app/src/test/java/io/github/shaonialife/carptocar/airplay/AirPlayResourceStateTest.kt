@@ -317,6 +317,38 @@ class AirPlayResourceStateTest {
     }
 
     @Test
+    fun `实验开关下借用未结束时 requestUI 也不抢屏，借用结束才恢复`() {
+        // 别克 6369：车机借屏放转向影像，我们在 requestUI 后立刻 overrideBorrow 抢回来，
+        // 它 100~170ms 内又判回去 —— 每轮都白付一次 SETUP/RECORD。
+        val state = AirPlayResourceState()
+        state.initialize(null)
+        state.applyCarChange(resource(1, 3, "borrowID" to "turn", "unborrowConstraint" to 100))
+        // 旧行为：约束 100 允许强抢（这条差异就是实验开关要解决的问题）
+        val legacy = AirPlayResourceState()
+        legacy.initialize(null)
+        legacy.applyCarChange(resource(1, 3, "borrowID" to "turn", "unborrowConstraint" to 100))
+        assertTrue(legacy.acquireScreen(fromRequestUi = true) { true })
+        // 实验开关：借用未结束先不动，也不发报文
+        assertFalse(
+            state.acquireScreen(fromRequestUi = true, respectBorrow = true) {
+                throw AssertionError("车机还借着屏，不该发 modesChanged")
+            },
+        )
+        assertFalse(state.phoneOwnsScreen)
+        // 车机自己结束借用（transferType=4）后，永久归属回手机
+        state.applyCarChange(resource(1, 4, "borrowID" to "turn"))
+        assertTrue(state.phoneOwnsScreen)
+    }
+
+    @Test
+    fun `实验开关不影响无借用时的正常申请`() {
+        val state = AirPlayResourceState()
+        state.initialize(resource(1, 1, "takeConstraint" to 500))
+        assertTrue(state.acquireScreen(fromRequestUi = false, respectBorrow = true) { true })
+        assertTrue(state.phoneOwnsScreen)
+    }
+
+    @Test
     fun `申请主屏不会顺带抢走车机持有的主音频`() {
         val state = AirPlayResourceState()
         state.initialize(
@@ -342,30 +374,99 @@ class AirPlayResourceStateTest {
         assertFalse(state.phoneOwnsAudio)
     }
 
+    // ---- changeModes.reasonStr 的可读形式 ----
+    // 车机只在 reasonStr 里说明「为什么动资源」。日志原来只打 params 的键名，
+    // 于是「这次抢屏是倒车、来电还是切回原生屏」事后无从判断。
+
     @Test
-    fun `requestUI 重拿主屏快照——构造临时让出报文但不污染本地持有态`() {
-        val state = AirPlayResourceState()
-        state.initialize(null)
-        assertTrue(state.phoneOwnsScreen)
-        val releasedSnapshot = state.commandWithScreenReleased()
-        val params = releasedSnapshot["params"] as Map<*, *>
-        val screenRes = (params["resources"] as List<*>).first() as Map<*, *>
-        assertEquals(2L, screenRes["entity"])
-        assertEquals(2L, screenRes["permanentEntity"])
-        // 内存态仍然保持手机持有，确保随后的 command() 直接发出 entity=1 完成 2->1 边沿
-        assertTrue(state.phoneOwnsScreen)
-        val retakeParams = state.command()["params"] as Map<*, *>
-        val retakeScreen = (retakeParams["resources"] as List<*>).first() as Map<*, *>
-        assertEquals(1L, retakeScreen["entity"])
+    fun `reasonStr 原样带引号输出`() {
+        assertEquals(
+            "\"screen native\"",
+            AirPlayResourceState.reasonText(
+                mapOf<Any?, Any?>("reasonStr" to "screen native", "resources" to emptyList<Any?>()),
+            ),
+        )
+        assertEquals("\"PHONE\"", AirPlayResourceState.reasonText(mapOf<Any?, Any?>("reasonStr" to "PHONE")))
     }
 
     @Test
-    fun `CarWith 返回原车交还主屏——takeConstraint 为 100，后续可正常再次拿回`() {
+    fun `reasonStr 缺失与空串要能区分`() {
+        assertEquals("(-)", AirPlayResourceState.reasonText(null))
+        // 只有 resources、没有 reasonStr
+        assertEquals("(-)", AirPlayResourceState.reasonText(mapOf<Any?, Any?>("resources" to emptyList<Any?>())))
+        // 给了但是空串
+        assertEquals("(\"\")", AirPlayResourceState.reasonText(mapOf<Any?, Any?>("reasonStr" to "")))
+    }
+
+    @Test
+    fun `reasonStr 非字符串取值也照打`() {
+        // plist 里数值型字段偶尔被车机塞进这个键，不能因为类型不对就整条日志丢信息
+        assertEquals("\"7\"", AirPlayResourceState.reasonText(mapOf<Any?, Any?>("reasonStr" to 7)))
+    }
+
+    // ---- params 原文摊平 ----
+    // 别克 6369 的 reasonStr 恒为空串（2026-11-21 12:10 实测 14/14），定点解析等于把
+    // 「报文里还有什么」一次性丢掉。下面锁的是「一个字段都不许漏」。
+
+    @Test
+    fun `paramsText 把 resources 逐字段摊平`() {
+        val params =
+            mapOf<Any?, Any?>(
+                "reasonStr" to "",
+                "resources" to
+                    listOf(
+                        mapOf<Any?, Any?>(
+                            "resourceID" to 1,
+                            "transferType" to 3,
+                            "borrowID" to "phoneCall",
+                            "unborrowConstraint" to 1000,
+                        ),
+                    ),
+            )
+        assertEquals(
+            "{reasonStr=\"\", resources=[{resourceID=1, transferType=3, borrowID=\"phoneCall\", unborrowConstraint=1000}]}",
+            AirPlayResourceState.paramsText(params),
+        )
+    }
+
+    @Test
+    fun `paramsText 保留没见过的键与缺省`() {
+        assertEquals("{来路不明=7}", AirPlayResourceState.paramsText(mapOf<Any?, Any?>("来路不明" to 7)))
+        assertEquals("null", AirPlayResourceState.paramsText(null))
+    }
+
+    @Test
+    fun `paramsText 二进制按十六进制截断`() {
+        val text = AirPlayResourceState.paramsText(mapOf<Any?, Any?>("data" to ByteArray(30) { it.toByte() }))
+        assertTrue(text.startsWith("{data=hex(30B)=00 01 02"))
+        assertTrue(text.endsWith("…}"))
+    }
+
+    @Test
+    fun `paramsText 超长截断并注明原长`() {
+        val text = AirPlayResourceState.paramsText(mapOf<Any?, Any?>("k" to "x".repeat(400)), limit = 60)
+        assertTrue(text.endsWith("字)"))
+        assertTrue(text.length < 100)
+    }
+
+    @Test
+    fun `describe 带出借用者身份与解借约束`() {
         val state = AirPlayResourceState()
         state.initialize(null)
-        assertTrue(state.relinquishScreenToCar { true })
-        assertFalse(state.phoneOwnsScreen)
-        assertTrue(state.acquireScreen(fromRequestUi = false) { true })
-        assertTrue(state.phoneOwnsScreen)
+        state.applyCarChange(
+            mapOf<Any?, Any?>(
+                "resources" to
+                    listOf(
+                        mapOf<Any?, Any?>(
+                            "resourceID" to 1,
+                            "transferType" to 3,
+                            "borrowID" to "phoneCall",
+                            "unborrowConstraint" to 1000,
+                        ),
+                    ),
+            ),
+        )
+        // 只写「借用 1 个」看不出是谁借的——车机借屏的动机全在 borrowID 里
+        assertTrue(state.describe(), state.describe().contains("借用 phoneCall@解借1000"))
     }
 }

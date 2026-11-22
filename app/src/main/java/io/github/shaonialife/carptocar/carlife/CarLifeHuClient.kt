@@ -1699,8 +1699,46 @@ class CarLifeHuClient(
         return ok
     }
 
+    /**
+     * 唤起 CarLife+ 语音（小度）：`MSG_CMD_HU_VOICE_CONTROL (0x10066)`。
+     *
+     * 与 [sendHardKeyCode] 的区别见 [CarLifeProtocol.HU_VOICE_CONTROL] 的注释：
+     * 硬键 `0x21` 这台车机（CarLife+ 8.8.5）**完全不处理**，语音控制是另一条消息。
+     *
+     * 判据仍然是引擎自己的 `65574`：真的起了识别才会报 `语音=1`。这里打 `已送达`
+     * 只代表 socket 写成功，**不代表引擎执行了**——日志里必须往下一行找 `语音=1`。
+     */
+    fun sendVoiceControl(command: Int, opt: Int): Boolean {
+        if (!running.get()) return false
+        val ok = send(CarLifeProtocol.HU_VOICE_CONTROL, CarLifeProtocol.voiceControlRequest(command, opt))
+        log(
+            "CARLIFE: 语音控制 0x10066 command=$command opt=$opt " +
+                (if (ok) "已送达（等引擎「语音=1」确认）" else "未送达——控制通道不可用"),
+        )
+        return ok
+    }
+
     /** 下发 `MSG_CMD_PAUSE_MEDIA (0x1800E)` 兼容暂停指令（配合硬键 `MEDIA_STOP` 兜底）。 */
     fun sendPauseMedia(): Boolean = if (running.get()) send(CarLifeProtocol.HU_PAUSE_MEDIA, ByteArray(0)) else false
+
+    /**
+     * 把 CarPlay 车机下发的昼夜状态送进手机 CarLife+ 引擎（0x18078）。
+     *
+     * 载荷 protobuf `CarlifeThemeChange{ themeModes }`：日间=0 / 夜间=1，
+     * 由引擎在自己的进程里切换导航/UI 配色。返回报文是否写出成功；
+     * 命令通道未握手时直接 false，调用方可据此判「引擎不在线」。
+     */
+    fun sendThemeChange(night: Boolean): Boolean {
+        if (!running.get()) return false
+        val mode = if (night) CarLifeProtocol.MODE_NIGHT else CarLifeProtocol.MODE_DAY
+        val ok = send(CarLifeProtocol.HU_THEME_CHANGE, CarLifeProtocol.themeChange(mode))
+        log(
+            "CARLIFE: 主题切换 0x18078 themeModes=$mode" +
+                "（${if (night) "夜间" else "日间"}）" +
+                if (ok) "" else " —— 命令通道不可用，未送达",
+        )
+        return ok
+    }
 
     /**
      * 只重发 98311 编码初始化（**不碰** 98386）。

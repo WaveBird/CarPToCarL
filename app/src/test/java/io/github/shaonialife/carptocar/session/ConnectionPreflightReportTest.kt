@@ -97,13 +97,18 @@ class ConnectionPreflightReportTest {
 
     @Test
     fun thirteenItemsAreChecked() {
-        // 13 项（含「后台存活未被限制」与「本机 CarWith / CarLife 画面源」）。
+        // 13 项（2026-11-17 加「后台存活未被限制」，2026-11-21 加「显示在其他应用上层」）。
+        // 后加的那项补的是「车机靠近了手机毫无反应」——后台 startActivity 被静默拦掉，
+        // 而旧体检里它一个字都没有，日志里只有 CarApproachReceiver 自己写的一行。
         // 注意**不含投屏授权（MediaProjection）**——本版本画面走双屏虚拟屏、
         // 声音走 CarLife 引擎 PCM 直通，都不过 MediaProjection（2026-11-11 核对）。
-        assertEquals(13, Requirement.values().size)
+        // 14 项:1.2.76 的 13 项 + 上游 1.2.79 并入的 OVERLAY(悬浮窗,车机自动拉起 App 的命门)。
+        // 注意不含投屏授权(MediaProjection)——本版本画面走双屏虚拟屏、声音走 CarLife 引擎
+        // PCM 直通,都不过 MediaProjection(2026-11-11 核对)。
+        assertEquals(14, Requirement.values().size)
         assertTrue(Requirement.values().any { it.name == "NOTIFICATION_ACCESS" })
         assertTrue(Requirement.values().any { it.name == "BACKGROUND_SURVIVAL" })
-        assertTrue(Requirement.values().any { it.name == "CARLIFE_SOURCE" })
+        assertTrue(Requirement.values().any { it.name == "OVERLAY" })
         assertFalse(Requirement.values().any { it.name == "PROJECTION" })
     }
 

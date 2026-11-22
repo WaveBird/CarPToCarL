@@ -666,6 +666,25 @@ object SessionController {
         // 第三方播放器不触发 CarLife 的 0x10035，歌名只能从 MediaSession 拿。
         MediaSessionsState.addListener {
             val np = MediaSessionsState.nowPlaying ?: return@addListener
+            // 暂停冻结:第三方播放器 playing 抖动(2-7 秒一次 true→false)会让 0x5001
+            // 反复在 PLAYING/PAUSED 之间翻转,而 CarWith 模式下引擎在暂停期间继续推
+            // **真实静音 PCM**——车机把「PAUSED + 静音流」理解成媒体通路已沉默,
+            // 输出设备被释放,App 恢复后的真声音再推也无声(2026-11-22 实车复现)。
+            // 暂停瞬间只记状态、不上报;恢复时一次性推 PLAYING,把车机媒体通路拉回激活。
+            if (!np.playing) {
+                if (!mediaSessionPaused) {
+                    mediaSessionPaused = true
+                    appendLog(
+                        "EVENT: MediaSession 暂停「${np.title ?: "?"}」→ 冻结 0x5001 状态推送" +
+                            "（保持车机媒体通路激活,防输出设备被释放）",
+                    )
+                }
+                return@addListener
+            }
+            if (mediaSessionPaused) {
+                mediaSessionPaused = false
+                appendLog("EVENT: MediaSession 恢复播放「${np.title ?: "?"}」→ 补推 0x5001（解除冻结）")
+            }
             appendLog(
                 "EVENT: MediaSession 歌名「${np.title ?: "?"}」→ 补推 iAP2 0x5001 NowPlayingUpdate",
             )
@@ -687,6 +706,9 @@ object SessionController {
      * （真车路径）。蓝牙链路只在测试台用，逐秒补推没有意义还添噪音。
      */
     private fun pushNowPlayingPosition() {
+        // 暂停冻结期间跳过逐秒补推:静音 PCM 流 + 每秒重申 PAUSED 是车机释放输出
+        // 设备的直接诱因;冻结期间车机侧进度停在暂停那一刻,与真实体验一致。
+        if (mediaSessionPaused) return
         val now = android.os.SystemClock.elapsedRealtime()
         if (now - lastPositionLogAtMs >= 10_000L) {
             lastPositionLogAtMs = now
@@ -751,6 +773,10 @@ object SessionController {
         lastEncodedBytes = null
         // 「这台车不取封面」是**一轮连接一次**的判断：换链路/换车都可能不一样，重新试。
         Iap2ArtworkSupport.reset()
+        // 暂停冻结是「一轮会话」的状态:新会话按 MediaSession 当前真实状态重建。
+        // 不复位的话,上一轮结束时的暂停会残留到新会话——重连后逐秒补推被永久跳过、
+        // provider 永远报 PLAYING 假状态(2026-11-22 审查意见 D)。
+        mediaSessionPaused = MediaSessionsState.nowPlaying?.playing == false
     }
 
     // ---- 封面（iAP2 session 12 文件传输）----
@@ -893,6 +919,19 @@ object SessionController {
      * [includeArtwork]=false 时不声明封面编号：**蓝牙 iAP2 链路还没有文件传输实现**，
      * 声明了编号却不传图，车机会留着封面位一直等（或反复重试同一个 id）。
      */
+    /**
+     * 「媒体会话当前是否处于暂停态」——供 0x5001 推送节流用。
+     *
+     * 宝马 MGU 实测(2026-11-22 11:43):汽水音乐 playing 抖动(3.1 秒就翻 false)时,
+     * 0x5001 被推成 STATUS_PAUSED,而引擎在暂停丢弃门禁禁用(CarWith 模式)下继续把
+     * **真实静音 PCM** 原样推给车机——车机把「PAUSED 状态 + 持续静音 PCM」理解为
+     * 「该媒体通路沉默了」,输出设备被释放;App 恢复播放后推的真声音不再被播出。
+     * 修复:暂停瞬间冻结 0x5001 推送(状态变化也不再上报),恢复时一次性推 PLAYING。
+     * 车机媒体通路全程保持「激活」认知,输出设备不会被释放。
+     */
+    @Volatile
+    private var mediaSessionPaused = false
+
     private fun buildNowPlaying(includeArtwork: Boolean = true): CarPlayNowPlaying? {
         val session = MediaSessionsState.nowPlaying
         val carLifeLatest = CarLifeHijack.latestMediaInfo
@@ -914,17 +953,32 @@ object SessionController {
                 artist = session.artist,
                 album = null, // MediaSession 未单独暴露专辑名，这里留空
                 durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                // 暂停冻结在 provider 层生效:0x5001 的全部出口(MediaSession 事件、
+                // 逐秒位置补推、VirtualIap2Link 1.5s 周期 poll、0x5000 订阅应答、
+                // CarLife 0x10035 桥接)都经由本函数取数——一处冻结,全通道一致。
+                // 宝马 MGU 实测(2026-11-22 11:43):playing 抖动时推 PAUSED + 引擎继续
+                // 推真实静音 PCM,车机把「PAUSED+静音流」当作媒体通路沉默,输出设备被
+                // 释放,App 恢复后推的真声音不再播出。冻结期间维持「播放中」认知,
+                // 进度停在暂停那一刻(不外推),车机媒体通路全程保持激活。
                 status =
-                    if (session.playing) {
+                    if (session.playing || mediaSessionPaused) {
                         Iap2NowPlaying.STATUS_PLAYING
                     } else {
                         Iap2NowPlaying.STATUS_PAUSED
                     },
                 elapsedMs =
-                    session
-                        .displayPositionAt(android.os.SystemClock.elapsedRealtime())
-                        .coerceAtMost(Int.MAX_VALUE.toLong())
-                        .toInt(),
+                    if (mediaSessionPaused && !session.playing) {
+                        // 冻结时的位置:停在暂停那一刻。displayPositionAt 会按
+                        // playbackSpeed 外推,冻结后改用锚点时刻的裸位置(不外推),
+                        // 车机进度条静止、不回跳。
+                        // 锚点时刻的裸位置(positionMs),不外推:车机进度条静止、不回跳。
+                        session.positionMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    } else {
+                        session
+                            .displayPositionAt(android.os.SystemClock.elapsedRealtime())
+                            .coerceAtMost(Int.MAX_VALUE.toLong())
+                            .toInt()
+                    },
                 appName = session.pkg,
                 artworkId =
                     if (includeArtwork && !Iap2ArtworkSupport.unsupported) {
@@ -4177,7 +4231,7 @@ object SessionController {
                 }
             }
         },
-        onScreenResumed = { sender ->
+        onScreenResumed = { sender, isReplacement ->
             synchronized(sessionLifecycleLock) {
                 if (currentClient !== client || client.cancelled || !client.phoneOwnsScreen) {
                     false
@@ -4186,8 +4240,11 @@ object SessionController {
                     videoSessionFrameBase = CarLifeHijack.framesDelivered
                     CarLifeHijack.attach(sender, ::appendLog)
                     ScreenDimmer.setSessionActive(true)
-                    phaseHint = "主屏资源已归还，CarPlay 视频恢复"
-                    appendLog("RESOURCE: 主屏归还，已重新 SETUP/RECORD 并恢复视频（音频所有权独立）")
+                    phaseHint = if (isReplacement) "CarPlay 视频运行中" else "主屏资源已归还，CarPlay 视频恢复"
+                    appendLog(
+                        if (isReplacement) "RESOURCE: 视频流替换完成（车机占屏保留流/换流），继续推帧"
+                        else "RESOURCE: 主屏归还，已重新 SETUP/RECORD 并恢复视频（音频所有权独立）",
+                    )
                     startCarlifeWaitNotice()
                     startFirstFrameGate()
                     startScreenHandoverGate(client)
@@ -4602,15 +4659,34 @@ object SessionController {
         pendingAudioRebuild = null
         val sender = audioSender
         if (sender != null && sender.isRunning) {
-            val rebuilt = rebuildAudioChannel(reason)
+            // 授权拆流兜底的两类路径(旧流均已无声):
+            //  1. 用户主动触发(语音键三连击/界面按钮)——明确宣告「我要声音回来」;
+            //  2. 通话结束看门狗自动重建——通话期间媒体流已被换档/停推,旧媒体流已废。
+            // 多档 SETUP 全 400 时拆掉旧流重试是唯一能救活的路径;红线约束仍由
+            // rebuildAudioChannel 内部保证——重试成功才停旧流收尾,重试全失败也只是
+            // 回到无声,不会更糟。
+            val rebuilt = rebuildAudioChannel(reason, allowTeardownFallback = true)
             appendLog(
                 if (rebuilt) {
                     "AUDIO: ✓ 重启音频完成（新流已建、旧流已停）"
+                } else if (audioSender == null) {
+                    // 拆流兜底已把旧流拆停、重试又全失败:此刻是完全无声,别再写
+                    // 「旧流仍在推」误导排查(2026-11-22 审查意见 C)。
+                    "AUDIO: 重启音频失败——旧流已拆停、重建未成功，当前完全无声" +
+                        "（无流状态下再按一次语音键会走完整补建路径）"
                 } else {
                     "AUDIO: 重启音频只完成了一半——泵已重置，音频流重建失败（旧流仍在推）"
                 },
             )
-            uiHintSink?.invoke(if (rebuilt) "音频已重启" else "音频已重置（流重建失败，旧流仍在推）")
+            uiHintSink?.invoke(
+                if (rebuilt) {
+                    "音频已重启"
+                } else if (audioSender == null) {
+                    "音频重启失败（旧流已拆停）——再按一次语音键补建"
+                } else {
+                    "音频已重置（流重建失败，旧流仍在推）"
+                },
+            )
             return
         }
         // 流根本没在推（引擎退出后没恢复、上一轮拆流没建回来）：这不是「重建」而是「补建」，
@@ -4660,7 +4736,11 @@ object SessionController {
      * 绝不能把「本来还有声」搞成「彻底没声」。
      */
     @Synchronized
-    fun rebuildAudioChannel(reason: String): Boolean {
+    fun rebuildAudioChannel(
+        reason: String,
+        /** 拆旧流重试（最后一级）是否允许。仅在旧流已无声时由调用方传 true。 */
+        allowTeardownFallback: Boolean = false,
+    ): Boolean {
         val client = currentClient ?: return false
         if (!client.phoneOwnsAudio) return false
         val secret = currentSharedSecret ?: return false
@@ -4670,17 +4750,155 @@ object SessionController {
         val old = audioSender ?: return false
         if (!old.isRunning) return false
         appendLog("AUDIO: $reason → 重建音频流（接收端音频输出在通话期间被释放，需新建流才会重开）")
-        val info =
-            try {
-                // 重建时把上行端口继续声明进去：不然车机以为手机不要麦了，通话里反而没上行
-                client.runAudioStream(secret, profile, AudioTuning.RAW_SPF, micPort = micPortFor(profile, micUplink))
-            } catch (error: Exception) {
-                appendLog("AUDIO: 重建协商异常 - ${error.message}")
-                null
+        // 重建候选：不再只拿当前档盲试同一档——宝马 MGU-55-J 实测同一档重发两次都被
+        // 400（2026-11-22 11:43:41 / 11:43:50），旧流继续推等于什么都没换。
+        // 候选来源与首轮完全一致（/info 位图 + 车机记忆排序 + 直通 PCM 优先），
+        // 当前档排最前以保持老行为；被拒档随试随记（markExhausted=false，SETUP 被拒
+        // 可能只是一次仲裁/时序抖动，不据此判死整车机音频）。
+        val identity = client.receiverIdentity()
+        val memoryEntry = AudioProfileMemory.load(context, identity)
+        val ratePref = io.github.shaonialife.carptocar.audio.AudioRatePreference.load(context)
+        val preferRate =
+            ratePref.preferredRate(
+                io.github.shaonialife.carptocar.audio.AudioRatePreference.announcedMediaRate(context),
+            )
+        val ordered =
+            client
+                .audioCandidates(preferCompat = audioPreferCompat, preferRate = preferRate)
+                .let { base ->
+                    val memoryOrdered = AudioProfileMemory.order(base, memoryEntry)
+                    // 直通（1.2.72 起音频只有这一条路径）PCM 档优先，与首轮逻辑一致；
+                    // 当前档提到最前，保证「本轮刚用过的档」仍第一个被试。
+                    val passthroughFirst =
+                        memoryOrdered.sortedBy { if (it.codec == io.github.shaonialife.carptocar.audio.AudioCodec.PCM) 0 else 1 }
+                    val current = passthroughFirst.firstOrNull { it.key == profile.key }
+                    if (current != null) {
+                        listOf(current) + passthroughFirst.filter { it.key != profile.key }
+                    } else {
+                        passthroughFirst
+                    }
+                }
+        appendLog(
+            "AUDIO: 重建候选=${ordered.map { it.label }}" +
+                "（车机记忆：${AudioProfileMemory.describe(memoryEntry)}；当前档=${profile.label}）",
+        )
+        var info: AirPlayClient.AudioStreamInfo? = null
+        var chosen: AudioProfile = profile
+        for (candidate in ordered) {
+            val candidateInfo =
+                try {
+                    // 重建时把上行端口继续声明进去：不然车机以为手机不要麦了，通话里反而没上行
+                    client.runAudioStream(secret, candidate, AudioTuning.RAW_SPF, micPort = micPortFor(candidate, micUplink))
+                } catch (error: Exception) {
+                    appendLog("AUDIO: 重建协商异常（${candidate.label}）- ${error.message}")
+                    null
+                }
+            if (candidateInfo != null) {
+                info = candidateInfo
+                chosen = candidate
+                break
             }
+            AudioProfileMemory.recordRejected(
+                context,
+                identity,
+                candidate.key,
+                ordered.map { it.key }.toSet(),
+                markExhausted = false,
+            )
+            appendLog("AUDIO: 重建档位 ${candidate.label} 协商失败——保持原音频流继续推，本会话内试下一档")
+        }
         if (info == null) {
-            appendLog("AUDIO: 重建协商失败——保持原音频流继续推（不降级成无声）")
-            return false
+            // 多档全部失败的最后一级手段：旧流此刻已经无声（这正是重建的原因），
+            // 「保持旧流继续推」只是挡住了下一次重建，没有任何价值。
+            // 拆掉旧音频流（只拆音频流，不拆会话/视频），让车机释放该通路的流状态，
+            // 再把候选重试一轮——宝马 MGU 实测 400 的成因正是
+            // 「同 type 已有存活流时的重复 SETUP」，旧流拆掉后同档就不再撞 400。
+            if (!allowTeardownFallback) {
+                appendLog(
+                    "AUDIO: 重建协商失败（共试 ${ordered.size} 档）——保持原音频流继续推" +
+                        "（未授权拆流兜底，避免把可能仍有声的流拆成无声）",
+                )
+                return false
+            }
+            appendLog("AUDIO: 重建协商失败（共试 ${ordered.size} 档）——旧流已无声，改走「拆旧流再重试」最后一级")
+            val tornDown =
+                try {
+                    client.teardownStream(profile.streamType)
+                } catch (error: Exception) {
+                    appendLog("AUDIO: 拆旧音频流异常 - ${error.message}")
+                    false
+                }
+            appendLog(
+                if (tornDown) "AUDIO: ✓ 旧音频流已 TEARDOWN（车机侧流状态已释放）——重试一轮候选"
+                else "AUDIO: 旧音频流 TEARDOWN 未确认（车机可能不回 200）——仍按已释放重试一轮",
+            )
+            // 拆流后 sender 仍在跑（socket 还开着），但它的流在车机侧已经没了：
+            // 推出去的包都会被丢弃。先把旧 sender 停掉，避免「包在发、车机不收」的假象。
+            old.stop()
+            audioSender = null
+            var retryInfo: AirPlayClient.AudioStreamInfo? = null
+            var retryChosen: AudioProfile = profile
+            for (candidate in ordered) {
+                val retryCandidateInfo =
+                    try {
+                        client.runAudioStream(
+                        secret, candidate, AudioTuning.RAW_SPF,
+                        micPort = micPortFor(candidate, micUplink),
+                        // 拆流重试轮用短超时：车机要么快速 200 要么快速 400，长等待只发生在彻底卡死时
+                        setupTimeoutMillis = 4_000,
+                    )
+                    } catch (error: Exception) {
+                        appendLog("AUDIO: 重试协商异常（${candidate.label}）- ${error.message}")
+                        null
+                    }
+                if (retryCandidateInfo != null) {
+                    retryInfo = retryCandidateInfo
+                    retryChosen = candidate
+                    break
+                }
+                AudioProfileMemory.recordRejected(
+                    context,
+                    identity,
+                    candidate.key,
+                    ordered.map { it.key }.toSet(),
+                    markExhausted = false,
+                )
+                appendLog("AUDIO: 重试档位 ${candidate.label} 协商失败——继续试下一档")
+            }
+            if (retryInfo == null) {
+                // 重试仍全失败:车机对新连接 ID 的同档 SETUP 仍拒绝——不是「重复 SETUP」,
+                // 而是「通路整体卡死」。最后一搏:按**原档**(车机记忆里成功过 200 的档位)
+                // 以全新连接 ID 回建。拆流后同档重试仍 400 说明车机的流状态机卡死,
+                // 此时唯一未试过的变量是「再来一次」——原档回建的成功概率最高。
+                appendLog("AUDIO: 拆旧流重试仍全部失败（共 ${ordered.size} 档）——按原档 ${profile.label} 兜底回建")
+                val fallbackInfo =
+                    try {
+                        client.runAudioStream(secret, profile, AudioTuning.RAW_SPF, micPort = micPortFor(profile, micUplink))
+                    } catch (error: Exception) {
+                        appendLog("AUDIO: 原档兜底协商异常 - ${error.message}")
+                        null
+                    }
+                if (fallbackInfo == null) {
+                    appendLog(
+                        "AUDIO: 原档兜底也失败——车机侧音频通路整体卡死。" +
+                            "语音键三连击可触发补建（无流时走完整补建路径），仍无效再断开重连",
+                    )
+                    return false
+                }
+                appendLog("AUDIO: ✓ 原档兜底回建成功（${profile.label}，dataPort=${fallbackInfo.dataPort}）")
+                retryInfo = fallbackInfo
+                retryChosen = profile
+            }
+            info = retryInfo
+            chosen = retryChosen
+            appendLog(
+                "AUDIO: ✓ 拆旧流重试成功（${if (chosen.label != profile.label) "${profile.label} → ${chosen.label}" else chosen.label}，" +
+                    "dataPort=${info.dataPort}）",
+            )
+        }
+        if (chosen.key != profile.key) {
+            appendLog("AUDIO: ✓ 重建换档成功：${profile.label} → ${chosen.label}")
+            activeAudioProfile = chosen
         }
         // 新流的密钥盐变了，上行监听跟换
         micUplink?.updateKey(secret, info.streamConnectionId)
@@ -4698,15 +4916,19 @@ object SessionController {
                 log = { line -> appendLog(line) },
                 context = context,
                 sampleRate = info.sampleRate,
-                codec = profile.codec,
-                streamType = profile.streamType,
+                codec = chosen.codec,
+                streamType = chosen.streamType,
                 adtsFrames = AudioTuning.RAW_SPF.adts,
                 controlPort = info.controlPort,
-                channelCount = profile.channels,
+                channelCount = chosen.channels,
             )
         audioSender = sender
         if (!sender.startPassthrough()) {
             audioSender = null
+            // 与首轮 startAudioChannel 失败路径对齐：换档成功但直通启动失败时，
+            // 不把 chosen 残留在 activeAudioProfile 里（否则下次重建会拿一个
+            // 没有在推的档当「当前档」置顶，语义错位）。
+            activeAudioProfile = null
             activeAudioStartedAt = 0L
             appendLog("AUDIO: 音频流重建后启动失败——本次仅推视频（重连可恢复）")
             return false
@@ -4866,7 +5088,7 @@ object SessionController {
                 } catch (_: InterruptedException) {
                     return@Thread
                 }
-                runCatching { rebuildAudioChannel("通话结束 ${AUDIO_REBUILD_DELAY_MS / 1000} 秒后") }
+                runCatching { rebuildAudioChannel("通话结束 ${AUDIO_REBUILD_DELAY_MS / 1000} 秒后", allowTeardownFallback = true) }
                     .onFailure { appendLog("AUDIO: 重建异常 - ${it.message}") }
             }
         worker.isDaemon = true

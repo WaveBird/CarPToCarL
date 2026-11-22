@@ -1,12 +1,14 @@
 package io.github.shaonialife.carptocar.bt
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import io.github.shaonialife.carptocar.util.DebugFileLog
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -55,6 +57,15 @@ object BtProfiles {
     /** profile id → 已获取的代理（进程内复用；代理本身无会话状态）。 */
     private val proxies = HashMap<Int, BluetoothProfile>()
 
+    /**
+     * 蓝牙服务重启日志的节流时间戳（2026-11-21 诊断）。
+     *
+     * onServiceDisconnected 会在蓝牙栈重启时对每个 profile 都回调一次，不节流会一次刷 3 行；
+     * 这里按进程时间限流，保证「有一次重启」这件事可见，又不淹没断开动作的时间线。
+     */
+    @Volatile
+    private var lastServiceLostLogAt = 0L
+
     /** 该地址当前在线（已连接）的配置文件名称。 */
     fun connectedNames(
         context: Context,
@@ -99,6 +110,15 @@ object BtProfiles {
         val before = connectedNames(context, address)
         if (before.isEmpty()) return emptyList()
         val device = deviceHint ?: remoteDevice(context, address)
+        // 2026-11-21 诊断：记下断开动作发生时的蓝牙适配器状态 + 时间戳。判「断 HFP 会不会
+        // 把手机蓝牙栈踢重启」就靠这条和 BT-STATE 广播、onServiceDisconnected 三者对齐：
+        // 若断开后紧跟着 TURNING_OFF / service 断开，则假设成立。
+        adapterState(context)?.let { state ->
+            DebugFileLog.append(
+                context,
+                "BT-PROFILE: 请求断开 $before · 适配器态=${stateName(state)} · $address",
+            )
+        }
         for (id in profiles) {
             if (profileName(id) !in before) continue
             val proxy = proxy(context, id)
@@ -107,11 +127,33 @@ object BtProfiles {
         if (!awaitDisconnected(context, address, 1_500L) && device != null) {
             // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
             // BLUETOOTH_CONNECT）。车载/耳机当前连接的设备可能被一并断开，属预期。
+            // 这一步是「断 HFP 却把整机蓝牙带崩」的最大嫌疑点，单独记一行。
+            DebugFileLog.append(context, "BT-PROFILE: 配置级断开超时 → 升级为设备级 disconnect() 兜底")
             runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
             awaitDisconnected(context, address, 500L)
         }
         return before
     }
+
+    /** 蓝牙适配器当前状态；读不到返回 null（日志里缺一行无妨，不能因此中断断开动作）。 */
+    private fun adapterState(context: Context): Int? =
+        try {
+            (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)
+                ?.adapter
+                ?.state
+        } catch (_: Throwable) {
+            null
+        }
+
+    /** 适配器状态值 → 可读名，纯函数。 */
+    internal fun stateName(state: Int): String =
+        when (state) {
+            BluetoothAdapter.STATE_OFF -> "OFF(10)"
+            BluetoothAdapter.STATE_TURNING_ON -> "TURNING_ON(11)"
+            BluetoothAdapter.STATE_ON -> "ON(12)"
+            BluetoothAdapter.STATE_TURNING_OFF -> "TURNING_OFF(13)"
+            else -> "UNKNOWN($state)"
+        }
 
     /**
      * 音频配置守卫：**建链期持续**把该设备的 HFP/A2DP 断开（2026-11-08 按宝马 fork 移植）。
@@ -139,7 +181,10 @@ object BtProfiles {
         shouldStop: () -> Boolean,
         onEvent: (String) -> Unit,
         stopLabel: () -> String = { "会话已激活" },
+        /** iAP2 握手期间暂停踢除（1.2.76 宝马实测：握手期踢 HFP 会打断建链）。 */
         shouldPause: () -> Boolean = { false },
+        /** 本轮 RFCOMM 是否已连入；连入即收工，不再踢 HFP/A2DP。 */
+        controlConnected: () -> Boolean = { false },
     ): Int {
         val started = SystemClock.uptimeMillis()
         var drops = 0
@@ -153,6 +198,19 @@ object BtProfiles {
                 onEvent("BT-GUARD: ${stopLabel()} → 立即收工（本次共断开 $drops 次）")
                 return drops
             }
+            if (shouldPause()) {
+                // iAP2 握手进行中：这轮不踢（宝马实测握手期踢 HFP/A2DP 会带着 ACL 一起断）。
+                idlePolls = 0
+                Thread.sleep(AudioProfileGuardPolicy.POLL_MILLIS)
+                continue
+            }
+            // 车机已经连进 iAP2 服务：守卫的使命到此为止。我们以前等的是更晚的
+            // iap2Ready，卡在 0x4300 ACK 时会一直踢 HFP（08:17 那轮 90 秒踢 6 次），
+            // 而踢 HFP 会带 ACL 一起断，只会让控制链路更不稳。
+            if (controlConnected()) {
+                onEvent("BT-GUARD: RFCOMM 已连入 → 立即收工（本次共断开 $drops 次）")
+                return drops
+            }
             val elapsed = SystemClock.uptimeMillis() - started
             if (!AudioProfileGuardPolicy.shouldKeepGuarding(elapsed)) {
                 onEvent(
@@ -161,44 +219,43 @@ object BtProfiles {
                 )
                 return drops
             }
-            if (!shouldPause()) {
-                val address = addressProvider()
-                if (address == null) {
-                    // 还没有对端（没指定目标、也还没建链）：空转 60 秒就收工，别留一条
-                    // 白睡的线程跑到 5 分钟上限。
-                    idlePolls++
-                    if (idlePolls * AudioProfileGuardPolicy.POLL_MILLIS >= NO_PEER_GIVE_UP_MILLIS) {
-                        onEvent("BT-GUARD: 一直没有对端可盯（未指定目标、也没建链）→ 收工")
+            val address = addressProvider()
+            if (address == null) {
+                // 还没有对端（没指定目标、也还没建链）：空转 60 秒就收工，别留一条
+                // 白睡的线程跑到 5 分钟上限。
+                idlePolls++
+                if (idlePolls * AudioProfileGuardPolicy.POLL_MILLIS >= NO_PEER_GIVE_UP_MILLIS) {
+                    onEvent("BT-GUARD: 一直没有对端可盯（未指定目标、也没建链）→ 收工")
+                    return drops
+                }
+            } else {
+                idlePolls = 0
+                val before = connectedNames(context, address)
+                if (before.isNotEmpty()) {
+                    // 二次确认（并再查一次 RFCOMM）：这几步本身要几十~几百毫秒，
+                    // 车机可能刚好在这期间连进来。连接既已建立就别再动它——
+                    // 保持现有配置文件，别在控制链路刚起来时把车机的音频路径掐断。
+                    val connectedNow = controlConnected()
+                    if (shouldStop() || connectedNow) {
+                        onEvent(
+                            "BT-GUARD: ${if (connectedNow) "RFCOMM 已连入" else stopLabel()} → " +
+                                "取消本次断开（${before.joinToString("/")} 保持在线），" +
+                                "收工（本次共断开 $drops 次）",
+                        )
                         return drops
                     }
-                } else {
-                    idlePolls = 0
-                    val before = connectedNames(context, address)
-                    if (before.isNotEmpty()) {
-                        // 二次确认：查状态本身就要几十~几百毫秒，这段时间里会话可能刚好
-                        // 起来。会话既已激活就别再动它——保持现有连接，让声音留在它该在
-                        // 的地方，别在推流中途把车机的音频路径掐断再让它自己拉回来。
-                        if (shouldStop()) {
-                            onEvent(
-                                "BT-GUARD: ${stopLabel()} → 取消本次断开" +
-                                    "（${before.joinToString("/")} 保持在线），收工（本次共断开 $drops 次）",
-                            )
+                    val dropped = disconnectAddress(context, address)
+                    if (dropped.isNotEmpty()) {
+                        drops++
+                        onEvent(
+                            "BT-GUARD: 车机把 ${dropped.joinToString("/")} 拉回来了 → " +
+                                "再次断开（第 $drops 次）",
+                        )
+                        // 硬上限：RFCOMM 连入后最多再踢 1 次，防「查询→断开」竞态里
+                        // 守卫追着刚建好的控制链路继续踢（bmw134 的 ACL 抖动）。
+                        if (controlConnected() && drops >= AudioProfileGuardPolicy.MAX_DROPS_AFTER_RFCOMM) {
+                            onEvent("BT-GUARD: RFCOMM 已连入且已断开 $drops 次 → 提前收工")
                             return drops
-                        }
-                        if (shouldPause()) {
-                            onEvent(
-                                "BT-GUARD: iAP2 正在握手 → 暂不断开" +
-                                    "（${before.joinToString("/")}），避免误杀蓝牙链路",
-                            )
-                        } else {
-                            val dropped = disconnectAddress(context, address)
-                            if (dropped.isNotEmpty()) {
-                                drops++
-                                onEvent(
-                                    "BT-GUARD: 车机把 ${dropped.joinToString("/")} 拉回来了 → " +
-                                        "再次断开（第 $drops 次）",
-                                )
-                            }
                         }
                     }
                 }
@@ -275,6 +332,17 @@ object BtProfiles {
                         override fun onServiceDisconnected(id: Int) {
                             // 蓝牙服务重启后旧代理失效：清缓存，下次重新获取
                             synchronized(proxies) { proxies.remove(id) }
+                            // 2026-11-21 诊断：profile 代理被系统收回 = 蓝牙栈重了的直接信号
+                            // （通常伴随 com.android.bluetooth 进程重启）。节流后记一行，
+                            // 用来和断开动作的时间戳对齐。
+                            val now = SystemClock.uptimeMillis()
+                            if (now - lastServiceLostLogAt > 3_000L) {
+                                lastServiceLostLogAt = now
+                                DebugFileLog.append(
+                                    context.applicationContext,
+                                    "BT-PROFILE: profile 服务断开（${profileName(id)}）——蓝牙栈重启信号",
+                                )
+                            }
                             latch.countDown()
                         }
                     },
@@ -327,6 +395,9 @@ object BtProfiles {
 object AudioProfileGuardPolicy {
     const val POLL_MILLIS = 1_500L
     const val MAX_MILLIS = 300_000L
+
+    /** RFCOMM 连入后最多再踢 1 次（竞态兜底；正常路径一连入就收工）。 */
+    const val MAX_DROPS_AFTER_RFCOMM = 1
 
     /** 守卫是否还该继续盯：从开始计时起，未到上限就一直盯。 */
     fun shouldKeepGuarding(

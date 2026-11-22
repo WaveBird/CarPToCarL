@@ -79,6 +79,10 @@ class AirPlayResourceState {
 
         fun copy() = Resource(permanentEntity, takeConstraint, borrowers.toMutableList(), borrowConstraint, phoneBorrowing)
 
+        /** 车机是否还借着（实验开关据此决定不去抢）。 */
+        val hasBorrowers: Boolean
+            get() = borrowers.isNotEmpty()
+
         fun reset() {
             permanentEntity = ENTITY_PHONE
             takeConstraint = null
@@ -184,11 +188,24 @@ class AirPlayResourceState {
         }
     }
 
-    /** 申请主屏；[fromRequestUi] = 车机 `requestUI` 主动请回手机画面，可收回车机的临时借屏。 */
+    /**
+     * 申请主屏。
+     *
+     * @param fromRequestUi 车机 `requestUI` 主动请回手机画面，可收回车机的临时借屏
+     * @param respectBorrow 车机还借着屏就**不申请**（实验开关）：link_plus 的做法——
+     *   借用未结束时 requestUI 不改变归属，等车机自己发 `transferType=4` 结束借用
+     */
     fun acquireScreen(
         fromRequestUi: Boolean,
+        respectBorrow: Boolean = false,
         publish: (Map<String, Any?>) -> Boolean,
-    ): Boolean = claimAndPublish(RESOURCE_SCREEN, publish) { it.claim(PRIORITY_USER, overrideBorrow = fromRequestUi) }
+    ): Boolean =
+        claimAndPublish(RESOURCE_SCREEN, publish) { screen ->
+            when {
+                respectBorrow && screen.hasBorrowers -> false
+                else -> screen.claim(PRIORITY_USER, overrideBorrow = fromRequestUi)
+            }
+        }
 
     /**
      * 用户在手机车联内点击「返回原车」时主动把主屏交还车机（takeConstraint=100，允许下次用户点图标拿回）。
@@ -395,7 +412,14 @@ class AirPlayResourceState {
 
     private fun ownerName(resource: Resource): String {
         val base = if (resource.entity == ENTITY_PHONE) "手机" else "车机"
-        val borrow = if (resource.borrowers.isEmpty()) "" else "（借用 ${resource.borrowers.size} 个）"
+        // 借用者要带 **borrowID 与解借约束**：车机借屏/借音频时只在这里露身份
+        // （真车取值见过 `phoneCall`、倒车/PDC 一类），只说「借用 1 个」等于没说。
+        val borrow =
+            if (resource.borrowers.isEmpty()) {
+                ""
+            } else {
+                "（借用 " + resource.borrowers.joinToString("+") { "${it.first ?: "<无ID>"}@解借${it.second}" } + "）"
+            }
         val permanent = if (resource.permanentEntity == ENTITY_PHONE) "永久=手机" else "永久=车机"
         return "$base$borrow/$permanent"
     }
@@ -502,6 +526,50 @@ class AirPlayResourceState {
         /** transferPriority：100 = 后台（导航播报），500 = 用户发起（主屏、媒体播放）。 */
         const val PRIORITY_BACKGROUND = 100
         const val PRIORITY_USER = 500
+
+        /**
+         * `changeModes.params.reasonStr` 的可读文本——车机唯一说明「为什么动资源」的人话字段。
+         *
+         * 真车取值见过 `screen native`（原生屏切换）、`PHONE`（来电/微信语音借走音频）。
+         * 此前日志只打 params 的**键名**（`reasonStr,resources`），于是「这次抢屏是倒车、
+         * 来电还是车机切回原生屏」事后无法回答——只能靠猜。
+         *
+         * 缺省与空串分开报：`(-)` = 车机压根没给这个字段，`("")` = 给了但为空。
+         */
+        fun reasonText(params: Map<*, *>?): String {
+            val raw = params?.get("reasonStr") ?: return "(-)"
+            val text = raw.toString()
+            return if (text.isEmpty()) "(\"\")" else "\"$text\""
+        }
+
+        /**
+         * 把 `changeModes` / `requestUI` / `/info.modes` 的 `params` **原样摊平**成一行文本。
+         *
+         * 为什么不用定点解析：`reasonStr` 在别克 6369 上恒为空串（2026-11-21 12:10 实测 14/14），
+         * 定点解析等于把「报文里还有什么」这件事一次性丢掉。这里把所有键（含没见过的新键）
+         * 全部打出来，嵌套的 map / list / data 也逐层展开——一次抓包就够定位，不用再补日志。
+         */
+        fun paramsText(
+            value: Any?,
+            limit: Int = 700,
+        ): String {
+            val text = dumpValue(value)
+            return if (text.length <= limit) text else text.take(limit) + "…(共 ${text.length} 字)"
+        }
+
+        private fun dumpValue(value: Any?): String =
+            when (value) {
+                null -> "null"
+                is Map<*, *> -> value.entries.joinToString(", ", "{", "}") { "${it.key}=${dumpValue(it.value)}" }
+                is List<*> -> value.joinToString(", ", "[", "]") { dumpValue(it) }
+                is ByteArray ->
+                    "hex(${value.size}B)=" +
+                        value.take(24).joinToString(" ") { "%02x".format(it) } +
+                        if (value.size > 24) "…" else ""
+                // 车机给的字符串原样带引号：空串（`""`）与缺字段（`null`）要能一眼分开
+                is String -> "\"" + value.take(120) + "\""
+                else -> value.toString().take(120)
+            }
 
         /** 约束 100 = 随时可拿；500 = 只让用户发起的申请；其余（如 1000）= 不让。 */
         private fun allows(

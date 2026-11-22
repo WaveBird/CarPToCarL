@@ -1409,8 +1409,8 @@ class MainActivity : AppCompatActivity() {
                         report.blockingMissing.joinToString("、") { it.requirement.title } + "）"
                 }
             // 「一键获取」只列出**真能自动引导**的项（[PermissionRepair]）：运行时权限弹框、
-            // 开蓝牙/开 WLAN、位置服务、通知使用权、忽略电池优化。本机蓝牙地址、目标车机
-            // 这些设置项不算权限，不放进按钮里冒充。
+            // 开蓝牙/开 WLAN、位置服务、通知使用权、显示在其他应用上层、忽略电池优化。
+            // 本机蓝牙地址、目标车机这些设置项不算权限，不放进按钮里冒充。
             val repairPlan = PermissionRepair.plan(this)
             val actions =
                 buildList {
@@ -2276,6 +2276,19 @@ class MainActivity : AppCompatActivity() {
                 },
             )
         }
+        // 连上后主动取一次主音频（实验，默认关；按车型自行开启，不做车机指纹判定）。
+        val proactiveAudioSwitch = findViewById<SwitchCompat>(R.id.switchProactiveAudio)
+        proactiveAudioSwitch.isChecked = DisplayPrefs.proactiveAudioOnLink(ctx)
+        proactiveAudioSwitch.setOnCheckedChangeListener { _, checked ->
+            DisplayPrefs.setProactiveAudioOnLink(ctx, checked)
+            snack(
+                if (checked) {
+                    "已开启「连上后主动取主音频」——下次连接 1.5 秒后自动取一次（日志见「主动申请主音频」）"
+                } else {
+                    "已关闭——恢复等播放意图再申请主音频"
+                },
+            )
+        }
         // 「立即重启一次」：不用下车按键也能验证这套动作通不通（同一段代码）。
         findViewById<TextView>(R.id.btnRestartAudio).setOnClickListener {
             if (!SessionController.isStreaming()) {
@@ -2406,6 +2419,23 @@ class MainActivity : AppCompatActivity() {
                     "触摸域自适应已开启——下一笔触摸起按实测上报域换算（日志见「触控 ↓」行）"
                 } else {
                     "触摸域自适应已关闭——坐标恢复原样透传"
+                },
+            )
+        }
+        // 车机占屏时保留视频流（实验，默认关）：车机借屏放转向/倒车影像时不再拆流，
+        // 归还后补关键帧 + 重武装 HID 即可恢复。即时生效——直接改静态开关字段，不必重连。
+        val keepScreenSwitch = findViewById<SwitchCompat>(R.id.switchKeepScreenStream)
+        keepScreenSwitch.isChecked = DisplayPrefs.keepScreenStreamOnTake(ctx)
+        io.github.shaonialife.carptocar.airplay.CarPlayResourceStreams.keepScreenStreamOnTake =
+            keepScreenSwitch.isChecked
+        keepScreenSwitch.setOnCheckedChangeListener { _, checked ->
+            DisplayPrefs.setKeepScreenStreamOnTake(ctx, checked)
+            io.github.shaonialife.carptocar.airplay.CarPlayResourceStreams.keepScreenStreamOnTake = checked
+            snack(
+                if (checked) {
+                    "已开启「车机占屏保留视频流」——不再 TEARDOWN，归还后补关键帧恢复（下一轮起算）"
+                } else {
+                    "已关闭——恢复旧行为（让屏即 TEARDOWN，归还后整套重建）"
                 },
             )
         }

@@ -36,10 +36,27 @@ object DisplayPrefs {
      */
     const val ADAPTIVE_TOUCH_DEFAULT = false
 
+    /**
+     * 车机拿走主屏时是否保留视频流（实验，**默认关**）。
+     *
+     * 关 = 旧行为：车机一接管就 `TEARDOWN` 屏幕流，归还/`requestUI` 后重新 `SETUP`+`RECORD`。
+     * 开 = 只承认「归属不是手机」，**不断流、不停编码器**，归还时补关键帧 + 重整 HID。
+     *
+     * 依据（2026-11-21）：别克 6369 上「让屏 → 申请 → 100~170ms 又被夺」连了 12 轮，
+     * 每轮都白做一次完整重建，一帧留不住；而 link_plus（别克可用的同源项目）从不拆流，
+     * 只在界面归还后补关键帧。见 `CarPlayResourceStreams.applyScreen`。
+     */
+    const val KEEP_SCREEN_STREAM_DEFAULT = false
+
+    /** 连上后主动取一次主音频（实验，**默认关**；不按车机指纹判定，由用户按车型自行开启）。 */
+    const val PROACTIVE_AUDIO_DEFAULT = false
+
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
     private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
     private const val KEY_ADAPTIVE_TOUCH = "adaptive_touch_domain"
+    private const val KEY_KEEP_SCREEN_STREAM = "keep_screen_stream_on_take"
+    private const val KEY_PROACTIVE_AUDIO = "proactive_audio_on_link"
     private const val KEY_LAST_CAR_WIDTH = "last_car_width"
     private const val KEY_LAST_CAR_HEIGHT = "last_car_height"
     private const val KEY_LAST_CAR_FROM_CAR = "last_car_from_car"
@@ -178,6 +195,51 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(KEY_ADAPTIVE_TOUCH, enabled)
+            .apply()
+    }
+
+    /**
+     * 车机拿走主屏时保留视频流（实验，默认关）。
+     *
+     * 只影响「车机接管主屏」后的处置：打开后不 `TEARDOWN`、不停编码器，车机归还画面时
+     * 直接接着推（补关键帧 + 重发 `hidSetInputMode`），不再付一次 SETUP/RECORD 的代价。
+     */
+    fun keepScreenStreamOnTake(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_KEEP_SCREEN_STREAM, KEEP_SCREEN_STREAM_DEFAULT)
+
+    fun setKeepScreenStreamOnTake(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_KEEP_SCREEN_STREAM, enabled)
+            .apply()
+    }
+
+    /**
+     * 连上后主动取一次主音频（实验，默认关）。
+     *
+     * 宝马 MGU-50-J：视频在送、车机 ACK 正常，但「没有音频会话就不交屏」——必须等用户
+     * 放首歌才进 CarPlay。打开后会话建立 1.5 秒、首帧已出后自动申请一次主音频。
+     * **不按车机指纹自动判定**：部分车机确实需要这一步才出画面，由用户按车型自行开启。
+     */
+    fun proactiveAudioOnLink(context: Context): Boolean =
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_PROACTIVE_AUDIO, PROACTIVE_AUDIO_DEFAULT)
+
+    fun setProactiveAudioOnLink(
+        context: Context,
+        enabled: Boolean,
+    ) {
+        context
+            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_PROACTIVE_AUDIO, enabled)
             .apply()
     }
 }

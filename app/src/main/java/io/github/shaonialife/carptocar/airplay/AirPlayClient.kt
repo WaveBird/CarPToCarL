@@ -1257,9 +1257,19 @@ class AirPlayClient(
     }
 
     // 手机侧申请与 appState 上报共用一把锁：两路 modesChanged 不交叉，车机看到的归属按序演进
-    fun acquireScreenResource(fromRequestUi: Boolean = false): Boolean =
+    /**
+     * 申请主屏。
+     *
+     * @param fromRequestUi 车机 `requestUI` 主动请回手机画面
+     * @param respectBorrow 车机还借着屏时**不去抢**（实验开关 `keepScreenStreamOnTake`）：
+     *   借用期间强抢只会被它在一个往返内判回去，白付一轮 SETUP/RECORD
+     */
+    fun acquireScreenResource(
+        fromRequestUi: Boolean = false,
+        respectBorrow: Boolean = false,
+    ): Boolean =
         synchronized(modesPublicationLock) {
-            resourceState.acquireScreen(fromRequestUi) { publishModes("申请主屏", it) }
+            resourceState.acquireScreen(fromRequestUi, respectBorrow) { publishModes("申请主屏", it) }
         }
 
     /**
@@ -1470,6 +1480,9 @@ class AirPlayClient(
         // 语义与兜底见 AirPlayResourceState；车机没给 modes 时状态就是「手机持有」，与旧行为一致。
         resourceState.initialize(infoMap?.get("modes") as? Map<*, *>)
         log("AIRPLAY: 资源归属初始 ${resourceState.describe()}")
+        // 初始快照也留一份原文：车机在这一刻写下的 transferType / 约束，是后面每一次
+        // 「它凭什么抢/让」的基准；只记归结论断，事后无法复查它当时到底声明了什么。
+        runCatching { log("AIRPLAY: /info.modes 原文=" + AirPlayResourceState.paramsText(infoMap?.get("modes"))) }
         // 候选屏全表。旧实现写死 `displays[0]`——多屏车机（大连屏/仪表）若先声明副屏，
         // 画面就被推到那块屏上，比例与触摸坐标全错，而日志里看不出选错了。
         // 选择规则与「只在车机声明 type 时才排序」的兼容性说明见 CarDisplayGeometry。
@@ -3868,17 +3881,27 @@ class AirPlayClient(
                             // 在日志里是可回答的问题。
                             val commandType = command["type"]?.toString()
                             if (commandType != null && eventCommandTypes.size < 24 && eventCommandTypes.add(commandType)) {
-                                val params = command["params"] as? Map<*, *>
-                                val keys =
-                                    params?.keys?.joinToString(",")
-                                        ?: command.keys.filter { it != "type" }.joinToString(",")
-                                log("EVENT: 车机命令 type=$commandType（本轮首次出现，params 键=$keys）")
+                                // 每种 type 首次出现时把 **params 的值**也打出来：只看键名等于
+                                // 只知道「它带了个字段」，不知道带的是什么；换车排查时这点最致命。
+                                log(
+                                    "EVENT: 车机命令 type=$commandType（本轮首次出现）params=" +
+                                        AirPlayResourceState.paramsText(command["params"] ?: command),
+                                )
                             }
                             // changeModes 在事件应答里直接回仲裁后的归属（不另发一轮阻塞的 modesChanged）
                             val reply =
                                 if (command["type"] == "changeModes") {
-                                    audioTransfer = resourceState.applyCarChange(command["params"] as? Map<*, *>)
-                                    log("EVENT: changeModes ${resourceState.describe()}")
+                                    val changeParams = command["params"] as? Map<*, *>
+                                    audioTransfer = resourceState.applyCarChange(changeParams)
+                                    // 两行：①人读的状态（谁持有、借用者是谁）；②报文原文（含所有
+                                    // 未知字段）。reasonStr 在别克 6369 上恒为空串，只能靠原文里
+                                    // 的 borrowID / transferType / 约束值来判断车机在干什么。
+                                    log(
+                                        "EVENT: changeModes reasonStr=" +
+                                            AirPlayResourceState.reasonText(changeParams) +
+                                            " " + resourceState.describe(),
+                                    )
+                                    log("EVENT: changeModes 原文=" + AirPlayResourceState.paramsText(changeParams))
                                     BinaryPlist.encode(linkedMapOf("status" to 0L, "params" to resourceState.command()["params"]))
                                 } else {
                                     ByteArray(0)
