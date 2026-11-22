@@ -29,6 +29,7 @@ class BtSessionGateTest {
         val inbound = dummyChannel("bt-server")
         try {
             BtSessionGate.claimControl(outbound, inbound = false)
+            assertTrue(BtSessionGate.hasActiveControl)
             BtSessionGate.markControlReady(outbound)
             assertTrue(BtSessionGate.ownsControl(outbound))
             assertTrue(BtSessionGate.iap2Ready)
@@ -36,13 +37,16 @@ class BtSessionGateTest {
 
             val displaced = BtSessionGate.claimControl(inbound, inbound = true)
             assertSame(outbound, displaced)
+            assertTrue(BtSessionGate.hasActiveControl)
             assertTrue(BtSessionGate.ownsControl(inbound))
             assertTrue(BtSessionGate.inboundActive)
             assertFalse("切换通道时必须先重置 iap2Ready", BtSessionGate.iap2Ready)
 
             assertFalse("旧通道退出不得清掉新通道所有权", BtSessionGate.releaseControl(outbound))
+            assertTrue(BtSessionGate.hasActiveControl)
             assertTrue(BtSessionGate.ownsControl(inbound))
             assertTrue(BtSessionGate.releaseControl(inbound))
+            assertFalse(BtSessionGate.hasActiveControl)
             assertFalse(BtSessionGate.inboundActive)
         } finally {
             outbound.close()

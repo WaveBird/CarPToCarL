@@ -97,4 +97,37 @@ class PostRecordWatchTest {
         clock += 1_900
         assertEquals("BMW MGU-81", w.take()?.identity)
     }
+
+    @Test
+    fun `首次 RECORD 后零帧在窗口内被拆——命中媒体缺席并压制重复 RECORD 误判`() {
+        val w = watch()
+        w.markInitialRecord("BMW Group MGU-55-J")
+        w.mark("BMW Group MGU-55-J")
+        clock += 900
+        val hit = w.takeMediaAbsent(framesSent = 0L)
+        assertEquals(PostRecordWatch.Cause.MEDIA_ABSENT, hit?.cause)
+        assertEquals("BMW Group MGU-55-J", hit?.identity)
+        assertEquals(900L, hit?.elapsedMillis)
+        assertNull(w.take())
+    }
+
+    @Test
+    fun `已发出视频帧——不命中媒体缺席且保留补发 RECORD 归因`() {
+        val w = watch()
+        w.markInitialRecord("BMW Group MGU-81")
+        w.mark("BMW Group MGU-81")
+        clock += 1_800
+        assertNull(w.takeMediaAbsent(framesSent = 12L))
+        val repeatHit = w.take()
+        assertEquals(PostRecordWatch.Cause.REPEAT_RECORD_ALLERGY, repeatHit?.cause)
+        assertEquals(1_800L, repeatHit?.elapsedMillis)
+    }
+
+    @Test
+    fun `零帧超过媒体缺席窗口——不命中`() {
+        val w = watch()
+        w.markInitialRecord("BMW Group MGU-55-J")
+        clock += PostRecordWatch.MEDIA_ABSENT_WINDOW_MILLIS + 1
+        assertNull(w.takeMediaAbsent(framesSent = 0L))
+    }
 }

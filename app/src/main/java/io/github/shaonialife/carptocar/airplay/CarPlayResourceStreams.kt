@@ -101,16 +101,37 @@ internal class CarPlayResourceStreams(
     }
 
     private fun applyScreen() {
-        var published = false
-        if (screenRequested && !client.phoneOwnsScreen) {
-            published = client.acquireScreenResource(screenRequestFromCarUi)
-            log("MODE: 申请主屏 fromRequestUi=$screenRequestFromCarUi acquired=$published")
-        }
+        val wantScreen = screenRequested
+        val fromCarUi = screenRequestFromCarUi
         screenRequested = false
         screenRequestFromCarUi = false
+        var published = false
+        if (wantScreen) {
+            if (!client.phoneOwnsScreen) {
+                published = client.acquireScreenResource(fromCarUi)
+                log("MODE: 申请主屏 fromRequestUi=$fromCarUi acquired=$published")
+            } else if (fromCarUi) {
+                published = client.retakeScreenForUiRequest()
+                log("MODE: 收到 requestUI 且本地已持有主屏——已执行让出再拿回跳变（ok=$published）")
+                sender?.requestKeyFrame()
+            }
+        }
         val owned = client.phoneOwnsScreen
-        if (owned && screenStreaming) {
-            screenPaused = false
+        val warmAlive = screenStreaming && sender?.isRunning == true
+        if (owned && warmAlive) {
+            if (screenPaused) {
+                screenPaused = false
+                sender?.requestKeyFrame()
+                log("MODE: 主屏归还手机（视频热流保持在线，无需二次 SETUP/RECORD）——已补关键帧秒切")
+            }
+            return
+        }
+        if (!owned && warmAlive) {
+            if (!screenPaused) {
+                screenPaused = true
+                log("MODE: 主屏暂归车机持有/借用——保持视频流在线热备（不发 TEARDOWN，避免二次 RECORD）")
+            }
+            if (!published) client.republishModes()
             return
         }
         if (!owned && !screenNegotiated) return

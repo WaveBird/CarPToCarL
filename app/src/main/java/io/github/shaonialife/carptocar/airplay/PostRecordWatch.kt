@@ -29,15 +29,32 @@ class PostRecordWatch(
     private val windowMillis: Long = SUSPECT_WINDOW_MILLIS,
     private val now: () -> Long = { SystemClock.uptimeMillis() },
 ) {
-    /** 命中的一次怀疑：哪台车机、补发 RECORD 之后过了多久被拆。 */
+    /** 拆链归因类型：区分「补发 RECORD 过敏」与「首次 RECORD 后零媒体被车机看门狗拆除」。 */
+    enum class Cause {
+        REPEAT_RECORD_ALLERGY,
+        MEDIA_ABSENT,
+    }
+
+    /** 命中的一次怀疑：哪台车机、RECORD 之后过了多久被拆、属于哪类原因。 */
     data class Suspect(
         val identity: String,
         val elapsedMillis: Long,
+        val cause: Cause = Cause.REPEAT_RECORD_ALLERGY,
     )
 
     private val lock = Any()
     private var markedAt = 0L
     private var identity = ""
+    private var initialRecordAt = 0L
+    private var initialIdentity = ""
+
+    /** 首次会话级 RECORD 刚收到 200（用于识别「RECORD 200 + 零帧被车机看门狗拆链」）。 */
+    fun markInitialRecord(receiverIdentity: String) {
+        synchronized(lock) {
+            initialRecordAt = now()
+            initialIdentity = receiverIdentity
+        }
+    }
 
     /** 补发 RECORD 刚发出去（在真正 `client.record()` 之前调，把往返也计入窗口）。 */
     fun mark(receiverIdentity: String) {
@@ -49,6 +66,28 @@ class PostRecordWatch(
 
     /** 只读查看，不消费（诊断/日志用）。 */
     fun peek(): Suspect? = synchronized(lock) { suspectLocked() }
+
+    /**
+     * 检查是否为「首次 RECORD 成功后零帧被拆」（媒体缺席槽位）。
+     *
+     * 命中时同时清掉补发 RECORD 标记，防止零帧拆链污染 `StreamOrderMemory` 与音频档位记忆。
+     * 若本轮已发出过视频帧（`framesSent > 0`），直接清掉首次 RECORD 标记并返回 null，
+     * 交由后续逻辑正常归因。
+     */
+    fun takeMediaAbsent(framesSent: Long): Suspect? =
+        synchronized(lock) {
+            val startedAt = initialRecordAt
+            val id = initialIdentity
+            initialRecordAt = 0L
+            initialIdentity = ""
+            if (framesSent > 0L || startedAt == 0L) return null
+            val elapsed = now() - startedAt
+            if (elapsed < 0 || elapsed > MEDIA_ABSENT_WINDOW_MILLIS) return null
+            // 零帧拆链已坐实媒体缺席，不再让同轮的补发 RECORD 窗口背锅
+            markedAt = 0L
+            identity = ""
+            Suspect(id, elapsed, Cause.MEDIA_ABSENT)
+        }
 
     /**
      * 取走这次怀疑（一次性）。
@@ -75,6 +114,8 @@ class PostRecordWatch(
         synchronized(lock) {
             markedAt = 0L
             identity = ""
+            initialRecordAt = 0L
+            initialIdentity = ""
         }
     }
 
@@ -83,7 +124,7 @@ class PostRecordWatch(
         val elapsed = now() - markedAt
         // 时钟不可能倒流，但 uptimeMillis 在极端情况下会出现 0；负值一律当「不在窗口内」
         if (elapsed < 0 || elapsed > windowMillis) return null
-        return Suspect(identity, elapsed)
+        return Suspect(identity, elapsed, Cause.REPEAT_RECORD_ALLERGY)
     }
 
     companion object {
@@ -95,5 +136,12 @@ class PostRecordWatch(
          * 把「起流 3 秒后才自然断掉」的别的原因也算进来。
          */
         const val SUSPECT_WINDOW_MILLIS = 3_500L
+
+        /**
+         * 「RECORD 200 + 零媒体拆链」归因窗口 5s。
+         *
+         * 实测宝马 MGU-55-J 零帧拆链约 0.9s，留余量覆盖车机事件通道延迟与不同车型看门狗。
+         */
+        const val MEDIA_ABSENT_WINDOW_MILLIS = 5_000L
     }
 }

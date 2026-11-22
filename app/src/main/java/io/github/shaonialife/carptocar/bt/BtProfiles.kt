@@ -139,6 +139,7 @@ object BtProfiles {
         shouldStop: () -> Boolean,
         onEvent: (String) -> Unit,
         stopLabel: () -> String = { "会话已激活" },
+        shouldPause: () -> Boolean = { false },
     ): Int {
         val started = SystemClock.uptimeMillis()
         var drops = 0
@@ -160,36 +161,45 @@ object BtProfiles {
                 )
                 return drops
             }
-            val address = addressProvider()
-            if (address == null) {
-                // 还没有对端（没指定目标、也还没建链）：空转 60 秒就收工，别留一条
-                // 白睡的线程跑到 5 分钟上限。
-                idlePolls++
-                if (idlePolls * AudioProfileGuardPolicy.POLL_MILLIS >= NO_PEER_GIVE_UP_MILLIS) {
-                    onEvent("BT-GUARD: 一直没有对端可盯（未指定目标、也没建链）→ 收工")
-                    return drops
-                }
-            } else {
-                idlePolls = 0
-                val before = connectedNames(context, address)
-                if (before.isNotEmpty()) {
-                    // 二次确认：查状态本身就要几十~几百毫秒，这段时间里会话可能刚好
-                    // 起来。会话既已激活就别再动它——保持现有连接，让声音留在它该在
-                    // 的地方，别在推流中途把车机的音频路径掐断再让它自己拉回来。
-                    if (shouldStop()) {
-                        onEvent(
-                            "BT-GUARD: ${stopLabel()} → 取消本次断开" +
-                                "（${before.joinToString("/")} 保持在线），收工（本次共断开 $drops 次）",
-                        )
+            if (!shouldPause()) {
+                val address = addressProvider()
+                if (address == null) {
+                    // 还没有对端（没指定目标、也还没建链）：空转 60 秒就收工，别留一条
+                    // 白睡的线程跑到 5 分钟上限。
+                    idlePolls++
+                    if (idlePolls * AudioProfileGuardPolicy.POLL_MILLIS >= NO_PEER_GIVE_UP_MILLIS) {
+                        onEvent("BT-GUARD: 一直没有对端可盯（未指定目标、也没建链）→ 收工")
                         return drops
                     }
-                    val dropped = disconnectAddress(context, address)
-                    if (dropped.isNotEmpty()) {
-                        drops++
-                        onEvent(
-                            "BT-GUARD: 车机把 ${dropped.joinToString("/")} 拉回来了 → " +
-                                "再次断开（第 $drops 次）",
-                        )
+                } else {
+                    idlePolls = 0
+                    val before = connectedNames(context, address)
+                    if (before.isNotEmpty()) {
+                        // 二次确认：查状态本身就要几十~几百毫秒，这段时间里会话可能刚好
+                        // 起来。会话既已激活就别再动它——保持现有连接，让声音留在它该在
+                        // 的地方，别在推流中途把车机的音频路径掐断再让它自己拉回来。
+                        if (shouldStop()) {
+                            onEvent(
+                                "BT-GUARD: ${stopLabel()} → 取消本次断开" +
+                                    "（${before.joinToString("/")} 保持在线），收工（本次共断开 $drops 次）",
+                            )
+                            return drops
+                        }
+                        if (shouldPause()) {
+                            onEvent(
+                                "BT-GUARD: iAP2 正在握手 → 暂不断开" +
+                                    "（${before.joinToString("/")}），避免误杀蓝牙链路",
+                            )
+                        } else {
+                            val dropped = disconnectAddress(context, address)
+                            if (dropped.isNotEmpty()) {
+                                drops++
+                                onEvent(
+                                    "BT-GUARD: 车机把 ${dropped.joinToString("/")} 拉回来了 → " +
+                                        "再次断开（第 $drops 次）",
+                                )
+                            }
+                        }
                     }
                 }
             }

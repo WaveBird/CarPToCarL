@@ -114,6 +114,19 @@ internal object CarLifeProtocol {
      * 所以默认**不再下发** `CONTENT_ENCRYPTION`，这行日志留着当判据。
      */
     const val MD_ENCRYPT_SETUP = 65642
+    const val MD_AES_SEED = 65644 // 0x1006C 手机回传 RSA 加密的 AES 种子
+    const val MD_ENCRYPT_READY = 65646 // 0x1006E 手机通知 AES 已就绪
+    const val MD_FOREGROUND = 65563 // 0x1001B 手机请求前台确认
+    const val MD_RETURN_TO_CAR = 65569 // 0x10021 用户在 CarWith 点击「返回原车」
+    const val MD_AUTH_RESPONSE = 65609 // 0x10049 手机身份证明应答
+    const val MD_AUTH_RESULT = 65611 // 0x1004B 手机渠道准入结果
+
+    const val HU_GO_TO_FOREGROUND = 98341 // 0x18025
+    const val HU_AUTH_REQUEST = 98376 // 0x18048
+    const val HU_AUTH_RESULT = 98378 // 0x1804A
+    const val HU_RSA_PUBLIC_KEY = 98411 // 0x1806B
+    const val HU_AES_ACK = 98413 // 0x1806D
+    const val VIDEO_DATA = 131073 // 0x20001 视频帧数据
 
     /**
      * 手机端主动推送的媒体信息（歌名/歌手/专辑/封面/时长）。
@@ -134,7 +147,7 @@ internal object CarLifeProtocol {
      * 65563(0x1001B)/65560(0x10018) 在版本匹配前后就会到，属于引擎的常规状态上报。
      * 留着不打日志，避免每次握手都刷三行「未处理」，把真正有用的行挤掉。
      */
-    val MD_IGNORED_IDS = intArrayOf(65560, 65563)
+    val MD_IGNORED_IDS = intArrayOf(65560)
 
     // ---- 触控（9340 / Touch 通道，**控制帧格式** 8B 头）----
     //
@@ -842,6 +855,139 @@ internal object CarLifeProtocol {
         payload: ByteArray,
         index: Int,
     ): Int = index + varintLen(payload, index)
+
+    data class DeviceInfo(
+        val brand: String,
+        val model: String,
+        val sdk: String,
+    )
+
+    /** CarWith 4.1 协议版本协商载荷（4.1）。 */
+    fun protocolVersion41(): ByteArray = pbVarint(1, 4) + pbVarint(2, 1)
+
+    /** CarWith 4.1 统计信息载荷（补齐 proto2 必填字段 1..7，否则小米组件解析失败）。 */
+    fun carWithStatisticsInfo(): ByteArray =
+        pbString(1, "CarPToCarL-local") +
+            pbString(2, "1.2.75") +
+            pbVarint(3, 1) +
+            pbString(4, "29999999") +
+            pbVarint(5, 1) +
+            pbVarint(6, 0) +
+            pbVarint(7, 0)
+
+    /** CarWith 4.1 车机身份信息载荷。 */
+    fun carWithHuInfo(): ByteArray =
+        pbString(1, "Android") +
+            pbString(4, "CarPToCarL") +
+            pbString(14, "Xiaomi") +
+            pbString(20, "CarWith")
+
+    /** CarWith 4.1 功能响应：开启 `CONTENT_ENCRYPTION=1`，仅在已有可信车机画布时声明 `DISABLE_RESOLUTION_OPTION=1`。 */
+    fun carWithFeatureResponse(preferVehicleResolution: Boolean): ByteArray {
+        val entries = LinkedHashMap<String, Int>()
+        entries["CONTENT_ENCRYPTION"] = 1
+        if (preferVehicleResolution) {
+            entries["DISABLE_RESOLUTION_OPTION"] = 1
+        }
+        var out = pbVarint(1, entries.size)
+        for ((key, value) in entries) {
+            out += pbBytes(2, pbString(1, key) + pbVarint(2, value))
+        }
+        return out
+    }
+
+    /** CarWith 4.1 精简视频编码初始化（3 字段 8B，对齐实机验证载荷）。 */
+    fun carWithVideoInit(
+        width: Int,
+        height: Int,
+        fps: Int = 30,
+    ): ByteArray = pbVarint(1, width) + pbVarint(2, height) + pbVarint(3, fps)
+
+    fun parseDeviceInfo(payload: ByteArray): DeviceInfo? {
+        val brand = firstStringField(payload, 4)?.takeIf { it.isNotBlank() } ?: return null
+        val model = firstStringField(payload, 14)?.takeIf { it.isNotBlank() } ?: return null
+        val sdk = firstStringField(payload, 20)?.takeIf { it.isNotBlank() } ?: return null
+        return DeviceInfo(brand = brand, model = model, sdk = sdk)
+    }
+
+    fun firstStringField(
+        payload: ByteArray,
+        fieldNumber: Int,
+    ): String? {
+        var offset = 0
+        while (offset < payload.size) {
+            val (tag, tagLen) = readVarintPair(payload, offset) ?: return null
+            offset += tagLen
+            val field = (tag ushr 3).toInt()
+            val wire = (tag and 7L).toInt()
+            when (wire) {
+                0 -> {
+                    val (_, valLen) = readVarintPair(payload, offset) ?: return null
+                    offset += valLen
+                }
+                2 -> {
+                    val (len, lenSize) = readVarintPair(payload, offset) ?: return null
+                    offset += lenSize
+                    if (len < 0 || len > payload.size - offset) return null
+                    if (field == fieldNumber) {
+                        return String(payload, offset, len.toInt(), Charsets.UTF_8)
+                    }
+                    offset += len.toInt()
+                }
+                1 -> offset += 8
+                5 -> offset += 4
+                else -> return null
+            }
+        }
+        return null
+    }
+
+    fun firstIntField(
+        payload: ByteArray,
+        fieldNumber: Int,
+    ): Int? {
+        var offset = 0
+        while (offset < payload.size) {
+            val (tag, tagLen) = readVarintPair(payload, offset) ?: return null
+            offset += tagLen
+            val field = (tag ushr 3).toInt()
+            val wire = (tag and 7L).toInt()
+            when (wire) {
+                0 -> {
+                    val (v, valLen) = readVarintPair(payload, offset) ?: return null
+                    offset += valLen
+                    if (field == fieldNumber) return v.toInt()
+                }
+                2 -> {
+                    val (len, lenSize) = readVarintPair(payload, offset) ?: return null
+                    offset += lenSize
+                    if (len < 0 || len > payload.size - offset) return null
+                    offset += len.toInt()
+                }
+                1 -> offset += 8
+                5 -> offset += 4
+                else -> return null
+            }
+        }
+        return null
+    }
+
+    private fun readVarintPair(
+        payload: ByteArray,
+        start: Int,
+    ): Pair<Long, Int>? {
+        var value = 0L
+        var shift = 0
+        var offset = start
+        while (offset < payload.size && shift < 64) {
+            val b = payload[offset].toInt() and 0xFF
+            value = value or ((b and 0x7F).toLong() shl shift)
+            offset++
+            if (b and 0x80 == 0) return value to (offset - start)
+            shift += 7
+        }
+        return null
+    }
 
     private fun writeU16(target: ByteArray, offset: Int, value: Int) {
         target[offset] = ((value ushr 8) and 0xFF).toByte()

@@ -29,6 +29,7 @@ import io.github.shaonialife.carptocar.bt.Iap2BluetoothServer
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.capture.HiddenDisplaySource
 import io.github.shaonialife.carptocar.carlife.CarGpsFix
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoCoordinator
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
 import io.github.shaonialife.carptocar.carlife.CarLifeMediaInfo
 import io.github.shaonialife.carptocar.carlife.CarLifeProtocol
@@ -576,6 +577,15 @@ object SessionController {
         appStateBridgeInstalled = true
         CarLifeHijack.onVoiceSession = { active -> appStateReporter.onEngineVoice(active) }
         CarLifeHijack.onSpeechAudio = { appStateReporter.onSpeechAudio() }
+        CarLifeHijack.onReturnToCar = {
+            Bg.run("carwith-return-to-car") {
+                val client = currentClient ?: return@run
+                if (client.relinquishScreenToCar()) {
+                    appendLog("RESOURCE: CarWith 请求返回原车界面——已将主屏归属交还车机（视频热流保持在线）")
+                    resourceStreams?.reconcile()
+                }
+            }
+        }
     }
 
     /** 协议门面是否已装配进聚合层（幂等）。 */
@@ -1451,8 +1461,13 @@ object SessionController {
         if (owned) {
             if (audioSender?.isRunning == true) return true
             if (!startAudioChannel(context, client, secret, currentAudioHost)) return false
-            // 流在 RECORD 之后加入：补发 RECORD 纳入已激活的会话（见 startAudioChannel 注释）
+            // 流在 RECORD 之后加入：补发 RECORD 纳入已激活的会话（见 startAudioChannel 注释）。
+            // 先挂 PostRecordWatch：若宝马 MGU 等车机在补发 RECORD 后 ~2s 内拆链，自动归因为
+            // 「补发 RECORD 过敏」并在下一轮切换为音频优先单次 RECORD，不误拉黑音频档位。
+            val receiverId = client.receiverIdentity()
+            postRecordWatch.mark(receiverId)
             if (!client.record()) {
+                StreamOrderMemory.notePostRecordRejected(appContext, receiverId)
                 endClientSession(client, "主音频资源取得后 RECORD 激活失败")
                 return false
             }
@@ -1651,7 +1666,11 @@ object SessionController {
             val wasEstablished = client.wasSessionEstablished
             val settledAuthKey = authReceiverKey
             authReceiverKey = null
-            if (attributeAudio) attributeAudioTeardown()
+            if (attributeAudio) {
+                attributeAudioTeardown()
+            } else {
+                checkMediaAbsentTeardown()
+            }
             videoSessionEnded = true
             phaseHint = "CarPlay 会话已结束：$reason"
             connectionAttempt.incrementAndGet()
@@ -2168,6 +2187,7 @@ object SessionController {
                         shouldStop = { guardStopReason() != null },
                         onEvent = { line -> appendLog(line) },
                         stopLabel = { guardStopReason() ?: "会话状态已变化" },
+                        shouldPause = { BtSessionGate.hasActiveControl },
                     )
                 appendLog("BT-GUARD: 守卫线程结束（共断开 $drops 次）")
             } catch (error: Throwable) {
@@ -2266,13 +2286,24 @@ object SessionController {
      * 推流中的邀请只记录、不重建（见 [onCtrlInviteWhileStreaming]）。
      */
     private fun onCtrlInvite(receiverId: String?) {
-        if (!sessionWanted || connectCancelled) return
+        if (connectCancelled) return
         if (isStreaming()) {
             onCtrlInviteWhileStreaming(receiverId)
             return
         }
+        // 兼容模式（蓝牙监听常开）下，车机主动入站握手并已进入建链流程时，用户可能尚未点「启动连接」
+        // （sessionWanted 仍为 false）。若直接丢弃邀请，bit37（CARPLAY_CONTROL）车机（如 BMW MGU）
+        // 会在 awaitCtrlInvite 里永远等不到 pendingInviteAtMs 而整轮超时（2026-11-21 23:47 实车日志）。
+        val inboundActive = sessionStarting || bluetoothServer?.isRunning == true
+        if (!sessionWanted && !inboundActive) return
         // 一条邀请只授权一轮连接（awaitCtrlInvite 消费），过期作废
         pendingInviteAtMs = android.os.SystemClock.uptimeMillis()
+        if (!sessionWanted) {
+            if (sessionStarting) {
+                appendLog("CTRL: 车机邀请到达（兼容监听入站会话进行中）——已记录待决邀请，交由本轮接续")
+            }
+            return
+        }
         val target = lastSessionTarget
         if (target == null) {
             appendLog(
@@ -4012,6 +4043,7 @@ object SessionController {
         endpointToProbe: Iap2SenderSession.CarPlayEndpoint,
     ): Boolean {
         val advertiser = ctrlAdvertiser
+        val initialInvites = advertiser?.inviteCount ?: 0
         val deadline = android.os.SystemClock.uptimeMillis() + timeoutMillis
         val startedAt = android.os.SystemClock.uptimeMillis()
         var lastLogAt = startedAt
@@ -4022,6 +4054,14 @@ object SessionController {
         while (android.os.SystemClock.uptimeMillis() < deadline) {
             if (connectCancelled) return false
             val invites = advertiser?.inviteCount ?: 0
+            if (invites > initialInvites) {
+                pendingInviteAtMs = 0L
+                appendLog(
+                    "CTRL: ✓ 收到本轮车机新邀请（${android.os.SystemClock.uptimeMillis() - startedAt}ms，第 $invites 次）" +
+                        "——立即连接 AirPlay",
+                )
+                return true
+            }
             if (invites > 0 && !receiverControlled) {
                 appendLog(
                     "CTRL: ✓ 收到车机邀请（${android.os.SystemClock.uptimeMillis() - startedAt}ms，第 $invites 次）" +
@@ -4039,7 +4079,7 @@ object SessionController {
             // 此刻连不上多半是窗口还没开，多探也是同样结果；后续邀请到了会被正常处理。
             if (
                 receiverControlled &&
-                invites == 0 &&
+                invites == initialInvites &&
                 !probedOnce &&
                 nowForProbe - startedAt >= CTRL_FALLBACK_PROBE_FIRST_MS
             ) {
@@ -4963,6 +5003,29 @@ object SessionController {
      *
      * 注意只在「确实起过音频」时归因；纯视频会话结束不做任何记忆改写。
      */
+    /**
+     * 检查是否为「首次 RECORD 200 + 零媒体帧被车机看门狗拆链」（第三类故障槽位）。
+     *
+     * 命中时直接消费并压制同轮的 `StreamOrderMemory` / 音频档位归因，避免把本机画面源
+     * 未出帧误记为「车机对重复 RECORD 过敏」或「音频档位不兼容」。
+     */
+    private fun checkMediaAbsentTeardown(): Boolean {
+        if (connectCancelled) {
+            postRecordWatch.clear()
+            return false
+        }
+        val framesSent = videoSender?.framesSentTotal ?: 0L
+        val hit = postRecordWatch.takeMediaAbsent(framesSent) ?: return false
+        appendLog(
+            "SESSION: RECORD 后 ${hit.elapsedMillis}ms 零帧被车机拆链（${hit.identity}）——" +
+                "归因为「媒体缺席（本机画面源未出帧）」，不修改 StreamOrderMemory 与音频档位记忆",
+        )
+        uiHintSink?.invoke("本机画面源尚未出帧导致车机断开，请确认 CarLife+ 已出帧")
+        activeAudioProfile = null
+        activeAudioStartedAt = 0L
+        return true
+    }
+
     private fun attributeAudioTeardown() {
         // 用户自己按「断开」不归因：这条路径上的拆链与车机无关。尤其是「补发 RECORD
         // 过敏」这条结论会改掉下一轮的**整体时序**（改音频优先），代价远大于档位记忆，
@@ -4971,6 +5034,9 @@ object SessionController {
             postRecordWatch.clear()
             return
         }
+        // -1) 先判「首次 RECORD 200 + 零帧被车机拆链」：画面源根本没出帧时，车机在 ~0.9~2s
+        //     内看门狗拆链属于媒体缺席，绝不能记成「补发 RECORD 过敏」或「音频档位不兼容」。
+        if (checkMediaAbsentTeardown()) return
         // 0) 「音频流加入后补发的那次 RECORD」之后 3.5s 内整链被拆 —— 先判这一条，而且
         //    必须排在档位归因之前。
         //
@@ -6513,11 +6579,15 @@ object SessionController {
                                 )
                             }
                             // 资源声明（must）：真车对未声明资源的屏幕流 SETUP 直接 400。
-                            // 主屏按需申请：车机占着（如倒车影像）时只复述归属，保留控制会话，归还后再建视频流
+                            // 严格遵守 Apple AIS 约束：若车机 `/info.modes` 以 `unborrowConstraint=1000`
+                            // 借用主屏（宝马 MGU-55-J 在原车菜单时实测），不私自越权抢报 entity=1，
+                            // 而是按实复述 `assertModes()`（entity=2），同时照常建立 type=110 屏幕流
+                            // 并随首次 RECORD 持续推送 H.264 帧进入热备（宝马实测 200 OK）；
+                            // 这样既避免 0 帧触发 0.9s/8s EOF，又让用户在车机点击 CarPlay 时 0ms 秒切且无需二次 RECORD。
                             val screenAcquired = client.acquireScreenResource()
                             if (!screenAcquired) {
                                 client.assertModes()
-                                appendLog("RESOURCE: 初始主屏被占用；保持控制会话，归还后再建视频流")
+                                appendLog("RESOURCE: 初始主屏暂由车机持有/借用——按实复述归属，同时预建立视频热流")
                             }
                             // HID 输入模式武装：/info hidDevices（奥迪字符串 "0"/"1"，触摸="1"）。
                             // display features=0x08（高保真触摸）已声明，缺这步车机不发 hidSendReport。
@@ -6529,7 +6599,7 @@ object SessionController {
                             hidReportFirstLogged.clear()
                             hidDeclaredUuids = setup.hidDeviceUuids
                             hidHasMediaKeyDevice = setup.hasMediaKeyHid
-                            val screen = if (screenAcquired) client.runScreenStream(sessionKey, setup.displayUuid) else null
+                            val screen = client.runScreenStream(sessionKey, setup.displayUuid)
                             requireAttempt(attempt)
                             if (screen != null || !screenAcquired) {
                                 // 地址取 client 真正连通的那个（配对期间可能被 mDNS 刷新过）：
@@ -6808,16 +6878,51 @@ object SessionController {
                                 }
                                 var audioStartedBeforeRecord = false
                                 if (streamOrder == StreamOrderMemory.Order.AUDIO_FIRST) {
-                                    // 音频 SETUP 要 ~2s，这里先做完再把 RECORD 一次发出去。
-                                    // 视频数据端口已在上面 openDataPort() 连上，2s 看门狗
-                                    // 不会因为「没连端口」而拆链（这是奥迪那条结论的前提）。
-                                    audioStartedBeforeRecord = startAudioChannelAndLog(client, sessionKey, host, context)
+                                    // 音频优先档必须在单次 RECORD 之前完成音频 SETUP：
+                                    // 1. 若车机初始持有主音频（takeConstraint<=500），先申请主音频归属，否则 startAudioChannel 直接放弃；
+                                    // 2. 不调 awaitControlSession（宝马隧道控制会话在 RECORD 之后才发 SYN marker，前置等待必超时）。
+                                    if (!client.phoneOwnsAudio) {
+                                        client.acquireAudioResource(AirPlayResourceState.PRIORITY_USER, temporary = false)
+                                    }
+                                    audioStartedBeforeRecord = startAudioChannel(context, client, sessionKey, host)
                                     requireAttempt(attempt)
                                     if (!audioStartedBeforeRecord) {
                                         appendLog("AUDIO: 音频优先档未建立音频流——本轮仅推视频（RECORD 照发）")
                                     }
                                 }
+                                // RECORD 前置媒体门控：即便是车机主动反连蓝牙（绕过「启动连接」入口），
+                                // 若本机画面源尚未出真实帧，先尝试自动拉起并短等首帧（上限 4.5s），
+                                // 避免 0 帧进 RECORD 后在 ~0.9s 被宝马看门狗直接拆链；若已在出帧则 0ms 直通。
+                                if (CarLifeHijack.isEnabled(context) && !CarLifeHijack.sourceActive && !CarLifeHijack.isStreaming) {
+                                    appendLog("MEDIA-GATE: RECORD 前检测到本机尚未出帧——尝试自动拉起并等待真实首帧（上限 4.5s）")
+                                    CarLifeAutoCoordinator.maybeAutoLaunchOnConnect(context, ::appendLog, silentMode = true)
+                                    val gateDeadline = android.os.SystemClock.uptimeMillis() + 4_500L
+                                    while (!CarLifeHijack.sourceActive &&
+                                        !CarLifeHijack.isStreaming &&
+                                        android.os.SystemClock.uptimeMillis() < gateDeadline &&
+                                        !connectCancelled &&
+                                        !client.cancelled &&
+                                        connectionAttempt.get() == attempt
+                                    ) {
+                                        try {
+                                            Thread.sleep(150L)
+                                        } catch (_: InterruptedException) {
+                                            break
+                                        }
+                                    }
+                                    requireAttempt(attempt)
+                                    if (CarLifeHijack.sourceActive || CarLifeHijack.isStreaming) {
+                                        appendLog("MEDIA-GATE: RECORD 前已等到本机真实首帧——继续激活会话")
+                                    } else {
+                                        appendLog("MEDIA-GATE: ⚠ RECORD 前等待 4.5s 仍无真实首帧——继续 RECORD（若车机 1~5s 内拆链将归因为媒体缺席）")
+                                    }
+                                } else if (CarLifeHijack.isStreaming && !CarLifeHijack.sourceActive) {
+                                    CarLifeHijack.requestKeyFrame()
+                                }
                                 val firstRecordOk = client.record()
+                                if (firstRecordOk) {
+                                    postRecordWatch.markInitialRecord(receiverIdentity)
+                                }
                                 if (!firstRecordOk && streamOrder == StreamOrderMemory.Order.AUDIO_FIRST) {
                                     // 音频优先时连第一次 RECORD 都非 200：不是「补发 RECORD 过敏」，
                                     // 记回 RECORD 优先，别把这台接收端永久锁在错误顺序上

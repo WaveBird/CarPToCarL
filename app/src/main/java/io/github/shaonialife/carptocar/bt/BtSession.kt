@@ -1,6 +1,7 @@
 package io.github.shaonialife.carptocar.bt
 
 import android.content.Context
+import io.github.shaonialife.carptocar.iap2.AccessoryDeclaration
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.Iap2SenderSession
 import io.github.shaonialife.carptocar.transport.Iap2LinkChannel
@@ -28,6 +29,11 @@ internal fun Iap2LinkChannel.runSenderSession(
     // 注意这只修**蓝牙名**；iAP2 的 0x4E09 自报身份固定是 iPhone（见 Iap2SenderSession），
     // 两者不能混用——把本地蓝牙名塞进 0x4E09 会让车机把我们归类成普通蓝牙设备。
     DeviceIdentity.ensureUsableBluetoothName(context, log)
+    if (!BtSessionGate.sessionActive) {
+        // 新一轮 BT bring-up（尚未建起 CarPlay 会话）：清掉上一轮失败 RFCOMM 留下的 0x1D01 快照，
+        // 避免宝马 MGU 在 CarPlay v2（含 0x5702/0x5703/0xAA06）与回退 v1 之间切换时把旧清单串到本轮。
+        AccessoryDeclaration.reset()
+    }
     val session =
         Iap2SenderSession(
             this,

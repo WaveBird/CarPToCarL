@@ -116,4 +116,23 @@ class MfiLengthMemoryTest {
         assertTrue(text.contains("静默=20B"))
         assertTrue(text.contains("被拒=16B"))
     }
+
+    @Test
+    fun forgetPreferencePreservesHardRejectedButClearsSucceededAndSilent() {
+        // 宝马 MGU-55-J 实车：第一轮 32B 硬断链记入 rejected，10 秒后回退档触发代际变更，
+        // 只清 succeeded/silent、保留 rejected，避免第二轮立刻再撞 32B。
+        val identity = "bmw 71280 mgu-55-j bmw group"
+        MfiLengthMemory.forget(null, identity)
+        MfiLengthMemory.recordSuccess(null, identity, 16)
+        MfiLengthMemory.recordSilent(null, identity, 20)
+        MfiLengthMemory.recordHardRejected(null, identity, 32)
+
+        MfiLengthMemory.forgetPreference(null, identity)
+        val after = MfiLengthMemory.load(null, identity)
+        assertEquals(null, after.succeeded)
+        assertTrue(after.silent.isEmpty())
+        assertEquals(setOf(32), after.rejected)
+        // 即使冷启动基线是 [32, 20, 16]，32B 仍排到最后，下一轮先发 20B
+        assertEquals(listOf(20, 16, 32), MfiLengthMemory.orderAttempts(baselineTestBench, after))
+    }
 }

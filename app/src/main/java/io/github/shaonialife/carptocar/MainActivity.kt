@@ -40,7 +40,11 @@ import io.github.shaonialife.carptocar.bt.CarApproachPrefs
 import io.github.shaonialife.carptocar.bt.CarApproachReceiver
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.carlife.CarGpsOption
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoCoordinator
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoPrefs
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerService
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
+import io.github.shaonialife.carptocar.carlife.CarLifeLauncher
 import io.github.shaonialife.carptocar.carlife.VoiceKeyGesture
 import io.github.shaonialife.carptocar.input.CarInputClient
 import io.github.shaonialife.carptocar.input.KnobRouter
@@ -73,6 +77,9 @@ import java.util.Locale
  * 也可以在 App 已在后台时重新武装一次自动连接（onNewIntent）。
  */
 const val EXTRA_CAR_APPROACH = "io.github.shaonialife.carptocar.extra.CAR_APPROACH"
+
+/** CarLife 接管出帧后兜底切入后台标记（未开启无障碍时，将本任务移至后台以压退前台 CarLife）。 */
+const val EXTRA_MOVE_TO_BACKGROUND = "io.github.shaonialife.carptocar.extra.MOVE_TO_BACKGROUND"
 
 /**
  * 手机侧界面（Material 3 暗色重构，设计稿 design/phone-ui-proto.html）：
@@ -132,7 +139,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchLog: androidx.appcompat.widget.SwitchCompat
     private lateinit var logText: TextView
     private lateinit var carLifeStatus: TextView
+    private lateinit var carLifeBadge: TextView
+    private lateinit var carLifeCardDesc: TextView
+    private lateinit var btnLaunchCarLife: TextView
+    private lateinit var btnStopCarLife: TextView
+    private lateinit var carLifeTargetValue: TextView
+    private lateinit var carLifeTargetNote: TextView
+    private lateinit var switchAutoLaunchCarLife: SwitchCompat
+    private lateinit var autoLaunchCarLifeNote: TextView
+    private lateinit var carLifeAccessibilityNote: TextView
+    private lateinit var btnCarLifeAccessibility: TextView
     private lateinit var snackbar: TextView
+
+    /** 本轮是否由「靠近车机 + 静默触发」进入（用于决定出帧后是否直接退回桌面）。 */
+    private var silentApproachSession = false
+
+    /** 避免「7240 持续零帧占口」每秒重复弹 Snackbar（状态恢复后再复位）。 */
+    private var zeroFrameAlertShown = false
 
     // ---- 英雄卡状态机（1s 轮询 SessionController 对账）----
     private var heroState: HeroState? = null
@@ -366,6 +389,7 @@ class MainActivity : AppCompatActivity() {
                         wifiJoinDialog?.cancel()
                         wifiJoinDialog = null
                         // 用户主动取消：同样抑制「靠近车机」的自动拉起，避免取消后立刻又被唤起
+                        CarLifeAutoCoordinator.disarm("用户取消连接")
                         CarApproachPrefs.setSuppressed(this, true)
                         SessionController.cancelConnecting(this)
                     },
@@ -617,6 +641,7 @@ class MainActivity : AppCompatActivity() {
                         // 手动断开 = 这一轮停车期间不要被「靠近车机」自动再拉起来
                         // （车机发现链路断了会立刻回连，不抑制就会变成「断开 → 自动重连」死循环）。
                         // 车机蓝牙链路真断（人离开/熄火）时由 CarApproachReceiver 自动解除。
+                        CarLifeAutoCoordinator.disarm("用户手动断开")
                         CarApproachPrefs.setSuppressed(this, true)
                         SessionController.disconnect(this)
                     },
@@ -862,7 +887,24 @@ class MainActivity : AppCompatActivity() {
             ) {
                 permissionLauncher.launch("android.permission.POST_NOTIFICATIONS")
             }
-            SessionController.startConnection(this)
+            if (CarLifeHijack.isEnabled(this)) {
+                CarLifeHijack.prewarm(applicationContext) { line -> runOnUiThread { log(line) } }
+            }
+            val waiting =
+                CarLifeAutoCoordinator.ensureSourceReadyThen(
+                    context = this,
+                    log = ::log,
+                    silentMode = silentApproachSession,
+                ) {
+                    runOnUiThread {
+                        SessionController.startConnection(this)
+                        updateCarLifeStatus()
+                    }
+                }
+            if (waiting) {
+                snack("正在自动拉起 CarLife 并等待首帧（最多 15 秒），出帧后自动连接车机…", 4_000L)
+            }
+            updateCarLifeStatus()
         }
     }
 
@@ -886,10 +928,23 @@ class MainActivity : AppCompatActivity() {
 
         deviceSubtitle = findViewById(R.id.deviceSubtitle)
         carLifeStatus = findViewById(R.id.carLifeStatus)
-        // 状态行兼作「重启守候」入口：不拉起任何应用，只是重新开始盯 7240 端口
+        carLifeBadge = findViewById(R.id.carLifeBadge)
+        carLifeCardDesc = findViewById(R.id.carLifeCardDesc)
+        btnLaunchCarLife = findViewById(R.id.btnLaunchCarLife)
+        btnStopCarLife = findViewById(R.id.btnStopCarLife)
+        carLifeTargetValue = findViewById(R.id.carLifeTargetValue)
+        carLifeTargetNote = findViewById(R.id.carLifeTargetNote)
+        switchAutoLaunchCarLife = findViewById(R.id.switchAutoLaunchCarLife)
+        autoLaunchCarLifeNote = findViewById(R.id.autoLaunchCarLifeNote)
+        carLifeAccessibilityNote = findViewById(R.id.carLifeAccessibilityNote)
+        btnCarLifeAccessibility = findViewById(R.id.btnCarLifeAccessibility)
+        CarLifeAutoCoordinator.bind(this)
+        // 顶部状态行点击：未运行且已安装时直接一键拉起，其它情况重启 7240 守候
         carLifeStatus.setOnClickListener {
-            if (!CarLifeHijack.isActive) {
-                log("CARLIFE: 手动重启守候（等待你打开 CarLife+ 的无线连接）")
+            if (!CarLifeHijack.isActive && CarLifeHijack.isEnabled(this)) {
+                launchCarLifeEngine()
+            } else if (!CarLifeHijack.isActive) {
+                log("CARLIFE: 手动重启守候（等待打开 CarWith / CarLife+ 无线连接）")
                 CarLifeHijack.prewarm(applicationContext) { line -> runOnUiThread { log(line) } }
             }
         }
@@ -1043,6 +1098,14 @@ class MainActivity : AppCompatActivity() {
         // maybeAutoConnect，所以真正的发起时机以自检完成为准，这里只是起步。
         val launchedByApproach = intent?.getBooleanExtra(EXTRA_CAR_APPROACH, false) == true
         val silentApproach = launchedByApproach && CarApproachPrefs.silentUi(this)
+        silentApproachSession = silentApproach
+        if (intent?.getBooleanExtra(EXTRA_MOVE_TO_BACKGROUND, false) == true) {
+            intent.removeExtra(EXTRA_MOVE_TO_BACKGROUND)
+            mainHandler.postDelayed(
+                { if (!isFinishing && !isDestroyed) moveTaskToBack(true) },
+                250L,
+            )
+        }
         // 用户**自己**点开了 App = 明确想用：立刻解除「刚断开过」的抑制。
         // 否则在车上（蓝牙一直连着，不会再收到 ACL_DISCONNECTED）关掉 App 之后，
         // 抑制会一直挂着，之后的抖动/车机重启都唤不醒它（2026-10-30 用户要求：
@@ -1073,13 +1136,17 @@ class MainActivity : AppCompatActivity() {
         // 只有在**冷启动**这一轮才退：旋转/重建、或用户自己点进界面时不该被弹走。
         // 免责声明未接受时不退——那是要用户读并点同意的，不能在后台替他跳过。
         if (silentApproach && savedInstanceState == null && !needsDisclaimer) {
-            log("APPROACH: 静默触发——界面不停留，进度与「断开」都在通知栏")
-            overridePendingTransition(0, 0)
-            // 留 1.2 秒：让 onResume/窗口/权限检查先走完一轮，建屏那一步不能被掐断
-            mainHandler.postDelayed(
-                { if (!isFinishing && !isDestroyed) moveTaskToBack(true) },
-                1_200L,
-            )
+            if (CarLifeAutoCoordinator.shouldAutoLaunchOnConnect(this)) {
+                log("APPROACH: 静默触发——本机 CarWith/CarLife 尚未出帧，先自动拉起并在接管后退后台")
+            } else {
+                log("APPROACH: 静默触发——界面不停留，进度与「断开」都在通知栏")
+                overridePendingTransition(0, 0)
+                // 留 1.2 秒：让 onResume/窗口/权限检查先走完一轮，建屏那一步不能被掐断
+                mainHandler.postDelayed(
+                    { if (!isFinishing && !isDestroyed) moveTaskToBack(true) },
+                    1_200L,
+                )
+            }
         }
     }
 
@@ -1461,6 +1528,9 @@ class MainActivity : AppCompatActivity() {
         // 通知使用权（媒体会话枚举，音乐卡数据源）：Shizuku 移除后没有静默授予通道，
         // 需要用户自己在系统设置里打开；这里不再阻塞启动。
 
+        // ---- CarWith / CarLife 画面源卡片 ----
+        bindCarLifeCard()
+
         // ---- 显示设置（原「显示」面板迁移至首页，2026-10-24） ----
         bindDisplayCard()
 
@@ -1528,25 +1598,329 @@ class MainActivity : AppCompatActivity() {
     // ==================== 英雄卡状态机 ====================
 
     /**
-     * 刷新「CarLife 劫持」状态行。
+     * 刷新「CarWith / CarLife 画面源」状态（顶部摘要行 + 独立状态卡片）。
      *
-     * 车机画面只有一个来源：手机原生 CarLife+ 的 H.264 直通。所以这行文案就是
-     * 排障的第一现场——用户不用展开日志就能看出卡在「没拉起 / 没进无线连接 /
-     * 已劫持没连车机 / 正在推流」哪一步。
+     * 车机画面唯一来源是本机 CarWith / CarLife+ 的 7240 H.264 直通：
+     * 界面实时标出「未安装 / 未启动 / 握手中 / 等出帧 / 已就绪(后台运行) / 推流中」，
+     * 并提供一键调起、自动退后台与无障碍自动点击（档位 2）入口。
      */
     private fun updateCarLifeStatus() {
-        val text =
-            when {
-                !CarLifeHijack.isEnabled(this) -> "CarLife 劫持已在设置里关闭 —— 不会有车机画面"
-                // 判定一律以「真实视频流」为准（用户明确要求）：帧真正写进车机通道才算在投，
-                // 不认 CarLife 进程/握手状态——否则会出现「显示已劫持、车机却在等视频」的误判。
-                SessionController.videoSender?.isVideoFlowing == true -> "车机画面来自 CarLife+（视频流正常）"
-                CarLifeHijack.isAttached -> "已接管 CarLife+，但暂无视频流送达车机"
-                CarLifeHijack.sourceActive -> "已劫持 CarLife+ 画面 —— 点「启动连接」推到车机"
-                CarLifeHijack.isActive -> "已连上 CarLife+，等待它开始推流"
-                else -> "等待你手动打开 CarLife+ 并点「无线连接」—— 点此重启守候"
+        val snapshot =
+            CarLifeLauncher.snapshot(
+                context = this,
+                videoFlowingToCar = SessionController.videoSender?.isVideoFlowing == true,
+            )
+        if (carLifeStatus.text != snapshot.shortLine) {
+            carLifeStatus.text = snapshot.shortLine
+        }
+        val statusColor =
+            when (snapshot.state) {
+                CarLifeLauncher.EngineState.STREAMING_TO_CAR,
+                CarLifeLauncher.EngineState.READY,
+                -> getColor(R.color.m3_ok)
+
+                CarLifeLauncher.EngineState.PORT_LISTENING,
+                CarLifeLauncher.EngineState.HANDSHAKEN_WAITING_FRAMES,
+                -> getColor(R.color.m3_primary)
+
+                CarLifeLauncher.EngineState.DISABLED,
+                CarLifeLauncher.EngineState.NOT_INSTALLED,
+                CarLifeLauncher.EngineState.ZERO_FRAME_STALLED,
+                -> getColor(R.color.m3_error)
+
+                CarLifeLauncher.EngineState.NOT_STARTED,
+                CarLifeLauncher.EngineState.ATTACHED_NO_FLOW,
+                -> getColor(R.color.m3_amber)
             }
-        if (carLifeStatus.text != text) carLifeStatus.text = text
+        carLifeStatus.setTextColor(statusColor)
+
+        if (!::carLifeBadge.isInitialized) return
+        if (carLifeBadge.text != snapshot.badgeText) carLifeBadge.text = snapshot.badgeText
+        carLifeBadge.setTextColor(statusColor)
+        val badgeBg =
+            when (snapshot.state) {
+                CarLifeLauncher.EngineState.STREAMING_TO_CAR,
+                CarLifeLauncher.EngineState.READY,
+                -> R.drawable.bg_badge_ok
+
+                else -> R.drawable.bg_badge_todo
+            }
+        carLifeBadge.setBackgroundResource(badgeBg)
+
+        if (carLifeCardDesc.text != snapshot.detailLine) {
+            carLifeCardDesc.text = snapshot.detailLine
+        }
+
+        val btnLabel =
+            when (snapshot.state) {
+                CarLifeLauncher.EngineState.STREAMING_TO_CAR,
+                CarLifeLauncher.EngineState.READY,
+                -> "后台运行中"
+
+                CarLifeLauncher.EngineState.PORT_LISTENING,
+                CarLifeLauncher.EngineState.HANDSHAKEN_WAITING_FRAMES,
+                -> "切去查看"
+
+                CarLifeLauncher.EngineState.ZERO_FRAME_STALLED -> "清理占口"
+
+                CarLifeLauncher.EngineState.DISABLED -> "先开劫持"
+                CarLifeLauncher.EngineState.NOT_INSTALLED -> "未检测到"
+                CarLifeLauncher.EngineState.NOT_STARTED,
+                CarLifeLauncher.EngineState.ATTACHED_NO_FLOW,
+                -> if (CarLifeAutoCoordinator.isArmed()) "再次拉起" else "启动并退后台"
+            }
+        if (btnLaunchCarLife.text != btnLabel) btnLaunchCarLife.text = btnLabel
+        val canLaunch =
+            snapshot.state != CarLifeLauncher.EngineState.DISABLED &&
+                snapshot.state != CarLifeLauncher.EngineState.NOT_INSTALLED
+        btnLaunchCarLife.alpha = if (canLaunch) 1f else 0.45f
+        val showStop =
+            snapshot.state == CarLifeLauncher.EngineState.STREAMING_TO_CAR ||
+                snapshot.state == CarLifeLauncher.EngineState.READY ||
+                snapshot.state == CarLifeLauncher.EngineState.PORT_LISTENING ||
+                snapshot.state == CarLifeLauncher.EngineState.HANDSHAKEN_WAITING_FRAMES ||
+                snapshot.state == CarLifeLauncher.EngineState.ZERO_FRAME_STALLED ||
+                snapshot.state == CarLifeLauncher.EngineState.ATTACHED_NO_FLOW
+        btnStopCarLife.visibility = if (showStop) View.VISIBLE else View.GONE
+
+        refreshCarLifeTargetRow(snapshot)
+        findViewById<View>(R.id.rowCarLifeAccessibility).visibility = View.GONE
+
+        if (snapshot.state == CarLifeLauncher.EngineState.ZERO_FRAME_STALLED) {
+            if (!zeroFrameAlertShown) {
+                zeroFrameAlertShown = true
+                log("CARLIFE: ⚠ 检测到 7240 端口持续 ${CarLifeHijack.zeroFrameStalledSec}s 零帧——疑似被后台僵死组件占口")
+                snack("⚠ 7240 连上但持续 0 帧，疑似被后台组件占口——点「清理占口」处理", 5_000L)
+            }
+        } else {
+            zeroFrameAlertShown = false
+        }
+    }
+
+    private fun bindCarLifeCard() {
+        btnLaunchCarLife.setOnClickListener {
+            if (CarLifeHijack.isZeroFrameStalled) {
+                promptZeroFrameRecovery()
+            } else {
+                launchCarLifeEngine()
+            }
+        }
+        btnStopCarLife.setOnClickListener { stopCarLifeEngine() }
+
+        findViewById<View>(R.id.rowCarLifeTarget).setOnClickListener {
+            val next = CarLifeAutoPrefs.launchTarget(this).next()
+            CarLifeAutoPrefs.setLaunchTarget(this, next)
+            updateCarLifeStatus()
+            snack("画面源目标已切换：${next.label}")
+            log("CARLIFE-AUTO: 优先拉起目标已切换为「${next.label}」")
+        }
+
+        val autoOn = CarLifeAutoPrefs.autoLaunchOnConnect(this)
+        switchAutoLaunchCarLife.isChecked = autoOn
+        renderAutoLaunchCarLifeNote(autoOn)
+        switchAutoLaunchCarLife.setOnCheckedChangeListener { _, checked ->
+            CarLifeAutoPrefs.setAutoLaunchOnConnect(this, checked)
+            CarLifeAutoPrefs.setAutoBackgroundOnReady(this, checked)
+            renderAutoLaunchCarLifeNote(checked)
+            log("CARLIFE-AUTO: 连接时自动拉起并退后台已${if (checked) "开启" else "关闭"}")
+        }
+
+        findViewById<View>(R.id.rowCarLifeAccessibility).visibility = View.GONE
+
+        updateCarLifeStatus()
+    }
+
+    private fun renderAutoLaunchCarLifeNote(enabled: Boolean) {
+        autoLaunchCarLifeNote.text =
+            if (enabled) {
+                "启动连接或靠近车机时，若未出帧则自动拉起目标，接管首帧后自动退后台"
+            } else {
+                "已关闭：连接车机时不会自动拉起 CarWith / CarLife，需手动点击上方按钮"
+            }
+    }
+
+    private fun refreshCarLifeTargetRow(snapshot: CarLifeLauncher.StatusSnapshot) {
+        val pref = CarLifeAutoPrefs.launchTarget(this)
+        val shortName =
+            when (pref) {
+                CarLifeAutoPrefs.LaunchTarget.AUTO -> "自动"
+                CarLifeAutoPrefs.LaunchTarget.XIAOMI_CARWITH -> "小米 CarWith"
+                CarLifeAutoPrefs.LaunchTarget.BAIDU_CARLIFE -> "百度 CarLife+"
+                CarLifeAutoPrefs.LaunchTarget.XIAOMI_CARLIFE_COMPONENT -> "小米组件"
+            }
+        if (carLifeTargetValue.text != shortName) carLifeTargetValue.text = shortName
+        val installedNames =
+            if (snapshot.installedApps.isEmpty()) {
+                "未检测到可用应用"
+            } else {
+                snapshot.installedApps.joinToString(" / ") { it.displayName }
+            }
+        val activeChoice = snapshot.preferredApp?.displayName ?: "无"
+        val note = "当前将拉起：$activeChoice（本机已安装：$installedNames）"
+        if (carLifeTargetNote.text != note) carLifeTargetNote.text = note
+    }
+
+    private fun refreshCarLifeAccessibilityRow() {
+        val enabled = CarLifeAutoTriggerService.isEnabledInSettings(this)
+        val connected = CarLifeAutoTriggerService.isConnected
+        val note =
+            when {
+                connected -> "✓ 服务运行中：自动点进 CarWith / CarLife 无线连接，出帧后自动退回桌面"
+                enabled -> "✓ 已在系统无障碍启用（等待系统绑定，或重启无障碍开关刷新）"
+                else -> "未开启（可选）：首次去系统无障碍开启一次，之后免手动点「无线连接」并自动退后台"
+            }
+        if (carLifeAccessibilityNote.text != note) carLifeAccessibilityNote.text = note
+        val btnText = if (enabled) "✓ 已开启" else "去开启"
+        if (btnCarLifeAccessibility.text != btnText) btnCarLifeAccessibility.text = btnText
+        btnCarLifeAccessibility.setTextColor(
+            getColor(if (enabled) R.color.m3_ok else R.color.m3_primary),
+        )
+    }
+
+    private fun promptZeroFrameRecovery() {
+        val sec = CarLifeHijack.zeroFrameStalledSec
+        val installed = CarLifeLauncher.detectInstalled(this)
+        val hasXiaomiComp = installed.any { it.packageName == io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARLIFE }
+        val hasBaidu = installed.any { it.packageName == io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerPolicy.PACKAGE_BAIDU_CARLIFE }
+        val actions =
+            buildList {
+                if (hasXiaomiComp) {
+                    add(
+                        DarkMessageDialog.Action("强停小米组件", DarkMessageDialog.Emphasis.PRIMARY) {
+                            openAppDetails(io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARLIFE)
+                        },
+                    )
+                }
+                if (hasBaidu) {
+                    add(
+                        DarkMessageDialog.Action(
+                            "强停百度 CarLife+",
+                            if (hasXiaomiComp) DarkMessageDialog.Emphasis.TEXT else DarkMessageDialog.Emphasis.PRIMARY,
+                        ) {
+                            openAppDetails(io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerPolicy.PACKAGE_BAIDU_CARLIFE)
+                        },
+                    )
+                }
+                add(
+                    DarkMessageDialog.Action("直接重新拉起") {
+                        launchCarLifeEngine()
+                    },
+                )
+            }
+        DarkMessageDialog.show(
+            activity = this,
+            title = "7240 端口持续 ${sec}s 零帧（疑似占口）",
+            message =
+                "本机 7240 端口已被某个无画面的后台进程占住（硬编输出 0 帧），导致正常的 CarLife 无法绑定端口出帧。\n\n" +
+                    "Android 不允许第三方 App 直接结束其它应用进程；请点下方按钮打开对应应用信息，点一次「强行停止」后返回本页再点「启动并退后台」即可秒出帧。",
+            actions = actions,
+        )
+    }
+
+    private fun openAppDetails(targetPackage: String) {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", targetPackage, null),
+                ),
+            )
+        }.onFailure {
+            snack("无法打开应用信息，请到系统设置 → 应用管理里强行停止 $targetPackage", 4_000L)
+        }
+    }
+
+    private fun launchCarLifeEngine() {
+        val connectingOrConnected = heroState == HeroState.CONNECTING || heroState == HeroState.CONNECTED
+        val result =
+            CarLifeAutoCoordinator.launchManual(
+                context = this,
+                log = ::log,
+                connectionActive = connectingOrConnected,
+            )
+        when (result.outcome) {
+            CarLifeAutoCoordinator.LaunchOutcome.LAUNCHED -> {
+                val hint = "已拉起「${result.appName}」——正在建立本地虚拟屏，出帧后将自动退回后台"
+                snack(hint, 3_500L)
+            }
+
+            CarLifeAutoCoordinator.LaunchOutcome.ALREADY_RUNNING -> {
+                snack("✓ 本机画面源已在后台正常运行，可直接启动连接")
+            }
+
+            CarLifeAutoCoordinator.LaunchOutcome.DISABLED -> {
+                snack("请先在下方「显示」卡中开启「本地 CarLife 劫持」", 3_500L)
+            }
+
+            CarLifeAutoCoordinator.LaunchOutcome.NOT_INSTALLED -> {
+                snack("未检测到小米 CarWith 或百度 CarLife+，请先安装后再试", 4_000L)
+            }
+
+            CarLifeAutoCoordinator.LaunchOutcome.FAILED -> {
+                snack(result.detail ?: "调起失败，请手动打开 CarWith / CarLife+", 4_000L)
+            }
+        }
+        updateCarLifeStatus()
+    }
+
+    private fun stopCarLifeEngine() {
+        CarLifeAutoCoordinator.disarm("用户点击停止")
+        log("CARLIFE: 用户手动停止虚拟投屏，正在断开本地七路连接")
+        btnStopCarLife.isEnabled = false
+        val appCtx = applicationContext
+        val shouldDisconnectCar = heroState == HeroState.CONNECTING || heroState == HeroState.CONNECTED || SessionController.isStreaming()
+        Thread(
+            {
+                if (shouldDisconnectCar) {
+                    SessionController.disconnect(appCtx)
+                }
+                CarLifeHijack.stop()
+                runOnUiThread {
+                    btnStopCarLife.isEnabled = true
+                    updateCarLifeStatus()
+                    snack("已停止虚拟投屏")
+                }
+            },
+            "stop-carlife-source",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun openAccessibilityGuide() {
+        val enabled = CarLifeAutoTriggerService.isEnabledInSettings(this)
+        val title = if (enabled) "无障碍自动连接助手已开启" else "开启无障碍自动连接助手（档位 2）"
+        val message =
+            if (enabled) {
+                "当前已启用「CarPToCarL · CarWith/CarLife 自动连接助手」。\n\n" +
+                    "工作方式：仅在连接车机或点击「启动并退后台」后的 25 秒窗口内，" +
+                    "自动点击小米 CarWith / 百度 CarLife+ 的无线连接，接管出帧后自动退回桌面。\n\n" +
+                    "如需关闭或检查运行状态，可前往系统无障碍设置。"
+            } else {
+                "开启后可实现接近有线的自动体验：\n" +
+                    "1. 靠近车机或点击「启动连接」时自动拉起小米 CarWith / 百度 CarLife+；\n" +
+                    "2. 自动点进「CarLife 无线连接 → WLAN直连 → 开始连接」；\n" +
+                    "3. 接管 7240 收到首帧后自动把界面退入后台。\n\n" +
+                    "小米手机路径：点击下方按钮 → 「已下载的应用」→ 找到「CarPToCarL · CarWith/CarLife 自动连接助手」→ 打开开关。\n" +
+                    "（服务已按包名白名单限定，只监听 CarWith / CarLife，不触碰其它应用）"
+            }
+        DarkMessageDialog.show(
+            activity = this,
+            title = title,
+            message = message,
+            actions =
+                listOf(
+                    DarkMessageDialog.Action("稍后") {},
+                    DarkMessageDialog.Action("前往无障碍设置", DarkMessageDialog.Emphasis.PRIMARY) {
+                        runCatching {
+                            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                        }.onFailure {
+                            snack("无法打开无障碍设置，请到系统设置 → 更多设置 → 无障碍 中开启", 4_000L)
+                        }
+                    },
+                ),
+        )
     }
 
     private fun tickHero() {
@@ -3089,9 +3463,20 @@ class MainActivity : AppCompatActivity() {
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .cancel(CarApproachReceiver.BLOCKED_NOTIFICATION_ID)
         }
+        if (intent.getBooleanExtra(EXTRA_MOVE_TO_BACKGROUND, false)) {
+            intent.removeExtra(EXTRA_MOVE_TO_BACKGROUND)
+            if (!isFinishing && !isDestroyed) {
+                mainHandler.postDelayed(
+                    { if (!isFinishing && !isDestroyed) moveTaskToBack(true) },
+                    250L,
+                )
+            }
+            return
+        }
         if (!intent.getBooleanExtra(EXTRA_CAR_APPROACH, false)) return
         intent.removeExtra(EXTRA_CAR_APPROACH)
         if (isFinishing || isDestroyed) return
+        silentApproachSession = CarApproachPrefs.silentUi(this)
         log("APPROACH: 检测到目标车机蓝牙靠近（App 已在运行）——由前台重新发起连接")
         autoConnectRequested = true
         // App 已在后台运行过：启动自检那一轮早就跑完，不必再为它让路。

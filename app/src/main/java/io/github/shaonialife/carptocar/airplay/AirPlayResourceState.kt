@@ -191,6 +191,52 @@ class AirPlayResourceState {
     ): Boolean = claimAndPublish(RESOURCE_SCREEN, publish) { it.claim(PRIORITY_USER, overrideBorrow = fromRequestUi) }
 
     /**
+     * 用户在手机车联内点击「返回原车」时主动把主屏交还车机（takeConstraint=100，允许下次用户点图标拿回）。
+     */
+    fun relinquishScreenToCar(publish: (Map<String, Any?>) -> Boolean): Boolean =
+        claimAndPublish(RESOURCE_SCREEN, publish) { screen ->
+            if (screen.entity == ENTITY_CAR && screen.permanentEntity == ENTITY_CAR && screen.borrowers.isEmpty()) {
+                false
+            } else {
+                screen.borrowers.clear()
+                screen.phoneBorrowing = false
+                screen.permanentEntity = ENTITY_CAR
+                screen.takeConstraint = 100
+                screen.borrowConstraint = 100
+                true
+            }
+        }
+
+    /**
+     * 构造一份「临时声明主屏归车机（entity=2, permanentEntity=2）」的 `modesChanged` 快照（不改状态机内存态）。
+     *
+     * 用于「主屏在状态机里本就归手机，但车机停在原车界面并下发 `requestUI`」的场景：
+     * 先发一次让出、再发拿回，制造真实的 `2 → 1` 归属边沿（参考 mcarplay VW4211 实车验证）。
+     */
+    fun commandWithScreenReleased(): Map<String, Any?> =
+        synchronized(lock) {
+            val base = command()
+            val params = (base["params"] as? Map<*, *>)?.toMutableMap() ?: return base
+            val rawResources = params["resources"] as? List<*> ?: return base
+            val updatedResources =
+                rawResources.map { entry ->
+                    val map = (entry as? Map<*, *>) ?: return@map entry
+                    val id = (map["resourceID"] as? Number)?.toInt()
+                    if (id == RESOURCE_SCREEN) {
+                        linkedMapOf<String, Any?>(
+                            "resourceID" to RESOURCE_SCREEN.toLong(),
+                            "entity" to ENTITY_CAR,
+                            "permanentEntity" to ENTITY_CAR,
+                        )
+                    } else {
+                        map
+                    }
+                }
+            params["resources"] = updatedResources
+            linkedMapOf("type" to "modesChanged", "params" to params)
+        }
+
+    /**
      * 申请主音频：媒体按用户优先级永久取得；导航按后台优先级 [temporary] 借用，
      * 播报结束用 [releaseAudioBorrow] 归还。
      */

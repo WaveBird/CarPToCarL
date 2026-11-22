@@ -618,14 +618,15 @@ class Iap2SenderSession(
         }
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
-        //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
-        //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
-        //    ACK 挑战帧后**整段静默**（不回 ACK、不回应答，会话变僵尸）——本日多轮实测，
-        //    32B→20B 的会话全部卡死，20B→（记忆命中）的会话全部秒通。
-        //  - 测试台 DiPlay（Carlinkit AuthV3 EC 身份）：**只接受精确 32B**，长度不符直接断链。
+        val certHint = MfiCertHint.inspectFrameBody(certificate.body)
+        val prefer20First = certHint.prefer20First ?: legacyCar
+        if (certHint != MfiCertHint.Kind.UNKNOWN) {
+            log("iap2 MFi 证书识别=${certHint.label}——冷启动首选 ${if (prefer20First) "20B" else "32B"} 挑战")
+        }
+        // 挑战长度优先按 0xAA01 证书公钥类型决定（RSA/SHA-1 MFi 2.0C → 20B；ECDSA/RSA-SHA256 MFi 3.0 → 32B），
+        // 无法识别时回退品牌特征（真车系 20B 首试，测试台 DiPlay 32B 首试），最终由按车机持久化记忆覆盖。
         // 全部无应答也不中止——我们不校验签名（0xAA05 自报），由 0x5702 是否应答判定放行。
-        runMfiChallenge(deadline, prefer20First = legacyCar, receiverKey = identityText)
+        runMfiChallenge(deadline, prefer20First = prefer20First, receiverKey = identityText)
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
@@ -1416,14 +1417,17 @@ class Iap2SenderSession(
         } else {
             send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         }
-        if (expectOrNull(Iap2MessageIds.MFI_CERTIFICATE, step()) == null) {
+        val certificate = expectOrNull(Iap2MessageIds.MFI_CERTIFICATE, step())
+        if (certificate == null) {
             log("iap2 重认证放弃：0xaa00 之后没等到 0xaa01（链路存活=${channel.isAlive}）")
             return null
         }
         // 挑战可能要多档试（32/20/16B），窗口按整段给而不是单步 3 秒
         val challengeDeadline = minOf(deadline, System.nanoTime() + REAUTH_CHALLENGE_BUDGET_MILLIS * 1_000_000L)
         val legacyCar = LEGACY_RECEIVER_MARKERS.any { receiverIdentity.contains(it) }
-        runMfiChallenge(challengeDeadline, prefer20First = legacyCar, receiverKey = receiverIdentity)
+        val certHint = MfiCertHint.inspectFrameBody(certificate.body)
+        val prefer20First = certHint.prefer20First ?: legacyCar
+        runMfiChallenge(challengeDeadline, prefer20First = prefer20First, receiverKey = receiverIdentity)
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 重认证完成（tx=0xaa05）——重发设备状态问候与 0x4300")
         sendDeviceStateGreetings()
@@ -2303,7 +2307,7 @@ class Iap2SenderSession(
             val generationChange = ProtocolGeneration.observe(context, profile.identityKey, profile)
             if (generationChange != null) {
                 log(ProtocolGeneration.describe(generationChange))
-                MfiLengthMemory.forget(context, profile.identityKey)
+                MfiLengthMemory.forgetPreference(context, profile.identityKey)
                 ProtocolAudit.record(
                     ProtocolAudit.Code.ERA_SWITCHED,
                     detail = "${generationChange.from.era}/${generationChange.from.wifiGen}" +

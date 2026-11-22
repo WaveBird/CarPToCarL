@@ -1025,6 +1025,9 @@ object BtSessionGate {
 
     fun ownsControl(channel: Iap2LinkChannel): Boolean = controlOwner === channel
 
+    /** 当前是否存在活跃的 BT iAP2 控制通道（含 bring-up 握手期，早于 [iap2Ready]）。 */
+    val hasActiveControl: Boolean get() = controlOwner != null
+
     @Synchronized
     fun markControlReady(channel: Iap2LinkChannel) {
         if (controlOwner === channel) iap2Ready = true

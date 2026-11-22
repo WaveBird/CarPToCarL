@@ -858,9 +858,32 @@ class VideoSender(
         }
     }
 
-    /** 编码器不存在时（直通模式）也允许请求关键帧：直接返回 true，由上游自行发 IDR。 */
+    /** 直通模式下车机请求关键帧或主屏归还时的上游回调（触发 CarWith/CarLife 立即出 IDR）。 */
+    @Volatile
+    var onPassthroughKeyFrameRequest: (() -> Boolean)? = null
+
+    /** 编码器不存在时（直通模式）也允许请求关键帧：通知上游催 IDR，并在已有缓存 IDR 时立即补发一帧。 */
     fun requestKeyFrame(): Boolean {
-        if (passthrough) return true
+        if (passthrough) {
+            val requested = onPassthroughKeyFrameRequest?.invoke() ?: false
+            val cachedIdr = lastIdrNals
+            if (cachedIdr != null && running.get()) {
+                Thread({
+                    val out = socket?.getOutputStream() ?: return@Thread
+                    suppressFrameLog = true
+                    try {
+                        sendFrameFromNals(cachedIdr, keyFrame = true, output = out, idleResend = true)
+                    } catch (_: Exception) {
+                    } finally {
+                        suppressFrameLog = false
+                    }
+                }, "video-force-idr").apply {
+                    isDaemon = true
+                    start()
+                }
+            }
+            return requested || cachedIdr != null
+        }
         val codec = encoder ?: return false
         return try {
             val params = android.os.Bundle()

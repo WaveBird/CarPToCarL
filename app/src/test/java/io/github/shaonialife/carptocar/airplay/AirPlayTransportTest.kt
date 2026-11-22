@@ -286,16 +286,16 @@ class AirPlayTransportTest {
         onTransportClosed = { _, _ -> onClosed() },
     )
 
-    private fun localHost(): String =
-        NetworkInterface
-            .getNetworkInterfaces()
-            .toList()
+    private fun localHost(): String {
+        val ifaces = NetworkInterface.getNetworkInterfaces().toList().filter { it.isUp }
+        val nonTun = ifaces.filterNot { it.isPointToPoint }
+        return (nonTun + ifaces)
             .asSequence()
-            .filter { it.isUp }
             .flatMap { it.inetAddresses.toList().asSequence() }
             .filterIsInstance<Inet4Address>()
             .firstOrNull { !it.isLoopbackAddress && !it.isAnyLocalAddress }
             ?.hostAddress ?: error("Local TCP integration requires a non-loopback IPv4 interface")
+    }
 
     private fun endpoint(
         port: Int,

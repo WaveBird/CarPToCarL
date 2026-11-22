@@ -341,4 +341,31 @@ class AirPlayResourceStateTest {
         assertFalse(acquired)
         assertFalse(state.phoneOwnsAudio)
     }
+
+    @Test
+    fun `requestUI 重拿主屏快照——构造临时让出报文但不污染本地持有态`() {
+        val state = AirPlayResourceState()
+        state.initialize(null)
+        assertTrue(state.phoneOwnsScreen)
+        val releasedSnapshot = state.commandWithScreenReleased()
+        val params = releasedSnapshot["params"] as Map<*, *>
+        val screenRes = (params["resources"] as List<*>).first() as Map<*, *>
+        assertEquals(2L, screenRes["entity"])
+        assertEquals(2L, screenRes["permanentEntity"])
+        // 内存态仍然保持手机持有，确保随后的 command() 直接发出 entity=1 完成 2->1 边沿
+        assertTrue(state.phoneOwnsScreen)
+        val retakeParams = state.command()["params"] as Map<*, *>
+        val retakeScreen = (retakeParams["resources"] as List<*>).first() as Map<*, *>
+        assertEquals(1L, retakeScreen["entity"])
+    }
+
+    @Test
+    fun `CarWith 返回原车交还主屏——takeConstraint 为 100，后续可正常再次拿回`() {
+        val state = AirPlayResourceState()
+        state.initialize(null)
+        assertTrue(state.relinquishScreenToCar { true })
+        assertFalse(state.phoneOwnsScreen)
+        assertTrue(state.acquireScreen(fromRequestUi = false) { true })
+        assertTrue(state.phoneOwnsScreen)
+    }
 }

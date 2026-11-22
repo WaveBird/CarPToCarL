@@ -852,9 +852,17 @@ class AirPlayClient(
     fun teardownQuietly(): Boolean {
         val streams = activeStreams.entries.map { it.key to it.value }
         activeStreams.clear()
+        // 有序断开第 1 步：若网络 iAP2 控制会话已建立，先通知 0x4E0D=0（无线不可用）
+        // 并留 ~150ms 让车机处理，再依次发单流 TEARDOWN 和整会话 TEARDOWN。
+        if (iapLink?.sendWirelessCarPlayUnavailable() == true) {
+            runCatching { Thread.sleep(ORDERED_TEARDOWN_STEP_DELAY_MS) }
+        }
         var allAccepted = true
         streams.forEach { (id, type) ->
             allAccepted = teardownStreamDescriptor(type, id) && allAccepted
+        }
+        if (streams.isNotEmpty()) {
+            runCatching { Thread.sleep(ORDERED_TEARDOWN_STEP_DELAY_MS) }
         }
         allAccepted = teardownSession() && allAccepted
         return allAccepted
@@ -1252,6 +1260,23 @@ class AirPlayClient(
     fun acquireScreenResource(fromRequestUi: Boolean = false): Boolean =
         synchronized(modesPublicationLock) {
             resourceState.acquireScreen(fromRequestUi) { publishModes("申请主屏", it) }
+        }
+
+    /**
+     * 车机发 `requestUI` 但本地状态已经是「主屏归手机」时，先发一次临时让出（entity=2）再发拿回（entity=1），
+     * 确保车机 HMI 看到真实的 `2 → 1` 归属跳变而切入 CarPlay 页面。
+     */
+    fun retakeScreenForUiRequest(): Boolean =
+        synchronized(modesPublicationLock) {
+            publishModes("requestUI 重拿主屏-先让出", resourceState.commandWithScreenReleased())
+            runCatching { Thread.sleep(80L) }
+            publishModes("requestUI 重拿主屏-拿回", resourceState.command())
+        }
+
+    /** 用户在 CarWith 点击「返回原车」时主动将主屏交还车机。 */
+    fun relinquishScreenToCar(): Boolean =
+        synchronized(modesPublicationLock) {
+            resourceState.relinquishScreenToCar { publishModes("返回原车交还主屏", it) }
         }
 
     fun acquireAudioResource(
@@ -2500,6 +2525,9 @@ class AirPlayClient(
 
         /** 整条会话 TEARDOWN 的等待上限（规范第 10 步：流拆完再拆会话）。 */
         private const val SESSION_TEARDOWN_TIMEOUT_MILLIS = 1_500
+
+        /** 有序断开步骤间隔（0x4E0D=0 → 单流 TEARDOWN → 整会话 TEARDOWN，每步留 150ms 让车机落状态）。 */
+        private const val ORDERED_TEARDOWN_STEP_DELAY_MS = 150L
 
         /**
          * 高质量主音频流类型（catplay `StreamType::MainHighAudio`）。

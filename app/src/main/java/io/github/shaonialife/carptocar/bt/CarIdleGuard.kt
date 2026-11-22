@@ -10,6 +10,7 @@ import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import io.github.shaonialife.carptocar.SessionController
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerService
 import io.github.shaonialife.carptocar.service.CarIdleReceiver
 import io.github.shaonialife.carptocar.service.CarPlayService
 import io.github.shaonialife.carptocar.util.DebugFileLog
@@ -114,10 +115,19 @@ object CarIdleGuard {
             )
             return
         }
+        // 若用户开启了无障碍自动连接助手，收摊时只停会话与保活服务，不强杀进程：
+        // `Process.killProcess` 会让系统把已绑定的 AccessibilityService 标进 Crashed services，
+        // 导致下次靠近车机时无障碍彻底失灵。
+        val keepAliveForA11y = CarLifeAutoTriggerService.isEnabledInSettings(context)
         shutdown(
             context,
-            reason = "车机已远离（蓝牙断开 30 秒未回连）",
-            killProcess = true,
+            reason =
+                if (keepAliveForA11y) {
+                    "车机已远离（蓝牙断开 30 秒未回连；已停会话与保活，保留进程以防无障碍被标为崩溃）"
+                } else {
+                    "车机已远离（蓝牙断开 30 秒未回连）"
+                },
+            killProcess = !keepAliveForA11y,
             // 车机确实走了：ACL 断开时已解除抑制，这里不必再动，保持「下次靠近可再拉起」。
             suppressAutoStart = false,
         )

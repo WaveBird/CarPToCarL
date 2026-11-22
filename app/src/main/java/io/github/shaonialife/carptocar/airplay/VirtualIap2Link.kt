@@ -395,6 +395,21 @@ class VirtualIap2Link(
     }
 
     /**
+     * 有序断开第 1 步（参考 mcarplay 实车对照 iPhone 抓包）：
+     * 若网络 iAP2 控制会话已识别完成，发 `0x4E0D WirelessCarPlayUpdate(state=0)`
+     * 通知车机本端即将优雅退出，让车机把会话结束原因记为正常断开（noErr）
+     * 而非异常掉线（kConnectionErr），减少配对列表丢失或冷却残留。
+     */
+    fun sendWirelessCarPlayUnavailable(): Boolean {
+        synchronized(lock) {
+            if (!mib3Identified || !alive()) return false
+            sendCsmLocked(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 0))
+            log("IAPLINK: 有序断开——已发 0x4E0D WirelessCarPlayUpdate=0")
+            return true
+        }
+    }
+
+    /**
      * 开一轮控制通道协商：marker + 本表同步包（会话 10/11/12），刷新引擎重发节拍。
      */
     private fun startControlRoundLocked(reason: String) {

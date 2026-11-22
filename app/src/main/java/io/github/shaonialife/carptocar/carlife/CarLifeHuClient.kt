@@ -195,6 +195,13 @@ class CarLifeHuClient(
      * 让引擎在「已有编码器」的状态下重建一次。只做一次，避免把引擎打进反复重建。
      */
     private val settleReinit: Boolean = true,
+    /** 小米原生 CarWith 4.1 加密模式（2.0 MD5 证明 + RSA-2048 + AES/ECB/PKCS5Padding + XIAOMI_MIX 音频）。 */
+    private val encryptedCarWith: Boolean = false,
+    /** 当前申请分辨率是否来自可信车机画布（本轮 `/info` 或已验证记忆），决定是否下发 `DISABLE_RESOLUTION_OPTION=1`。 */
+    @Volatile
+    var hasTrustedCanvas: Boolean = true,
+    /** 用户在 CarWith 内点击「返回原车」（0x10021）时回调。 */
+    private val onReturnToCar: () -> Unit = {},
     private val monotonicMillis: () -> Long = { android.os.SystemClock.uptimeMillis() },
     private val connectSocket: ((Int) -> Socket)? = null,
 ) {
@@ -202,6 +209,26 @@ class CarLifeHuClient(
     private val running = AtomicBoolean(false)
     private val sockets = ConcurrentHashMap<Int, Socket>()
     private var cmdOut: OutputStream? = null
+
+    @Volatile
+    var handshakeFailed: Boolean = false
+        private set
+
+    private val seedExchange = CarLifeSeedExchange()
+    private val videoAssembler = CarLifeVideoAccessUnitAssembler()
+
+    @Volatile
+    private var payloadCipher: CarLifePayloadCipher? = null
+    private var carWithDeviceInfo: CarLifeProtocol.DeviceInfo? = null
+    private var carWithChallenge: String? = null
+    private var carWithAuthVerified = false
+    private var carWithPeerAuthAccepted = false
+    private var carWithFeatureRequested = false
+    private var carWithFeatureSent = false
+    private var carWithRsaSent = false
+    private var carWithSeedAccepted = false
+    private var carWithEncryptReady = false
+    private var carWithVideoInitSent = false
 
     @Volatile
     private var touchOut: OutputStream? = null
@@ -519,14 +546,34 @@ class CarLifeHuClient(
             }
         }
         val cmd = sockets[CarLifeProtocol.PORT_CMD]
-        if (cmd == null) {
-            log("CARLIFE: 控制端口未连通，CarLife 可能不在「无线连接」态")
+        if (cmd == null || (encryptedCarWith && sockets.size < PORTS.size)) {
+            log(
+                if (cmd == null) {
+                    "CARLIFE: 控制端口未连通，CarLife 可能不在「无线连接」态"
+                } else {
+                    "CARLIFE: CarWith 七路端口尚未全部就绪（已连通 ${sockets.size}/${PORTS.size}），稍后重试"
+                },
+            )
             closeAll()
             return false
         }
         cmdOut = cmd.getOutputStream()
         touchOut = sockets[CarLifeProtocol.PORT_TOUCH]?.getOutputStream()
         running.set(true)
+        handshakeFailed = false
+        payloadCipher = null
+        seedExchange.clear()
+        videoAssembler.reset()
+        carWithDeviceInfo = null
+        carWithChallenge = null
+        carWithAuthVerified = false
+        carWithPeerAuthAccepted = false
+        carWithFeatureRequested = false
+        carWithFeatureSent = false
+        carWithRsaSent = false
+        carWithSeedAccepted = false
+        carWithEncryptReady = false
+        carWithVideoInitSent = false
         lastFrameAt = monotonicMillis()
         // 首轮有序初始化的闸门：每条新会话都要从「98386 还没确认、首条 98311 还没发」开始。
         firstInitSent = false
@@ -554,17 +601,25 @@ class CarLifeHuClient(
         // 音频：媒体（9240）/ TTS（9241）各挂一条读线程，挂上即为沉默判定的宽限起点
         sockets[CarLifeProtocol.PORT_MEDIA]?.let { openAudio(mediaChan, it) }
         sockets[CarLifeProtocol.PORT_TTS]?.let { openAudio(ttsChan, it) }
+        if (encryptedCarWith) {
+            sockets[CarLifeProtocol.PORT_VR]?.let { vr -> startReader("carlife-vr-drain") { drainStreamSocket(vr) } }
+            sockets[CarLifeProtocol.PORT_DATA]?.let { dt -> startReader("carlife-data-drain") { drainCommandSocket(dt) } }
+        }
         startReader("carlife-heartbeat") { heartbeatLoop() }
         // 视频通道看门狗：冷启动期被引擎 reset、或中途断链时自动重连并重发编码初始化。
-        startReader("carlife-video-dog") { videoSupervisor() }
-        // 音频通道看门狗：补上「断链后没人管」的窟窿（画面早就有、声音却要等 88 秒的真因）
-        startReader("carlife-audio-dog") { audioSupervisor() }
+        if (!encryptedCarWith) {
+            startReader("carlife-video-dog") { videoSupervisor() }
+            startReader("carlife-audio-dog") { audioSupervisor() }
+        }
 
         return sendVersionNegotiation()
     }
 
     fun stop() {
         running.set(false)
+        payloadCipher = null
+        seedExchange.clear()
+        videoAssembler.reset()
         touchLock.lock()
         try {
             touchQueue.clear()
@@ -706,12 +761,13 @@ class CarLifeHuClient(
         val py = y.coerceIn(0, TOUCH_COORD_MAX)
         // 复合动作（0x68001）的负载是 CarlifeTouchAction{action,x,y}，
         // 单点消息（0x68002/3/4）的负载是 CarlifeTouchSinglePoint{x,y}——两者不能混用。
-        val payload =
+        val rawPayload =
             if (serviceType == CarLifeProtocol.TOUCH_ACTION) {
                 CarLifeProtocol.touchAction(action, px, py)
             } else {
                 CarLifeProtocol.touchPoint(px, py)
             }
+        val payload = payloadCipher?.encrypt(rawPayload) ?: rawPayload
         val frame = CarLifeProtocol.packCommand(serviceType, payload)
         sentTouchCount++
         val current = touchOut ?: reopenTouch()
@@ -789,9 +845,11 @@ class CarLifeHuClient(
     // ---- 握手 ----
 
     private fun sendVersionNegotiation(): Boolean {
-        val deadline = System.currentTimeMillis() + 15_000
+        val timeoutMs = if (encryptedCarWith) 6_000L else 15_000L
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val versionPayload = if (encryptedCarWith) CarLifeProtocol.protocolVersion41() else CarLifeProtocol.protocolVersion()
         while (running.get() && !versionMatched && System.currentTimeMillis() < deadline) {
-            send(CarLifeProtocol.HU_PROTOCOL_VERSION, CarLifeProtocol.protocolVersion())
+            send(CarLifeProtocol.HU_PROTOCOL_VERSION, versionPayload)
             var waited = 0
             while (waited < 1500 && !versionMatched && running.get()) {
                 Thread.sleep(100)
@@ -799,11 +857,12 @@ class CarLifeHuClient(
             }
         }
         if (!versionMatched) {
-            log("CARLIFE: 15s 内未收到版本匹配，放弃本次连接")
+            handshakeFailed = true
+            log("CARLIFE: ${timeoutMs / 1000}s 内未收到版本匹配，放弃本次连接")
             stop()
             return false
         }
-        log("CARLIFE: 版本匹配成功（协议 3.0）")
+        log("CARLIFE: 版本匹配成功（协议 ${if (encryptedCarWith) "4.1 加密模式" else "3.0 明文模式"}）")
         return true
     }
 
@@ -815,8 +874,21 @@ class CarLifeHuClient(
                 data.readFully(header)
                 val length = ((header[0].toInt() and 0xFF) shl 8) or (header[1].toInt() and 0xFF)
                 val serviceType = readU32(header, 4)
-                val payload = ByteArray(length)
-                if (length > 0) data.readFully(payload)
+                val rawPayload = ByteArray(length)
+                if (length > 0) data.readFully(rawPayload)
+                val cipher = payloadCipher
+                val payload =
+                    if (cipher != null && rawPayload.isNotEmpty()) {
+                        try {
+                            cipher.decrypt(rawPayload)
+                        } catch (error: Exception) {
+                            handshakeFailed = true
+                            log("CARLIFE: 控制通道 AES 解密失败（0x${serviceType.toString(16)}）- ${error.message}")
+                            break
+                        }
+                    } else {
+                        rawPayload
+                    }
                 handleMessage(serviceType, payload)
             }
         } catch (error: Exception) {
@@ -830,11 +902,40 @@ class CarLifeHuClient(
         when (serviceType) {
             CarLifeProtocol.MD_VERSION_MATCH -> {
                 versionMatched = true
-                flushPendingEncoderInit()
-                send(CarLifeProtocol.HU_STATISTICS, CarLifeProtocol.statisticsInfo())
+                if (encryptedCarWith) {
+                    send(CarLifeProtocol.HU_STATISTICS, CarLifeProtocol.carWithStatisticsInfo())
+                } else {
+                    flushPendingEncoderInit()
+                    send(CarLifeProtocol.HU_STATISTICS, CarLifeProtocol.statisticsInfo())
+                }
+            }
+
+            CarLifeProtocol.MD_FOREGROUND -> {
+                send(CarLifeProtocol.HU_GO_TO_FOREGROUND, ByteArray(0))
+            }
+
+            CarLifeProtocol.MD_RETURN_TO_CAR -> {
+                log("CARLIFE: 收到返回原车指令（0x10021）——交还车机主屏资源")
+                onReturnToCar()
             }
 
             CarLifeProtocol.MD_INFO -> {
+                if (encryptedCarWith) {
+                    val info = CarLifeProtocol.parseDeviceInfo(payload)
+                    if (info == null) {
+                        handshakeFailed = true
+                        log("CARLIFE: CarWith MD_INFO 解析失败（${payload.size}B）——可能不是 CarWith 引擎")
+                        stop()
+                        return
+                    }
+                    carWithDeviceInfo = info
+                    val challenge = CarLifeAuthentication.newChallenge()
+                    carWithChallenge = challenge
+                    log("CARLIFE: CarWith MD_INFO brand=${info.brand} model=${info.model} sdk=${info.sdk} → 下发 2.0 挑战")
+                    send(CarLifeProtocol.HU_INFO, CarLifeProtocol.carWithHuInfo())
+                    send(CarLifeProtocol.HU_AUTH_REQUEST, CarLifeProtocol.pbString(1, challenge))
+                    return
+                }
                 log("CARLIFE: 收到手机设备信息（${payload.size}B）")
                 // display 报**车机画布**（requested），不是引擎回显值（video）。
                 // 用 video 的坏处：引擎一旦把 1412×654 降档成 1280×720，回显值就变成 720p，
@@ -888,10 +989,17 @@ class CarLifeHuClient(
                     log(
                         "CARLIFE: 主动推送 98386 特征配置（CONNECT_TYPE=$connectType，" +
                             "I 帧间隔=${CarLifeProtocol.I_FRAME_INTERVAL_DEFAULT} 帧，" +
-                            "DISABLE_RESOLUTION_OPTION=1 分辨率直通，CONTENT_ENCRYPTION=0 不加密，MEDIA_LYRIC_SUPPORT=1 歌词" +
+                            "DISABLE_RESOLUTION_OPTION=${if (hasTrustedCanvas) 1 else 0}，CONTENT_ENCRYPTION=0 不加密，MEDIA_LYRIC_SUPPORT=1 歌词" +
                                 (mediaSampleRate?.let { "，MEDIA_SAMPLE_RATE=$it（${if (it == 1) "48k" else "44.1k"}）" } ?: "") + "）",
                     )
-                    send(CarLifeProtocol.HU_FEATURE_CONFIG, CarLifeProtocol.featureConfig(connectType, mediaSampleRate = mediaSampleRate))
+                    send(
+                        CarLifeProtocol.HU_FEATURE_CONFIG,
+                        CarLifeProtocol.featureConfig(
+                            connectType,
+                            useVehicleResolution = hasTrustedCanvas,
+                            mediaSampleRate = mediaSampleRate,
+                        ),
+                    )
                     Thread.sleep(1200)
                     log("CARLIFE: 主动推送 98311 视频编码初始化 ${requestedWidth}x$requestedHeight@$videoFps")
                     sendEncoderInit()
@@ -962,9 +1070,11 @@ class CarLifeHuClient(
                         "（申请 ${requestedWidth}x$requestedHeight@$requestedFps），启动推流",
                 )
                 send(CarLifeProtocol.VIDEO_ENC_START, ByteArray(0))
-                requestHigherFrameRate()
-                onEncoderConfirmed()
-                scheduleSettleReinit()
+                if (!encryptedCarWith) {
+                    requestHigherFrameRate()
+                    onEncoderConfirmed()
+                    scheduleSettleReinit()
+                }
             }
 
             CarLifeProtocol.MD_VIDEO_FRAME_RATE_DONE -> {
@@ -1034,18 +1144,86 @@ class CarLifeHuClient(
                 sendEncoderInit()
             }
 
+            CarLifeProtocol.MD_AUTH_RESPONSE -> {
+                if (!encryptedCarWith) return
+                val challenge = carWithChallenge
+                if (challenge == null || !CarLifeAuthentication.verify(challenge, payload, carWithDeviceInfo)) {
+                    handshakeFailed = true
+                    log("CARLIFE: CarWith 身份证明校验未通过——中止当前握手")
+                    stop()
+                    return
+                }
+                carWithAuthVerified = true
+                log("CARLIFE: ✓ CarWith 2.0 身份证明校验通过 → 下发 0x1804A")
+                send(CarLifeProtocol.HU_AUTH_RESULT, CarLifeProtocol.pbVarint(1, 1))
+                maybeSendCarWithFeatures()
+            }
+
+            CarLifeProtocol.MD_AUTH_RESULT -> {
+                if (!encryptedCarWith) {
+                    send(CarLifeProtocol.HU_AUTHEN_ACK, ByteArray(0))
+                    return
+                }
+                if (CarLifeProtocol.firstIntField(payload, 1) != 1) {
+                    handshakeFailed = true
+                    log("CARLIFE: CarWith 手机渠道准入拒绝")
+                    stop()
+                    return
+                }
+                carWithPeerAuthAccepted = true
+                log("CARLIFE: ✓ CarWith 手机渠道准入通过 → 回复 0x1804C")
+                send(CarLifeProtocol.HU_AUTHEN_ACK, ByteArray(0))
+                maybeSendCarWithFeatures()
+                maybeSendCarWithVideoInit()
+            }
+
+            CarLifeProtocol.MD_FEATURE_CONFIG -> {
+                if (encryptedCarWith) {
+                    carWithFeatureRequested = true
+                    maybeSendCarWithFeatures()
+                }
+            }
+
             CarLifeProtocol.MD_ENCRYPT_SETUP -> {
-                // 引擎要求内容加密（RSA/AES）握手。我们不实现密钥协商，收到它几乎等于
-                // 「这轮会话 20 秒后会被引擎拆掉 + 媒体音频永远不推」。默认已不下发
-                // CONTENT_ENCRYPTION，这一行是万一又被打开的判据（每轮只说一次）。
+                if (encryptedCarWith) {
+                    if (carWithRsaSent) return
+                    carWithRsaSent = true
+                    val pubKey = seedExchange.createPublicKey()
+                    log("CARLIFE: 收到 RSA 公钥请求（0x1006A）→ 下发 2048 位临时公钥（0x1806B）")
+                    send(CarLifeProtocol.HU_RSA_PUBLIC_KEY, CarLifeProtocol.pbString(1, pubKey))
+                    return
+                }
                 if (encryptSetupLogged.compareAndSet(false, true)) {
                     val head = payload.take(32).joinToString(" ") { "%02x".format(it) }
                     log(
                         "CARLIFE: ⚠ 引擎要求内容加密握手 0x1006a (EncryptSetup) ${payload.size}B head=$head" +
-                            "——本实现没有 RSA/AES 密钥协商；实测带上 CONTENT_ENCRYPTION=1 时，" +
-                            "引擎约 20 秒后拆掉整条会话、CarLife+ 重启且媒体音频不再推流",
+                            "——当前为 3.0 明文模式，请切换为小米 CarWith 加密模式",
                     )
                 }
+            }
+
+            CarLifeProtocol.MD_AES_SEED -> {
+                if (!encryptedCarWith || carWithSeedAccepted) return
+                val seedB64 = CarLifeProtocol.firstStringField(payload, 1)
+                val seed = seedB64?.let { seedExchange.decryptSeed(it) }
+                if (seed == null) {
+                    handshakeFailed = true
+                    log("CARLIFE: CarWith AES 种子解密失败")
+                    stop()
+                    return
+                }
+                payloadCipher = CarLifePayloadCipher(seed)
+                seed.fill(0)
+                carWithSeedAccepted = true
+                log("CARLIFE: ✓ 已接收并解密 AES 会话密钥 → 回复 0x1806D")
+                send(CarLifeProtocol.HU_AES_ACK, ByteArray(0))
+            }
+
+            CarLifeProtocol.MD_ENCRYPT_READY -> {
+                if (!encryptedCarWith || !carWithSeedAccepted || payloadCipher == null) return
+                carWithEncryptReady = true
+                log("CARLIFE: ✓ 收到 ENCRYPT_READY（0x1006E）——AES 加密通道就绪")
+                maybeSendCarWithVideoInit()
             }
 
             else -> {
@@ -1054,6 +1232,28 @@ class CarLifeHuClient(
                 }
             }
         }
+    }
+
+    @Synchronized
+    private fun maybeSendCarWithFeatures() {
+        if (!encryptedCarWith || !carWithAuthVerified || !carWithFeatureRequested || carWithFeatureSent) return
+        carWithFeatureSent = true
+        val preferVehicleRes = hasTrustedCanvas
+        log(
+            "CARLIFE: 下发 CarWith 0x18052 功能响应（CONTENT_ENCRYPTION=1" +
+                (if (preferVehicleRes) "，DISABLE_RESOLUTION_OPTION=1 按车机画布编码" else "，首次无画布不声明直通") + "）",
+        )
+        send(CarLifeProtocol.HU_FEATURE_CONFIG, CarLifeProtocol.carWithFeatureResponse(preferVehicleRes))
+    }
+
+    @Synchronized
+    private fun maybeSendCarWithVideoInit() {
+        if (!encryptedCarWith || !carWithEncryptReady || !carWithPeerAuthAccepted || carWithVideoInitSent) return
+        carWithVideoInitSent = true
+        firstInitSent = true
+        val targetFps = requestedFps.coerceIn(20, 60)
+        log("CARLIFE: CarWith 加密与渠道准入均就绪 → 请求视频编码 ${requestedWidth}x$requestedHeight@$targetFps")
+        send(CarLifeProtocol.HU_VIDEO_ENC_INIT, CarLifeProtocol.carWithVideoInit(requestedWidth, requestedHeight, targetFps))
     }
 
     // ---- CONNECT_TYPE 探测 ----
@@ -1209,8 +1409,7 @@ class CarLifeHuClient(
         owner: Socket? = null,
     ) {
         val data = DataInputStream(input)
-        // 实测帧率窗口：每 5 秒统计一次，回答「98311 声明 60 到底有没有让引擎真的吐 60 帧」。
-        var windowStart = android.os.SystemClock.uptimeMillis()
+        var windowStart = monotonicMillis()
         var windowFrames = 0L
         try {
             while (running.get()) {
@@ -1221,44 +1420,65 @@ class CarLifeHuClient(
                     log("CARLIFE: 视频帧长度异常（$length），放弃该通道")
                     break
                 }
-                // 帧头 [4..7] 是引擎给的毫秒时间戳（[8..11] 是包类型），此前一直被丢掉。
-                // 按无符号读：若是 currentTimeMillis 量级，当 Int 读会变成负数。
                 val sourceTimestampMs = readU32(header, 4).toLong() and 0xFFFF_FFFFL
-                val payload = ByteArray(length)
-                if (length > 0) data.readFully(payload)
+                val pkgType = readU32(header, 8)
+                val rawPayload = ByteArray(length)
+                if (length > 0) data.readFully(rawPayload)
                 if (length <= 0) continue
-                videoFrameCount++
-                lastFrameAt = android.os.SystemClock.uptimeMillis()
-                reinitCount = 0
-                windowFrames++
-                // 关键帧里带 SPS：解析出码流真实分辨率，触摸坐标以它为准。
-                // 只在 I 帧上做（20fps 下很稀疏），开销可忽略。
-                if (length > 32 && (isSpsCandidate(payload) || (streamWidth == 0 && videoFrameCount < 300))) {
-                    val sps = H264Sps.parseAnnexB(payload)
-                    if (sps != null && isPlausibleSize(sps.first, sps.second) &&
-                        (sps.first != streamWidth || sps.second != streamHeight)
-                    ) {
-                        val previous = "$streamWidth x $streamHeight"
-                        streamWidth = sps.first
-                        streamHeight = sps.second
-                        log(
-                            "CARLIFE: 码流真实分辨率 ${sps.first}x${sps.second}" +
-                                "（原 $previous，谈好档位 ${videoWidth}x$videoHeight）",
-                        )
-                        onStreamSize(sps.first, sps.second)
+                if (encryptedCarWith && pkgType != CarLifeProtocol.VIDEO_DATA) continue
+                val cipher = payloadCipher
+                val decrypted =
+                    if (cipher != null) {
+                        try {
+                            cipher.decrypt(rawPayload)
+                        } catch (error: Exception) {
+                            log("CARLIFE: 视频帧 AES 解密失败 - ${error.message}")
+                            break
+                        }
+                    } else {
+                        rawPayload
                     }
+                val units =
+                    if (encryptedCarWith) {
+                        videoAssembler.push(sourceTimestampMs, decrypted)
+                    } else {
+                        listOf(CarLifeVideoAccessUnitAssembler.AccessUnit(sourceTimestampMs, decrypted, isKeyFrame(decrypted)))
+                    }
+                for (unit in units) {
+                    val payload = unit.data
+                    videoFrameCount++
+                    lastFrameAt = monotonicMillis()
+                    reinitCount = 0
+                    windowFrames++
+                    if (payload.size > 32 && (isSpsCandidate(payload) || (streamWidth == 0 && videoFrameCount < 300))) {
+                        val sps = H264Sps.parseAnnexB(payload)
+                        if (sps != null && isPlausibleSize(sps.first, sps.second) &&
+                            (sps.first != streamWidth || sps.second != streamHeight)
+                        ) {
+                            val previous = "$streamWidth x $streamHeight"
+                            streamWidth = sps.first
+                            streamHeight = sps.second
+                            log(
+                                "CARLIFE: 码流真实分辨率 ${sps.first}x${sps.second}" +
+                                    "（原 $previous，谈好档位 ${videoWidth}x$videoHeight）",
+                            )
+                            onStreamSize(sps.first, sps.second)
+                        }
+                    }
+                    val now = monotonicMillis()
+                    if (now - windowStart >= 5_000) {
+                        val fps = windowFrames * 1000.0 / (now - windowStart)
+                        log(
+                            "CARLIFE: 实测帧率 %.1ffps（5s 内 %d 帧，声明 $requestedFps）"
+                                .format(fps, windowFrames),
+                        )
+                        windowStart = now
+                        windowFrames = 0
+                    }
+                    // 小米 CarWith 帧头 [4..7] 为 Unix 秒（非毫秒），传 0L 避免 VideoDeliveryGate 误算排队漂移
+                    val effectiveTs = if (encryptedCarWith) 0L else unit.timestamp
+                    onVideoFrame(payload, unit.keyFrame, effectiveTs)
                 }
-                val now = android.os.SystemClock.uptimeMillis()
-                if (now - windowStart >= 5_000) {
-                    val fps = windowFrames * 1000.0 / (now - windowStart)
-                    log(
-                        "CARLIFE: 实测帧率 %.1ffps（5s 内 %d 帧，声明 $requestedFps）"
-                            .format(fps, windowFrames),
-                    )
-                    windowStart = now
-                    windowFrames = 0
-                }
-                onVideoFrame(payload, isKeyFrame(payload), sourceTimestampMs)
             }
         } catch (error: Exception) {
             if (running.get()) log("CARLIFE: 视频通道断开 - ${error.message}")
@@ -1355,8 +1575,21 @@ class CarLifeHuClient(
      */
     fun requestVideoReinit() {
         if (!running.get()) return
+        if (encryptedCarWith) {
+            if (!carWithVideoInitSent) return
+            log("CARLIFE: 请求 CarWith 编码器立即刷新关键帧（0x1800B VIDEO_ENCODER_RESET）")
+            send(CarLifeProtocol.HU_VIDEO_ENC_RESET, ByteArray(0))
+            return
+        }
         log("CARLIFE: 请求引擎重建编码器（补 SPS/PPS 关键帧）")
         restartEncoding()
+    }
+
+    /** 车机 forceKeyFrame 或主屏归还时请求引擎立即补一帧 IDR（400ms 节流由上层控制）。 */
+    fun requestKeyFrame(): Boolean {
+        if (!running.get()) return false
+        if (encryptedCarWith && !carWithVideoInitSent) return false
+        return send(CarLifeProtocol.HU_VIDEO_ENC_RESET, ByteArray(0))
     }
 
     /**
@@ -1378,7 +1611,14 @@ class CarLifeHuClient(
         log("CARLIFE: 车机分辨率申请更新 ${requestedWidth}x$requestedHeight → ${w}x$h")
         requestedWidth = w
         requestedHeight = h
+        hasTrustedCanvas = true
         if (!running.get()) return
+        if (encryptedCarWith) {
+            if (!carWithVideoInitSent) return
+            val targetFps = requestedFps.coerceIn(20, 60)
+            send(CarLifeProtocol.HU_VIDEO_ENC_INIT, CarLifeProtocol.carWithVideoInit(w, h, targetFps))
+            return
+        }
         if (shouldDeferHotResend(orderedInit, firstInitSent)) {
             // 这条热更新以前会在 300ms 内抢跑（车机 /info 一到就触发），从而**赶在 98386
             // 确认之前**把引擎的档位定死成 1280×720。有序模式下只改申请值，
@@ -1489,16 +1729,24 @@ class CarLifeHuClient(
      */
     @Synchronized
     private fun pushFeatureConfig(logIt: Boolean = false) {
+        if (encryptedCarWith) return
         featureConfigAcked = false
         if (logIt) {
             log(
                 "CARLIFE: 主动推送 98386 特征配置（CONNECT_TYPE=$connectType，" +
                     "I 帧间隔=${CarLifeProtocol.I_FRAME_INTERVAL_DEFAULT} 帧，" +
-                    "DISABLE_RESOLUTION_OPTION=1 分辨率直通，CONTENT_ENCRYPTION=0 不加密，MEDIA_LYRIC_SUPPORT=1 歌词" +
+                    "DISABLE_RESOLUTION_OPTION=${if (hasTrustedCanvas) 1 else 0}，CONTENT_ENCRYPTION=0 不加密，MEDIA_LYRIC_SUPPORT=1 歌词" +
                         (mediaSampleRate?.let { "，MEDIA_SAMPLE_RATE=$it（${if (it == 1) "48k" else "44.1k"}）" } ?: "") + "）",
             )
         }
-        send(CarLifeProtocol.HU_FEATURE_CONFIG, CarLifeProtocol.featureConfig(connectType, mediaSampleRate = mediaSampleRate))
+        send(
+            CarLifeProtocol.HU_FEATURE_CONFIG,
+            CarLifeProtocol.featureConfig(
+                connectType,
+                useVehicleResolution = hasTrustedCanvas,
+                mediaSampleRate = mediaSampleRate,
+            ),
+        )
     }
 
     /**
@@ -1685,8 +1933,16 @@ class CarLifeHuClient(
                     log("CARLIFE: $label 音频包长度异常（$length），放弃该通道")
                     return
                 }
-                val payload = ByteArray(length)
-                if (length > 0) data.readFully(payload)
+                val rawPayload = ByteArray(length)
+                if (length > 0) data.readFully(rawPayload)
+                val payload =
+                    try {
+                        CarLifeAudioPayload.decode(channel.port, type, rawPayload, payloadCipher)
+                    } catch (error: Exception) {
+                        log("CARLIFE: $label 音频包 AES 解密失败（0x${type.toString(16)}）- ${error.message}")
+                        continue
+                    }
+                val decodedLength = payload.size
                 synchronized(channel) {
                     if (!running.get() || channel.generation != generation) return
                     if (isTts) {
@@ -1703,7 +1959,7 @@ class CarLifeHuClient(
                                     publishAudioGate(channel, generation, true)
                                 }
                             }
-                        } else if (type == CarLifeProtocol.TTS_PKG_NORMAL && length > 0) {
+                        } else if (type == CarLifeProtocol.TTS_PKG_NORMAL && decodedLength > 0) {
                             if (channel.rate <= 0) {
                                 channel.rate = CarLifeProtocol.TTS_DEFAULT_RATE
                                 channel.channels = 1
@@ -1713,7 +1969,7 @@ class CarLifeHuClient(
                             ttsPackets++
                             if (ttsPackets == 1L) {
                                 log(
-                                    "CARLIFE: ✓ 收到导航播报音频（TTS 首包 ${length}B，" +
+                                    "CARLIFE: ✓ 收到导航播报音频（TTS 首包 ${decodedLength}B，" +
                                         "${channel.rate}Hz ${channel.channels}ch）",
                                 )
                             }
@@ -1722,7 +1978,7 @@ class CarLifeHuClient(
                                 ttsActive = true
                                 publishAudioGate(channel, generation, true)
                             }
-                            onTtsPcm(payload, length)
+                            onTtsPcm(payload, decodedLength)
                         } else if (type == CarLifeProtocol.TTS_PKG_STOP) {
                             ttsActive = false
                             publishAudioGate(channel, generation, false)
@@ -1755,10 +2011,10 @@ class CarLifeHuClient(
                                 log("CARLIFE: $label 未收到格式宣告，按 48kHz 立体声处理")
                                 onAudioFormat(DEFAULT_AUDIO_RATE, 2)
                             }
-                            if (length > 0) {
+                            if (decodedLength > 0) {
                                 noteAudioPcm(channel)
                                 onMediaActivity(CarLifeMediaActivity.PCM)
-                                onAudioPcm(payload, length)
+                                onAudioPcm(payload, decodedLength)
                             }
                         }
 
@@ -2029,10 +2285,51 @@ class CarLifeHuClient(
             while (running.get()) {
                 Thread.sleep(1000)
                 if (!running.get()) return
-                send(CarLifeProtocol.HEARTBEAT, ByteArray(0))
+                if (encryptedCarWith) {
+                    val videoSocket = sockets[CarLifeProtocol.PORT_VIDEO] ?: continue
+                    val ts = (System.currentTimeMillis() / 1000L).toInt()
+                    val body = payloadCipher?.encrypt(ByteArray(0)) ?: ByteArray(0)
+                    runCatching {
+                        synchronized(videoSocket) {
+                            videoSocket.getOutputStream().apply {
+                                write(CarLifeProtocol.packStream(ts, CarLifeProtocol.HEARTBEAT, body))
+                                flush()
+                            }
+                        }
+                    }
+                } else {
+                    send(CarLifeProtocol.HEARTBEAT, ByteArray(0))
+                }
             }
         } catch (error: Exception) {
             if (running.get()) log("CARLIFE: 心跳中止 - ${error.message}")
+        }
+    }
+
+    private fun drainStreamSocket(socket: Socket) {
+        val data = DataInputStream(socket.getInputStream())
+        try {
+            while (running.get()) {
+                val head = ByteArray(12)
+                data.readFully(head)
+                val len = readU32(head, 0)
+                if (len < 0 || len > MAX_AUDIO_PACKET) break
+                if (len > 0) data.skipBytes(len)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun drainCommandSocket(socket: Socket) {
+        val data = DataInputStream(socket.getInputStream())
+        try {
+            while (running.get()) {
+                val head = ByteArray(8)
+                data.readFully(head)
+                val len = ((head[0].toInt() and 0xFF) shl 8) or (head[1].toInt() and 0xFF)
+                if (len > 0) data.skipBytes(len)
+            }
+        } catch (_: Exception) {
         }
     }
 
@@ -2041,8 +2338,10 @@ class CarLifeHuClient(
     private fun send(serviceType: Int, payload: ByteArray): Boolean {
         val out = cmdOut ?: return false
         return try {
+            val cipher = payloadCipher
+            val body = if (cipher != null && payload.isNotEmpty()) cipher.encrypt(payload) else payload
             synchronized(writeLock) {
-                out.write(CarLifeProtocol.packCommand(serviceType, payload))
+                out.write(CarLifeProtocol.packCommand(serviceType, body))
                 out.flush()
             }
             true

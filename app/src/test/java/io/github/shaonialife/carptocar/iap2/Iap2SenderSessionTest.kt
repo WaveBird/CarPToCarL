@@ -485,6 +485,54 @@ class Iap2SenderSessionTest {
         accessoryChannel.close()
     }
 
+    /**
+     * 宝马 530Li（MGU-55-J，iDrive 7，2026-11-21 实车日志）：
+     * 身份不含 audi/delphi/mib，但 0xAA01 证书是 MFi 2.0C（RSA-1024 + sha1WithRSAEncryption）。
+     * 发送端必须按证书识别结果在第一轮就发 20B 挑战，不能先发 32B 把车机打断链。
+     */
+    @Test
+    fun bmwMguRsaSha1CertificateGets20ByteChallengeFirst() {
+        val oidSha1WithRsa =
+            byteArrayOf(0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x01, 0x05)
+        val oidRsaEncryption =
+            byteArrayOf(0x06, 0x09, 0x2A, 0x86.toByte(), 0x48, 0x86.toByte(), 0xF7.toByte(), 0x0D, 0x01, 0x01, 0x01)
+        val mfi20cCert = byteArrayOf(0x30, 0x82.toByte(), 0x03, 0x88.toByte()) + oidSha1WithRsa + oidRsaEncryption
+
+        val pair = InMemoryStreamPair()
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val accessory =
+            MockAccessory(
+                accessoryChannel,
+                identityName = "BMW 71280",
+                identityModel = "MGU-55-J",
+                identityManufacturer = "BMW Group",
+                certificateBytes = mfi20cCert,
+            )
+
+        val accessoryThread = Thread({ accessory.run() }, "mock-bmw-mgu")
+        accessoryThread.isDaemon = true
+        accessoryThread.start()
+
+        MfiLengthMemory.forget(null, "bmw 71280 mgu-55-j bmw group")
+        val session =
+            Iap2SenderSession(
+                phoneChannel,
+                log = { line -> println("PHONE $line") },
+                bluetoothMac = "F8:43:EF:D2:9B:BA",
+            )
+        val endpoint = session.run(timeoutMillis = 10_000L)
+        assertEquals("MockAP", endpoint.ssid)
+        assertEquals(
+            "MFi 2.0C（RSA/SHA-1）车机冷启动首轮必须直接发 20B 挑战，不能先发 32B",
+            listOf(20),
+            accessory.challengeLengths.toList(),
+        )
+
+        phoneChannel.close()
+        accessoryChannel.close()
+    }
+
     /** 按 DiPlay Iap2WirelessControlClient 的时序脚本化应答。 */
     private class MockAccessory(
         private val channel: Iap2LinkChannel,
@@ -536,9 +584,16 @@ class Iap2SenderSessionTest {
          * 因此这一条就足以让它走「宽限 90 秒 + 拆链前不重认证」那条路。
          */
         private val cinemoIdentity: Boolean = false,
+        private val identityName: String = "MockCarPlay",
+        private val identityModel: String = "MU-1",
+        private val identityManufacturer: String? = null,
+        private val certificateBytes: ByteArray = ByteArray(64) { it.toByte() },
     ) {
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
+
+        /** 收到的 0xAA02 挑战字节长度序列（校验冷启动首试长度）。 */
+        val challengeLengths = java.util.concurrent.CopyOnWriteArrayList<Int>()
 
         /**
          * 收到的 0x4E09 自报设备名（解析出的可打印部分）。
@@ -569,9 +624,12 @@ class Iap2SenderSessionTest {
             expect(Iap2MessageIds.START_IDENTIFICATION)
             // 重认证时车机要把同一份识别信息再发一遍，先把 body 拼好复用
             val identificationBody =
-                Iap2Csm.string(0, "MockCarPlay") +
-                    Iap2Csm.string(1, "MU-1") +
-                    Iap2Csm.string(2, if (cinemoIdentity) "Cinemo Mock Manufacturer" else "Mock Manufacturer") +
+                Iap2Csm.string(0, identityName) +
+                    Iap2Csm.string(1, identityModel) +
+                    Iap2Csm.string(
+                        2,
+                        identityManufacturer ?: if (cinemoIdentity) "Cinemo Mock Manufacturer" else "Mock Manufacturer",
+                    ) +
                     (
                         if (audiDeclarations) {
                             Iap2Csm.u16List(6, intArrayOf(0x5703, 0xea03))
@@ -619,8 +677,11 @@ class Iap2SenderSessionTest {
                 )
                 expect(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
             }
-            send(Iap2MessageIds.MFI_CERTIFICATE, Iap2Csm.param(0, ByteArray(64) { it.toByte() }))
-            expect(Iap2MessageIds.MFI_REQUEST_CHALLENGE)
+            send(Iap2MessageIds.MFI_CERTIFICATE, Iap2Csm.param(0, certificateBytes))
+            val challengeFrame = expectFrame(Iap2MessageIds.MFI_REQUEST_CHALLENGE)
+            Iap2Csm.parseParams(challengeFrame.body).firstOrNull { it.id == 0 }?.value?.size?.let {
+                challengeLengths += it
+            }
             send(Iap2MessageIds.MFI_RESPONSE, Iap2Csm.param(0, ByteArray(70) { (it * 7).toByte() }))
             expect(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
 
@@ -816,12 +877,16 @@ class Iap2SenderSessionTest {
          * 「跳过非目标消息」并记数，跳太多仍然判定失败（防止真的抓错帧）。
          */
         private fun expect(messageId: Int) {
+            expectFrame(messageId)
+        }
+
+        private fun expectFrame(messageId: Int): Iap2Csm.Frame {
             println("MOCK expect 0x${messageId.toString(16)}")
             // 已经收到过、只是当时还没轮到它看的目标帧：直接拿走
             stashed.firstOrNull { it.messageId == messageId }?.let {
                 stashed.remove(it)
                 println("MOCK got 0x${it.messageId.toString(16)}（暂存区）")
-                return
+                return it
             }
             val deadlineAt = System.nanoTime() + 10_000_000_000L
             var skipped = 0
@@ -831,7 +896,7 @@ class Iap2SenderSessionTest {
                         ?: error("mock timed out waiting 0x${messageId.toString(16)}")
                 if (frame.messageId == messageId) {
                     println("MOCK got 0x${frame.messageId.toString(16)}")
-                    return
+                    return frame
                 }
                 if (frame.messageId in UNDECLARED_FOR_CADILLAC) seenUndeclared += frame.messageId
                 // 0x4300 可能先于 StartHID 到达（新协议代不再在 0x6800 上空等 2s）：

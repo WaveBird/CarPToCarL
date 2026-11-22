@@ -187,6 +187,29 @@ object MfiLengthMemory {
         }
     }
 
+    /**
+     * 协议代际变更时仅作废「成功/静默」偏好，保留硬拒绝记录（[Entry.rejected]）。
+     *
+     * 2026-11-21 宝马 MGU-55-J（iDrive 7）实车定谳：
+     * 第一轮（CarPlay v2，含 0x5702/0x5703 → LEGACY）发 32B 触发硬断链并记入 `rejected={32}`；
+     * 10 秒后车机以回退档（v1，14+12 项不含 0x57xx → NEW）重连，触发 `LEGACY → NEW`。
+     * 此前直接调 [forget] 把刚记下的 `rejected={32}` 抹掉，导致第二轮重发 32B 再次秒断。
+     * MFi 协处理器是物理硬件，保留 `rejected` 只会让从未成功过的车机不再撞同一堵墙；
+     * 真升级固件换偏好的场景只需清掉 `succeeded`/`silent` 即可重新探测。
+     */
+    fun forgetPreference(
+        context: Context?,
+        identityText: String,
+    ) {
+        update(context, identityText) { entry ->
+            if (entry.succeeded == null && entry.silent.isEmpty()) {
+                entry
+            } else {
+                Entry(succeeded = null, silent = emptySet(), rejected = entry.rejected)
+            }
+        }
+    }
+
     // ---- 内部 ----
 
     private val memory = HashMap<String, Entry>()

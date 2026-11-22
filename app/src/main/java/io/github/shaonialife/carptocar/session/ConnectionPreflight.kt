@@ -13,7 +13,9 @@ import android.os.SystemClock
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
+import io.github.shaonialife.carptocar.SessionController
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
+import io.github.shaonialife.carptocar.carlife.CarLifeLauncher
 import io.github.shaonialife.carptocar.util.DeviceIdentity
 
 /**
@@ -72,6 +74,7 @@ object ConnectionPreflight {
         LOCATION_SERVICE("位置服务", Severity.WARNING),
         TARGET_PAIRED("目标车机已配对", Severity.WARNING),
         IDENTITY_NAME("本机蓝牙名", Severity.WARNING),
+        CARLIFE_SOURCE("本机 CarWith / CarLife 画面源", Severity.WARNING),
         NOTIFICATIONS("通知权限", Severity.INFO),
         NOTIFICATION_ACCESS("通知使用权（媒体会话）", Severity.INFO),
         BATTERY_OPTIMIZATION("电池优化已忽略", Severity.INFO),
@@ -344,6 +347,7 @@ object ConnectionPreflight {
                         },
                     ),
                 )
+                add(carLifeSourceCheck(app))
                 add(
                     Check(
                         Requirement.NOTIFICATIONS,
@@ -384,6 +388,22 @@ object ConnectionPreflight {
         context: Context,
         permission: String,
     ): Boolean = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+
+    /** 本机 CarWith / CarLife 画面源体检：已出帧或正在推流即视为就绪，未启动则给出可操作的提示。 */
+    private fun carLifeSourceCheck(app: Context): Check {
+        val snapshot =
+            runCatching {
+                CarLifeLauncher.snapshot(
+                    context = app,
+                    videoFlowingToCar = SessionController.videoSender?.isVideoFlowing == true,
+                )
+            }.getOrNull()
+                ?: return Check(Requirement.CARLIFE_SOURCE, false, "无法读取本机 CarLife 状态")
+        val ready =
+            snapshot.state == CarLifeLauncher.EngineState.READY ||
+                snapshot.state == CarLifeLauncher.EngineState.STREAMING_TO_CAR
+        return Check(Requirement.CARLIFE_SOURCE, ready, snapshot.detailLine)
+    }
 
     /**
      * 「后台存活未被限制」：`isBackgroundRestricted` + app standby bucket 两条系统事实。

@@ -6,4 +6,6 @@
     <string name="app_name">CarPToCarL</string>
     <string name="app_subtitle">非官方实验性 CarPlay 兼容发送端</string>
     <string name="accessibility_description">镜像模式：把车机触摸手势注入手机屏幕，不读取屏幕内容</string>
+    <string name="carlife_accessibility_label">CarPToCarL · CarWith/CarLife 自动连接助手</string>
+    <string name="carlife_accessibility_description">仅在连接车机时自动点击小米 CarWith 或百度 CarLife+ 的无线连接，并在接管画面后将其切入后台运行；不读取其它任何应用内容。</string>
 </resources>
