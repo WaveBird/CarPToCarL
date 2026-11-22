@@ -1773,10 +1773,19 @@ class MainActivity : AppCompatActivity() {
             }
         val note = "当前将拉起：$activeChoice（本机已安装：$installedNames）$autoHint"
         if (carLifeTargetNote.text != note) carLifeTargetNote.text = note
-        // 小米机型走 CarWith 直连入口：拉起即后台虚拟屏，「出帧后退后台」对它无意义
-        // （界面瞬息即隐，退后台动作是多余的 moveTaskToBack 往返）——整个选项行隐藏。
+        // 「出帧后退后台」选项只看**本次实际将拉起的目标**：CarWith 直连入口
+        // （CarlifeAdbActivity）是后台虚拟屏、无前台界面，退后台对它无意义——隐藏；
+        // 百度 CarLife+ 等有真实前台的引擎照样需要退后台，选项必须保留（哪怕在
+        // 小米机型上：机型≠目标，用户显式选了百度 CarLife+ 就该看到这个开关）。
         val row = findViewById<View>(R.id.rowAutoLaunchCarLife)
-        val rowVisibility = if (xiaomi) View.GONE else View.VISIBLE
+        val rowVisibility =
+            if (snapshot.preferredApp?.intent?.component?.className ==
+                CarLifeLauncher.XIAOMI_CARWITH_DIRECT_ENTRY
+            ) {
+                View.GONE
+            } else {
+                View.VISIBLE
+            }
         if (row.visibility != rowVisibility) row.visibility = rowVisibility
     }
 
