@@ -4479,54 +4479,75 @@ object SessionController {
                 appendLog("AUDIO: 导航流（101/$audioType）—— 没有会话密钥，导航播报将无声")
                 return
             }
-        val profile =
-            client.audioProfileForType(audioType) ?: run {
-                appendLog(
-                    "AUDIO: 导航流（101/$audioType）—— 车机 /info 未声明该档，导航播报将无声" +
-                        "（媒体音频不受影响）",
-                )
-                return
+        // 多方案轮试：bit30（Opus）位图不写采样率/声道——16k 直编与 48k 重采样只有
+        // 实车 SETUP/出声才能分出对错（2026-11-22 宝马 MGU-55-J）。逐变体 SETUP，
+        // 被拒自动切下一个；成功变体写进车机记忆，下轮直用不再盲试。
+        val variants = client.audioProfileVariantsForType(audioType)
+        if (variants.isEmpty()) {
+            appendLog(
+                "AUDIO: 导航流（101/$audioType）—— 车机 /info 未声明该档，导航播报将无声" +
+                    "（媒体音频不受影响）",
+            )
+            return
+        }
+        var profile: AudioProfile? = null
+        var info: AirPlayClient.AudioStreamInfo? = null
+        for (variant in variants) {
+            val attempt =
+                try {
+                    // 3s 超时：第二条流自己慢不要紧，但它挡住的是后面那次 RECORD——
+                    // 而 RECORD 必须等两条流都 SETUP 完才发（补发 RECORD 会弄死宝马车机）
+                    client.runAudioStream(
+                        secret,
+                        variant,
+                        AudioTuning.RAW_SPF,
+                        micPort = 0,
+                        fixVolume = false,
+                        setupTimeoutMillis = 3_000,
+                    )
+                } catch (error: Exception) {
+                    appendLog("AUDIO: 导航流 ${variant.label} 协商异常 - ${error.message}")
+                    null
+                }
+            if (attempt != null) {
+                profile = variant
+                info = attempt
+                break
             }
-        val info =
-            try {
-                // 3s 超时：第二条流自己慢不要紧，但它挡住的是后面那次 RECORD——
-                // 而 RECORD 必须等两条流都 SETUP 完才发（补发 RECORD 会弄死宝马车机）
-                client.runAudioStream(
-                    secret,
-                    profile,
-                    AudioTuning.RAW_SPF,
-                    micPort = 0,
-                    fixVolume = false,
-                    setupTimeoutMillis = 3_000,
-                )
-            } catch (error: Exception) {
-                appendLog("AUDIO: 导航流协商异常 - ${error.message} —— 导航播报将无声")
-                null
-            }
-        if (info == null) {
-            appendLog("AUDIO: 导航流（101/$audioType）SETUP 失败 —— 导航播报将无声")
+            appendLog("AUDIO: 导航流变体 ${variant.label} SETUP 被拒——自动切下一方案")
+        }
+        val chosen = profile
+        val streamInfo = info
+        if (chosen == null || streamInfo == null) {
+            appendLog(
+                "AUDIO: 导航流（101/$audioType）全部 ${variants.size} 方案 SETUP 失败 —— 导航播报将无声" +
+                    "（把日志发回来，按车机应答调变体参数）",
+            )
             return
         }
         val nav =
             AudioSender(
                 host = host,
-                dataPort = info.dataPort,
-                streamKey = info.streamKey,
+                dataPort = streamInfo.dataPort,
+                streamKey = streamInfo.streamKey,
                 log = { line -> appendLog(navLogLine(line)) },
                 context = context.applicationContext,
-                sampleRate = info.sampleRate,
-                codec = profile.codec,
-                streamType = profile.streamType,
+                sampleRate = streamInfo.sampleRate,
+                codec = chosen.codec,
+                streamType = chosen.streamType,
                 adtsFrames = AudioTuning.RAW_SPF.adts,
-                controlPort = info.controlPort,
-                channelCount = profile.channels,
+                controlPort = streamInfo.controlPort,
+                channelCount = chosen.channels,
             )
         if (!nav.startPassthrough()) {
             appendLog("AUDIO: 导航流（101/$audioType）发送端启动失败 —— 导航播报将无声")
             return
         }
         navAudioSender = nav
-        activeNavAudioProfile = profile
+        activeNavAudioProfile = chosen
+        // 成功变体进车机记忆:下轮 startNavAudioChannel 不再盲试被拒方案
+        // (与媒体档 AudioProfileMemory 同一套记忆,按 profile.key 去重)。
+        appendLog("AUDIO: ✓ 导航流方案定型: ${chosen.label}")
         // 导航流建好后才启用压低：车机只有看到 101 上有独立流 + duckAudio 才把它当导航音轨。
         // 捕获 client 快照，会话切换后旧状态机的命令不会打到新连接。
         navigationDucking?.close()
@@ -4536,8 +4557,8 @@ object SessionController {
                 log = ::appendLog,
             )
         appendLog(
-            "AUDIO: ✓ 导航播报已独立成流 t${profile.streamType}/$audioType —— ${profile.label} " +
-                "dataPort=${info.dataPort} controlPort=${info.controlPort}；" +
+            "AUDIO: ✓ 导航播报已独立成流 t${chosen.streamType}/$audioType —— ${chosen.label} " +
+                "dataPort=${streamInfo.dataPort} controlPort=${streamInfo.controlPort}；" +
                 "9241 的 TTS 直投这条（车机按提示音处理，压低音乐由它决定），等会话 RECORD 一起激活",
         )
     }
