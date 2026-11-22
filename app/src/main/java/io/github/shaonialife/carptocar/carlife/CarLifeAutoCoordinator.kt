@@ -1,5 +1,6 @@
 package io.github.shaonialife.carptocar.carlife
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Handler
@@ -49,6 +50,12 @@ object CarLifeAutoCoordinator {
     private const val READY_SETTLE_DELAY_MS = 750L
     private const val CONNECT_GUARD_TIMEOUT_MS = 15_000L
 
+    /**
+     * 直连入口「无握手自动重发」的触发点：守候窗口开跑后过半仍零握手才动手。
+     * 给 CarWith 正常冷启动（约 0.7s 出画面，慢时数秒）留足时间，不抢跑。
+     */
+    private const val CONNECT_GUARD_RETRY_AT_MS = 8_000L
+
     private val lock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val policy = CarLifeAutoTriggerPolicy()
@@ -73,6 +80,31 @@ object CarLifeAutoCoordinator {
 
     @Volatile
     private var pendingConnectCallback: (() -> Unit)? = null
+
+    /**
+     * 直连入口（CarlifeAdbActivity）调起后**是否已经重试过一次**。
+     *
+     * MIUI「后台弹出界面」拦截时 `startActivity` 静默丢弃不抛异常（mcarplay 2026-10-26
+     * 实测：CarlifeAdbActivity 从未创建，7240 一直 ECONNREFUSED）——调起返回值 true
+     * 不能证明入口真的收到请求。守候窗口过半仍零握手时，把重试一次当作对静默丢弃的
+     * 自动兜底（只限直连入口：无障碍路径有自己的点击节奏，不能插队）。
+     */
+    @Volatile
+    private var directEntryRetried: Boolean = false
+
+    /**
+     * 直连入口本次调起是否发生在后台（MIUI 可能静默拦截的风险条件，见 [directEntryRetried]）。
+     */
+    @Volatile
+    private var launchedInBackground: Boolean = false
+
+    /** 本轮武装走的是否是**直连入口**（CarlifeAdbActivity）——只有它才参与无握手自动重发。 */
+    @Volatile
+    private var isDirectCarWithEntry: Boolean = false
+
+    /** 本轮武装窗口的开始时刻（uptimeMillis；0 = 未武装）——重发触发点以此计时。 */
+    @Volatile
+    private var armedStartMs: Long = 0L
 
     private val connectGuardTimeoutRunnable =
         Runnable {
@@ -103,7 +135,60 @@ object CarLifeAutoCoordinator {
                     onSourceFrameArrived()
                     return
                 }
+                maybeRetryDirectEntry(now)
                 mainHandler.postDelayed(this, POLL_INTERVAL_MS)
+            }
+
+            /**
+             * 直连入口调起后过半窗口仍无任何握手 → 自动重发一次入口 Intent。
+             *
+             * 判据（全部满足才动手，避免打扰正常慢启动）：
+             *  - 走的是直连入口（无障碍路径有自己的点击节奏，不重试）；
+             *  - 本轮还没重试过（每轮窗口最多一次，不连环轰炸）；
+             *  - 窗口已过半（给 CarWith 正常冷启动留足时间）；
+             *  - 7240 连协议握手都没有（`handshakeAtMs == 0`）——说明入口八成没收到
+             *    请求（MIUI 静默拦截）；已有握手只是零帧属于引擎侧问题，重试无用。
+             *
+             * 重试时重置窗口后半段（再给一半窗口等首帧），并在日志里点名
+             * 「后台弹出界面」这个最常见的根因，让用户有可行动的下一步。
+             */
+            private fun maybeRetryDirectEntry(now: Long) {
+                val app = appContext ?: return
+                val snapshot =
+                    synchronized(lock) {
+                        if (!isDirectCarWithEntry || directEntryRetried) return
+                        if (now - armedStartMs < CONNECT_GUARD_RETRY_AT_MS) return
+                        directEntryRetried = true
+                        armedDeadlineMs
+                    }
+                if (CarLifeHijack.handshakeSeen) return
+                val startOk =
+                    runCatching {
+                        val intent =
+                            Intent().apply {
+                                component =
+                                    ComponentName(
+                                        CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH,
+                                        CarLifeLauncher.XIAOMI_CARWITH_DIRECT_ENTRY,
+                                    )
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                        app.startActivity(intent)
+                        true
+                    }.getOrDefault(false)
+                if (startOk) {
+                    synchronized(lock) { armedDeadlineMs = snapshot + CONNECT_GUARD_RETRY_AT_MS }
+                    SessionController.appendLog(
+                        "CARLIFE-AUTO: 直连入口调起后 ${CONNECT_GUARD_RETRY_AT_MS / 1000}s 无握手——已自动重发一次入口" +
+                            (if (launchedInBackground) {
+                                "（本应用当时在后台，若仍无画面请到 系统设置→应用→CarPToCarL 允许「后台弹出界面」）"
+                            } else {
+                                "（若仍无画面请手动打开一次 CarWith）"
+                            }),
+                    )
+                } else {
+                    SessionController.appendLog("CARLIFE-AUTO: 直连入口重发失败——保持等待，必要时手动打开 CarWith")
+                }
             }
         }
 
@@ -305,6 +390,10 @@ object CarLifeAutoCoordinator {
             backgroundScheduled = false
             returnAction = ReturnAction.NONE
             pendingConnectCallback = null
+            isDirectCarWithEntry = false
+            armedStartMs = 0L
+            directEntryRetried = false
+            launchedInBackground = false
             policy.disarm()
         }
         mainHandler.removeCallbacks(readyPollRunnable)
@@ -356,10 +445,13 @@ object CarLifeAutoCoordinator {
         val isDirectCarWith = preferred.intent?.component?.className == CarLifeLauncher.XIAOMI_CARWITH_DIRECT_ENTRY
         val now = SystemClock.uptimeMillis()
         synchronized(lock) {
+            armedStartMs = now
             armedDeadlineMs = now + CarLifeAutoTriggerPolicy.DEFAULT_WINDOW_MS
             backgroundScheduled = false
             returnAction = returnOnReady
             launchedAppName = preferred.displayName
+            isDirectCarWithEntry = isDirectCarWith
+            directEntryRetried = false
             if (!isDirectCarWith) {
                 policy.arm(now)
             } else {
@@ -373,6 +465,11 @@ object CarLifeAutoCoordinator {
         return runCatching {
             val launchIntent = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             context.startActivity(launchIntent)
+            // mcarplay 实测（2026-10-26）：后台发起的 startActivity 会被 MIUI「后台弹出
+            // 界面」静默丢弃且不抛异常——返回值 true 不能证明 CarWith 真的收到入口请求。
+            // 这里只做两件事：把风险条件记下来（供无握手自动重发时点名根因）+ 当场告警。
+            val foreground = CarLifeLauncher.isAppInForeground()
+            launchedInBackground = !foreground
             val a11yState =
                 when {
                     isDirectCarWith -> "公开有线虚拟屏直连入口（无需无障碍点击）"
@@ -386,6 +483,12 @@ object CarLifeAutoCoordinator {
                     ReturnAction.NONE -> "出帧后不切后台"
                 }
             log("CARLIFE-AUTO: $reason → 已调起「${preferred.displayName}」（$a11yState · $bgState）")
+            if (isDirectCarWith && !foreground) {
+                log(
+                    "CARLIFE-AUTO: ⚠ 本应用当前不在前台——系统可能静默拦截 CarWith 入口" +
+                        "（小米需允许「后台弹出界面」；无画面时 8s 后会自动重发一次入口）",
+                )
+            }
             LaunchResult(LaunchOutcome.LAUNCHED, appName = preferred.displayName)
         }.getOrElse { error ->
             disarm()
