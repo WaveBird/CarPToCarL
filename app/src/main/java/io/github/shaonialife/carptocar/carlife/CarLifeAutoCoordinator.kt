@@ -162,6 +162,19 @@ object CarLifeAutoCoordinator {
                         armedDeadlineMs
                     }
                 if (CarLifeHijack.handshakeSeen && !CarLifeHijack.isZeroFrameStalled) return
+
+                // 2026-11-22 夜间实车日志定谳（235301 失败 vs 235939 成功）：坏状态下
+                // CarWith「应答了端口却不应答协议」——7240 TCP 能连上但瞬间被关闭，
+                // 版本协商无应答。此时**重发入口无效**（同一个坏进程再应答一次而已，
+                // 日志里重发 3 次全灭），唯一有效的是让进程冷启动（成功轮=间隔数分钟后
+                // 进程被系统回收，下一次 startActivity 才正常）。所以这里升级为：
+                // force-stop CarWith → 重新调起，等价于用户手动「停止再启动」。
+                val killed =
+                    runCatching {
+                        val am = app.getSystemService(android.app.ActivityManager::class.java)
+                        am?.killBackgroundProcesses(CarLifeAutoTriggerPolicy.PACKAGE_XIAOMI_CARWITH)
+                        true
+                    }.getOrDefault(false)
                 val startOk =
                     runCatching {
                         val intent =
@@ -176,21 +189,21 @@ object CarLifeAutoCoordinator {
                         app.startActivity(intent)
                         true
                     }.getOrDefault(false)
-                if (startOk) {
-                    synchronized(lock) { armedDeadlineMs = snapshot + CONNECT_GUARD_RETRY_AT_MS }
-                    SessionController.appendLog(
-                        "CARLIFE-AUTO: 直连入口调起后 ${CONNECT_GUARD_RETRY_AT_MS / 1000}s 未出帧" +
-                            (if (CarLifeHijack.handshakeSeen) "（已有协议握手但零帧——入口请求可能被引擎吞掉）" else "（连协议握手都没有）") +
-                            "——已自动重发一次入口" +
-                            (if (launchedInBackground) {
-                                "（本应用当时在后台，若仍无画面请到 系统设置→应用→CarPToCarL 允许「后台弹出界面」）"
-                            } else {
-                                "（若仍无画面请手动打开一次 CarWith）"
-                            }),
-                    )
-                } else {
-                    SessionController.appendLog("CARLIFE-AUTO: 直连入口重发失败——保持等待，必要时手动打开 CarWith")
-                }
+                synchronized(lock) { armedDeadlineMs = snapshot + CONNECT_GUARD_RETRY_AT_MS }
+                SessionController.appendLog(
+                    "CARLIFE-AUTO: 直连入口调起后 ${CONNECT_GUARD_RETRY_AT_MS / 1000}s 未出帧" +
+                        (if (CarLifeHijack.handshakeSeen) {
+                            "（已有协议握手但零帧）"
+                        } else {
+                            "（端口应答但协议无响应——CarWith 编码器初始化疑似卡死）"
+                        }) +
+                        "——已" + (if (killed) "强制回收 CarWith 进程并" else "") + "重新调起（等价手动重启）" +
+                        (if (launchedInBackground) {
+                            "（本应用当时在后台，若仍无画面请到 系统设置→应用→CarPToCarL 允许「后台弹出界面」）"
+                        } else {
+                            "（若仍无画面请手动到系统设置强行停止 CarWith 后重试）"
+                        }),
+                )
             }
         }
 

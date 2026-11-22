@@ -1573,15 +1573,23 @@ class MainActivity : AppCompatActivity() {
         log("测试台：两台手机蓝牙配对 -> 备用机跑 xcertplay 无线模式 -> 点「启动连接」等待回连")
         // 接收端（WinPlay 等）按真实蓝牙地址过滤设备：解析不到就等于注定 SETUP 403，
         // 必须在启动时就明确告知，而不是让用户对着「接收端拒绝了会话」无从上手。
-        val identityMac = DeviceIdentity.bluetoothMac(this)
-        if (identityMac == DeviceIdentity.PLACEHOLDER_MAC) {
-            log(
-                "MAC: 未取到本机真实蓝牙地址（厂商脱敏/Shizuku 已移除）——" +
-                    "请在上方「本机蓝牙地址」填入后保存；否则 WinPlay 类接收端会回 SETUP 403",
-            )
-        } else {
-            val from = if (DeviceIdentity.hasOverride(this)) "手填" else "自动解析"
-            log("MAC: 本机蓝牙地址=$identityMac（$from）")
+        // 解析放后台线程：无 override 时会走 sysfs/su 等 shell 来源（每次可达 4s，
+        // 1.2.97 曾在主线程直接调——SHELL 违规日志里两次「主线程调用 shell」就是它），
+        // 结果回 UI 线程刷提示与门禁状态。
+        Bg.run("mac-resolve-boot") {
+            val identityMac = DeviceIdentity.bluetoothMac(this@MainActivity)
+            runOnUiThread {
+                if (identityMac == DeviceIdentity.PLACEHOLDER_MAC) {
+                    log(
+                        "MAC: 未取到本机真实蓝牙地址（厂商脱敏/Shizuku 已移除）——" +
+                            "请在上方「本机蓝牙地址」填入后保存；否则 WinPlay 类接收端会回 SETUP 403",
+                    )
+                } else {
+                    val from = if (DeviceIdentity.hasOverride(this@MainActivity)) "手填" else "自动解析"
+                    log("MAC: 本机蓝牙地址=$identityMac（$from）")
+                }
+                refreshMacGate()
+            }
         }
         // 启动即按上面的解析结果刷新门禁（副标题/按钮置灰/输入框提示行）
         refreshMacGate()
