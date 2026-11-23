@@ -965,6 +965,8 @@ class AirPlayClient(
             cipher = null
             sessionEstablished = false
             screenUuid = null
+            // 新连接 = 新的控制通道：失效标记必须复位，否则重连后一直报「控制通道已失效」
+            controlIapBroken = false
             synchronized(rtspWriteLock) {
                 readerSocket = null
                 readerThread = null
@@ -2397,6 +2399,22 @@ class AirPlayClient(
         }
     private var controlIapCount = 0
 
+    /**
+     * 控制通道 POST 是否已**确定失效**（EOF/被关/socket 关闭）。
+     *
+     * 为什么需要这个标志：`postControlIap` 是 `(ByteArray, () -> Boolean) -> Unit`——
+     * 它把字节排进单线程队列后就算完事，`IOException` 只在内部 catch 里记一行日志。
+     * 于是 [VirtualIap2Link] 的 `flushOutputLocked` 永远认为出站成功、链路引擎照常把帧
+     * 记进已发账本，而字节一个都没到车机：`0x5001`/触摸应答/订阅应答全部静默蒸发，
+     * 日志上看不出任何异常（2026-11-23 晚间 532 秒的会话正是这个形态）。
+     *
+     * 这里只做**可见化**，不改链路存活性语义（pacer 的 `alive()` 仍以 AirPlay socket
+     * 为准）：控制通道死掉时车机侧会话通常也已结束，下一轮会重建新实例。
+     */
+    @Volatile
+    var controlIapBroken = false
+        private set
+
     fun postControlIap(
         frame: ByteArray,
         isCurrentEpoch: () -> Boolean = { true },
@@ -2436,7 +2454,19 @@ class AirPlayClient(
                     }
                 }
             } catch (error: IOException) {
-                log("IAPLINK: 控制通道 POST 失败 - ${error.message}")
+                // 首次失败升级为明确告警：控制通道死了之后，所有经 POST /command 的
+                // iAP2 出站（0x5001 歌名、触摸应答、订阅应答）都送不到车机，而调用方
+                // 仍以为发成功了——必须在日志里一眼可见，不能只留一行 "POST 失败"。
+                if (controlIapBroken) {
+                    log("IAPLINK: 控制通道 POST 失败 - ${error.message}")
+                } else {
+                    controlIapBroken = true
+                    log(
+                        "IAPLINK: ⚠ 控制通道已失效（${error.message}）——此后 iAP2 出站" +
+                            "（0x5001 歌名 / 触摸应答 / 订阅应答）全部无法送达车机；" +
+                            "车机首页媒体卡与仪表将停在最后一次成功推送的状态。已发出 $controlIapCount 条",
+                    )
+                }
             }
         }
     }

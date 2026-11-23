@@ -268,6 +268,15 @@ class VirtualIap2Link(
      */
     private fun formLabel(): String = if (tunnelWriter() != null) "隧道" else "控制通道"
 
+    /**
+     * [SessionTrace] 的通道标签（英文，供离线 grep/统计）。
+     *
+     * 与 [formLabel] 必须**同步**：会话报文快照（`session_trace_fail_*.log`）按这个标签
+     * 分通道统计，日志文案改了而标签仍写死 `tunnel`，下游分析会把 MIB3/控制通道形态的
+     * 报文误算成真隧道——正是 2026-11-23 那次误判的同一种成因。
+     */
+    private fun traceChannel(): String = if (tunnelWriter() != null) "tunnel" else "control-iap"
+
     /** 使异步排队中的控制通道写与应答立即失效；若对端在 MFi 挑战期间拆链则同步记录硬拒绝。 */
     fun close() {
         val wasOpen = !linkClosed
@@ -750,7 +759,7 @@ class VirtualIap2Link(
             "IAPLINK: ${formLabel()} tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B ok=$ok",
         )
-        SessionTrace.csm(SessionTrace.Dir.TX, "tunnel", messageId, body, if (ok) "" else "send-failed")
+        SessionTrace.csm(SessionTrace.Dir.TX, traceChannel(), messageId, body, if (ok) "" else "send-failed")
     }
 
     /** 直接投递完整 CSM 帧（Frida 抓的逐字节常量，勿重新编码）。 */
@@ -774,7 +783,7 @@ class VirtualIap2Link(
         if (messageId >= 0) {
             SessionTrace.csm(
                 SessionTrace.Dir.TX,
-                "tunnel",
+                traceChannel(),
                 messageId,
                 frame.copyOfRange(Iap2Csm.HEADER_BYTES, frame.size),
                 if (ok) "raw" else "raw,send-failed",
@@ -1330,7 +1339,7 @@ class VirtualIap2Link(
             }
             // 摘要行按条数抽样（上），录制行全量（下）：事后分析拆链时，被抽掉的那几条
             // 往往正是关键（例如某条订阅的应答没发）。
-            SessionTrace.csm(SessionTrace.Dir.RX, "tunnel", frame.messageId, frame.body)
+            SessionTrace.csm(SessionTrace.Dir.RX, traceChannel(), frame.messageId, frame.body)
             maybeRespondControlCsmLocked(frame)
         }
         if (frames.isEmpty() && frameCount <= 10) {
