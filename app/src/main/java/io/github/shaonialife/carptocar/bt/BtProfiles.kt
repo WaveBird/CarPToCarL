@@ -128,6 +128,18 @@ object BtProfiles {
             // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
             // BLUETOOTH_CONNECT）。车载/耳机当前连接的设备可能被一并断开，属预期。
             // 这一步是「断 HFP 却把整机蓝牙带崩」的最大嫌疑点，单独记一行。
+            //
+            // 修复 #5（2026-11-24 实车 00:26 段）：设备级 disconnect() **不是无条件兜底**
+            // ——出站 RFCOMM 正在建链时（`BtSessionGate.outboundConnecting == true`）
+            // 它会把刚拨出去的 ACL 连同配置文件一起拆掉，整轮拨号全部失败。守卫在
+            // shouldPause 里也带同一条件（见 [guardAudioProfiles]），这里是第二道闸。
+            if (BtSessionGate.outboundConnecting) {
+                DebugFileLog.append(
+                    context,
+                    "BT-PROFILE: 配置级断开未生效，但出站建链进行中——不做设备级 disconnect()（会拆掉刚建的 ACL）",
+                )
+                return before
+            }
             DebugFileLog.append(context, "BT-PROFILE: 配置级断开超时 → 升级为设备级 disconnect() 兜底")
             runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
             awaitDisconnected(context, address, 500L)

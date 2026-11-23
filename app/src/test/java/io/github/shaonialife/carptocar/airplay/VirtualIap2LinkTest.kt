@@ -50,6 +50,7 @@ class VirtualIap2LinkTest {
         val allControl = ArrayList<ByteArray>()
         val eventSent = ArrayList<ByteArray>()
         val car = Iap2LinkEngine()
+
         /** 可变歌名源：测试「订阅先于歌名」「内容变化」两条路径。 */
         var nowPlaying: CarPlayNowPlaying? = null
         val link =
@@ -394,7 +395,11 @@ class VirtualIap2LinkTest {
         assertEquals("换歌应再推一次", 3, h.controlFrames().count { it.second == 0x5001 })
     }
 
-    /** 周期补推只在车机订阅过 0x5000 之后生效，避免改变既有会话形态。 */
+    /**
+     * 周期补推不再要求车机先订阅 0x5000（2026-11-24 放宽，iPhone 基线 §C.5：
+     * 车机 0x5000 只发一次还发在短命连接上，iPhone 是「有媒体信息就周期推」）。
+     * 保留「内容键不变不重发（进度变化不算）」与「换歌必推」两条去重语义。
+     */
     @Test
     fun nowPlayingPollRequiresSubscriptionAndKeyIgnoresProgress() {
         val h = Harness()
@@ -403,8 +408,8 @@ class VirtualIap2LinkTest {
         h.clock += VirtualIap2Link.NOW_PLAYING_POLL_MILLIS * 2
         h.tick()
         assertEquals(
-            "车机没订阅 0x5000 时不该主动发 0x5001",
-            0,
+            "链路识别后即使没收到 0x5000 订阅也要周期补推（iPhone 同款策略）",
+            1,
             h.controlFrames().count { it.second == 0x5001 },
         )
 
@@ -419,6 +424,15 @@ class VirtualIap2LinkTest {
             h.link.nowPlayingKey(np),
             h.link.nowPlayingKey(np.copy(title = "另一首")),
         )
+    }
+
+    /** canSendNowPlaying：识别完成才为 true——宿主据此决定 0x5001 走隧道还是降级 BT。 */
+    @Test
+    fun canSendNowPlayingTracksIdentification() {
+        val h = Harness()
+        assertFalse("未识别的隧道不能承载 0x5001", h.link.canSendNowPlaying())
+        h.readyForSubscriptions()
+        assertTrue("识别完成后应可推送", h.link.canSendNowPlaying())
     }
 
     @Test

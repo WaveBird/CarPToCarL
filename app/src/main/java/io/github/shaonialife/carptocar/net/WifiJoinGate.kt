@@ -72,9 +72,15 @@ class WifiJoinGate(
             val ticket: Ticket,
         ) : Decision
 
-        /** 刚失败过，还在去重窗口内。 */
+        /**
+         * 刚失败过，还在去重窗口内。**修复 #8（2026-11-24）**：Skip 不再是终点——
+         * 调用方应按 [retryAfterMillis]（剩余冷却）等冷却结束后**自动重发一次**；
+         * 旧实现直接按失败返回，恰逢 BMW 27s 窗口时整轮直接报废，用户观感是
+         * 「一次机会都没给」。
+         */
         data class Skip(
             val sinceMillis: Long,
+            val retryAfterMillis: Long,
         ) : Decision
     }
 
@@ -98,7 +104,8 @@ class WifiJoinGate(
                 !lastSucceeded &&
                 nowMillis - lastAtMillis < dedupeWindowMillis
             ) {
-                Decision.Skip(nowMillis - lastAtMillis)
+                // 修复 #8：Skip 带上剩余冷却，调用方等完这段自动重发一次（不再一轮报废）。
+                Decision.Skip(nowMillis - lastAtMillis, dedupeWindowMillis - (nowMillis - lastAtMillis))
             } else {
                 val fresh = Ticket(ssid)
                 pending = fresh

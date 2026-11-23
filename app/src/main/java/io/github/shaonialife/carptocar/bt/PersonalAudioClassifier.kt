@@ -33,11 +33,31 @@ object PersonalAudioClassifier {
      *
      * 刻意不放品牌名（JBL / Bose / Sony…）：车机名字里带音响品牌的情况不少，
      * 误判会把真车机排除掉，代价远大于多拨一次耳机。
+     *
+     * `wf-` / `wh-`（修复 #15，2026-11-24）：索尼 WF-/WH- 系列的型号前缀。今晚实车
+     * WF-SP700N 在 Android 16 上 CoD 缺失、名字又不带任何关键词，被连拨 4 次
+     * （L176/195/208/226）；这类「品牌+型号」形态只有前缀这一条稳定线索。
+     * 保留不放品牌名的原则：前缀是型号语义，品牌是产品线语义——车机不会被命名为
+     * 「wf-xxx」，但可能被命名为「Bose xxx」。
      */
     private val NAME_KEYWORDS =
         listOf(
-            "buds", "airpods", "freebuds", "headphone", "headset", "earphone", "earbuds",
-            "speaker", "soundbar", "耳机", "耳塞", "音箱", "音响", "降噪",
+            "buds",
+            "airpods",
+            "freebuds",
+            "headphone",
+            "headset",
+            "earphone",
+            "earbuds",
+            "speaker",
+            "soundbar",
+            "耳机",
+            "耳塞",
+            "音箱",
+            "音响",
+            "降噪",
+            "wf-",
+            "wh-",
         )
 
     fun isAudioDeviceClass(deviceClass: Int?): Boolean = deviceClass != null && deviceClass in AUDIO_DEVICE_CLASSES

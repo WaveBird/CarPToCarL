@@ -173,6 +173,9 @@ class VirtualIap2Link(
     private var controlSynRoundStartedAtMs = 0L
     private var controlSynGaveUp = false
 
+    /** 「NEGOTIATING 停滞」告警只打一次（200ms 节拍会反复进状态判定，修复 #15/P0-5）。 */
+    private var negotiatingStallLogged = false
+
     /** 未处理的控制会话消息计数（媒体键排查的观测点，见 [maybeRespondControlCsmLocked]）。 */
     private var unknownCsmIds = 0
 
@@ -319,6 +322,16 @@ class VirtualIap2Link(
     }
 
     /**
+     * 「隧道链路此刻能不能承载 0x5001」（2026-11-24 修复，iPhone 基线 §C.5）。
+     *
+     * 宿主（SessionController.pushNowPlayingAll）据此走**单一明确路径**：
+     * 本方法为 true → 只走隧道；false → 降级 BT（并打一行降级日志）；BT 也没有
+     * 活跃控制链路 → 真正不发（打原因）。消除旧形态「隧道未识别先报『0x5001 未发出』、
+     * 紧接着又从 BT 补发同一帧」的自相矛盾（今晚实车 L1678 vs L1682/1735/1756）。
+     */
+    fun canSendNowPlaying(): Boolean = synchronized(lock) { mib3Identified || tunnelIdentified }
+
+    /**
      * 主动推送一次 0x5001 NowPlayingUpdate（歌名变化时由宿主调用）。
      *
      * 车机只在订阅（0x5000）时收到一次 0x5001；而歌名是用户开始播放音乐后才经
@@ -385,18 +398,17 @@ class VirtualIap2Link(
         ).joinToString("|")
 
     /**
-     * 车机订阅 0x5000 之后，按 [NOW_PLAYING_POLL_MILLIS] 周期主动查一次歌名。
+     * 链路识别完成后按周期主动查一次歌名（2026-11-24 放宽，iPhone 基线 §C.5）。
      *
-     * 存在的理由：0x5000 应答是**一次性**的，空态之后车机不会再来问；而补推原本
-     * 完全依赖 MediaSession / CarLife 的**变化事件**。若歌名先于订阅就存在（音乐
-     * 早就在放），或通知监听器晚绑定（vivo Android 17 上 requestRebind 常不生效），
-     * 就再也不会有事件 → 仪表永久空白，且手机侧日志一条错误都没有。
-     *
-     * 这里只查不猜：provider 返回 null 就静默等下一拍，绝不伪造歌名；内容键与
-     * 上次发出的一致也不重发。挂在既有 200ms 节拍上，不新增线程、不额外唤醒。
+     * 旧判据 `nowPlayingSubscribed`（必须先收到 0x5000）与 iPhone 实测相反：
+     * 车机发 0x5000 仅 1 次、还是发在第一条短命 iAP2 连接上；iPhone 之后在**没有
+     * 订阅**的新端点上主动发了 273 次 0x5001（P1 会话前 2 分钟 134 次）。结论是
+     * 「有媒体信息就周期推」，不是「等 0x5000 再推」。现改为：链路已识别就查，
+     * 内容键变化必推 + [NOW_PLAYING_POLL_MILLIS] 周期心跳兜底（同内容不重发，
+     * 见 [nowPlayingKey]）。挂在既有 200ms 节拍上，不新增线程。
      */
     private fun maybePollNowPlayingLocked() {
-        if (!nowPlayingSubscribed || (!mib3Identified && !tunnelIdentified)) return
+        if (!mib3Identified && !tunnelIdentified) return
         val now = nowMillis()
         if (lastNowPlayingPollMs != 0L && now - lastNowPlayingPollMs < NOW_PLAYING_POLL_MILLIS) return
         lastNowPlayingPollMs = now
@@ -406,7 +418,7 @@ class VirtualIap2Link(
         lastPushedNowPlayingKey = key
         sendNowPlayingLocked(np)
         log(
-            "IAPLINK: 0x5000 订阅后周期补推 0x5001（歌名=${np.title ?: "?"}" +
+            "IAPLINK: 周期补推 0x5001（歌名=${np.title ?: "?"}" +
                 " 歌手=${np.artist ?: "?"} 状态=${np.status}）",
         )
     }
@@ -623,6 +635,20 @@ class VirtualIap2Link(
     /** 链路状态迁移只在日志里出现一次（IDLE→NEGOTIATING→NORMAL 是按键通路是否打通的分水岭）。 */
     private fun noteLinkStateLocked() {
         val state = engine.state
+        // 修复 #15/P0-5：NEGOTIATING 停滞到「SYN 轮次用尽仍没升级」时打一条显式告警——
+        // 今晚实车 I5 段链路停在 NEGOTIATING 全程零告警（L1591 之后无 NORMAL），排障
+        // 时完全无从下手。只打一次（negotiatingStallLogged，否则 200ms 节拍刷屏）。
+        if (state == Iap2LinkEngine.State.NEGOTIATING &&
+            controlSynGaveUp &&
+            !negotiatingStallLogged
+        ) {
+            negotiatingStallLogged = true
+            log(
+                "IAPLINK: ⚠ 链路卡在 NEGOTIATING——控制通道 SYN 已发 $controlSynRounds 轮仍无车机回应，" +
+                    "媒体键/带内消息将不可用（0x5001 会降级到 BT 链路推送）；" +
+                    "若持续出现，请核对车机 iAP2 隧道识别握手是否发起（对照成功日志的 0x1D01 隧道清单）",
+            )
+        }
         if (state == lastLinkState) return
         lastLinkState = state
         log("IAPLINK: 链路状态 → $state（NORMAL 才可能收到车机 0x6800/0x6802 媒体键）")
@@ -1399,14 +1425,13 @@ class VirtualIap2Link(
         internal const val ARTWORK_START_TIMEOUT_MILLIS = 8_000L
 
         /**
-         * 车机订阅 0x5000 后主动查歌名的周期。
+         * 链路识别后主动查歌名的周期（2026-11-24 放宽为 5s 心跳：iPhone 基线实测
+         * 0x5001 是 1 秒级持续推送，我们不追密度——内容变化事件已即时推，这里只做
+         * 「事件丢一条」的兜底；1.5s 在无变化时纯白查，5s 足够自愈又几乎不添流量）。
          *
-         * 真机时序里订阅常**早于**歌名：通知监听器晚绑定、音乐早就在放（歌名先于
-         * 订阅存在，不会再有 metadata 事件）时，事件驱动的补推永远不触发，车机就
-         * 一直停在 0x5001 空态。1.5s 既能让歌名及时补上，又不会给控制链路刷帧
-         * （只有内容键变化才真正发，见 [nowPlayingKey]）。
+         * 不再要求先收到 0x5000 订阅（车机整个会话只发一次、还常发在短命连接上）。
          */
-        const val NOW_PLAYING_POLL_MILLIS = 1_500L
+        const val NOW_PLAYING_POLL_MILLIS = 5_000L
 
         /** 隧道 MFi 冷启动基线（Frida 真机 20B 优先；顺序会被按车机记忆重排）。 */
         val TUNNEL_MFI_BASELINE = listOf(20, 32, 16)

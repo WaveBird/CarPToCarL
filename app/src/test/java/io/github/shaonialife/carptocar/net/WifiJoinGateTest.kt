@@ -68,6 +68,20 @@ class WifiJoinGateTest {
     }
 
     @Test
+    fun skipCarriesRemainingCooldownForAutoRetry() {
+        // 修复 #8：Skip 不再是终点——带剩余冷却让调用方等完自动重发一次
+        // （BMW 27s 窗口内被 Skip 报废一整轮的教训，2026-11-24）。
+        val gate = gate()
+        val run = gate.decide("Audi_5GHz", nowMillis = 1_000L) as WifiJoinGate.Decision.Run
+        gate.finish(run.ticket, succeeded = false, nowMillis = 16_000L)
+        val skip = gate.decide("Audi_5GHz", nowMillis = 17_500L) as WifiJoinGate.Decision.Skip
+        assertEquals("剩余冷却 = 窗口 - 已流逝", 3_500L, skip.retryAfterMillis)
+        // 冷却耗尽后同一查询变成 Run（自动重发路径依据它放行）
+        val after = gate.decide("Audi_5GHz", nowMillis = 17_500L + 4_000L)
+        assertTrue(after is WifiJoinGate.Decision.Run)
+    }
+
+    @Test
     fun dedupeWindowExpires() {
         val gate = gate()
         val run = gate.decide("Audi_5GHz", nowMillis = 1_000L) as WifiJoinGate.Decision.Run

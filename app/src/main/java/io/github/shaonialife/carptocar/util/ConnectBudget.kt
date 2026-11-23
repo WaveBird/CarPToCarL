@@ -15,7 +15,13 @@ enum class ConnectStage(
     val budgetMs: Long,
 ) {
     ENDPOINT("等车机连接信息（0x4301）", 5 * 60_000L),
-    WIFI("加入车机热点", 60_000L),
+
+    /**
+     * 加入车机热点：**25 秒**（2026-11-24 修复 #7）。与 SessionController 的
+     * `WIFI_JOIN_TOTAL_BUDGET_MS` 同值——BMW iD9 交出 0x4301 后约 27 秒拆链，
+     * 旧值 60s 意味着每轮入网都注定撞上车机拆链还继续跑。
+     */
+    WIFI("加入车机热点", 25_000L),
     PAIRING("AirPlay 配对", 120_000L),
     SETUP("会话建立（SETUP）", 30_000L),
     FIRST_FRAME("等首帧", 20_000L),
@@ -71,7 +77,7 @@ class ConnectBudget(
             history.clear()
             current = Entry(ConnectStage.ENDPOINT, startedAt).also { history += it }
         }
-        sink("STAGE: 本轮开始（$note）——预算：等端点 5min / 热点 60s / 配对 120s / SETUP 30s / 首帧 20s")
+        sink("STAGE: 本轮开始（$note）——预算：等端点 5min / 热点 25s / 配对 120s / SETUP 30s / 首帧 20s")
     }
 
     /** 进入下一个阶段，返回**上一阶段实际耗时**（毫秒；第一阶段返回 0）。 */
@@ -96,13 +102,13 @@ class ConnectBudget(
             history += entry
             line =
                 "STAGE: ${stage.label}开始" +
-                    if (prev == null) {
-                        ""
-                    } else {
-                        "（上段 ${prev.stage.label} 用时 ${seconds(spent)}" +
-                            (if (prev.stage.hasBudget && spent > prev.stage.budgetMs) "，**超预算**" else "") +
-                            "，本轮累计 ${seconds(now - startedAt)}）"
-                    }
+                if (prev == null) {
+                    ""
+                } else {
+                    "（上段 ${prev.stage.label} 用时 ${seconds(spent)}" +
+                        (if (prev.stage.hasBudget && spent > prev.stage.budgetMs) "，**超预算**" else "") +
+                        "，本轮累计 ${seconds(now - startedAt)}）"
+                }
         }
         sink(line)
         return spent

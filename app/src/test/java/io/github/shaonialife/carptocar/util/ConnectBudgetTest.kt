@@ -85,10 +85,11 @@ class ConnectBudgetTest {
     @Test
     fun budgetValuesMatchExistingTimeouts() {
         // 这几个数字不是新发明的，必须与 SessionController 里既有常量一致：
-        // PENDING_START_SESSION_WAIT_MS=5min、CAR_WIFI_BIND_WAIT_MS=45s(取整 60s)、
+        // PENDING_START_SESSION_WAIT_MS=5min、WIFI_JOIN_TOTAL_BUDGET_MS=25s
+        // （2026-11-24 修复 #7：对齐 BMW 27s 拆链窗口，旧值 60s 注定撞窗）、
         // PAIRING_WINDOW_MILLIS=120s、INITIAL_SETUP_WINDOW_MS=30s
         assertEquals(5 * 60_000L, ConnectStage.ENDPOINT.budgetMs)
-        assertEquals(60_000L, ConnectStage.WIFI.budgetMs)
+        assertEquals(25_000L, ConnectStage.WIFI.budgetMs)
         assertEquals(120_000L, ConnectStage.PAIRING.budgetMs)
         assertEquals(30_000L, ConnectStage.SETUP.budgetMs)
         assertEquals(20_000L, ConnectStage.FIRST_FRAME.budgetMs)

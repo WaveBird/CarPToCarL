@@ -65,4 +65,18 @@ class PersonalAudioClassifierTest {
         // 名字命中、Class 缺失（Android 16 的常见形态）
         assertTrue(PersonalAudioClassifier.looksLikePersonalAudio(null, "FreeBuds 6i"))
     }
+
+    @Test
+    fun `wf-wh- 型号前缀命中——2026-11-24 实车 WF-SP700N 被连拨 4 次的病根`() {
+        // 今晚实车（L176/195/208/226）：索尼 WF-SP700N 在 Android 16 上 CoD 缺失，
+        // 旧关键词表全不命中，被当车机候选连拨 4 次还断它音频。
+        assertTrue(PersonalAudioClassifier.looksLikePersonalAudioName("WF-SP700N"))
+        assertTrue(PersonalAudioClassifier.looksLikePersonalAudioName("wf-1000xm4"))
+        assertTrue(PersonalAudioClassifier.looksLikePersonalAudio(null, "WH-1000XM5"))
+        // 大小写不敏感
+        assertTrue(PersonalAudioClassifier.looksLikePersonalAudioName("Wf-C500n"))
+        // 真车机不受影响（不会有人给车机起 wf-/wh- 名字）
+        assertFalse(PersonalAudioClassifier.looksLikePersonalAudioName("MBUX 29573"))
+        assertFalse(PersonalAudioClassifier.looksLikePersonalAudioName("BMW 71280"))
+    }
 }

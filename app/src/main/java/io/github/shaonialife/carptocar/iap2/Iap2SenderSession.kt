@@ -110,6 +110,26 @@ class Iap2SenderSession(
 
     private val random = SecureRandom()
 
+    /**
+     * 本轮**实际收到**的消息 id 列表（去重、按到达顺序，修复 P0-3/P2-10）。
+     *
+     * 2026-11-24 实车 00:32:45.982：失败文案说「既没回 0x4301、也没有 0x5703」，
+     * 而 0x5703 早在 00:32:42.167 就到手了——旧文案只写「缺什么」，从不写「实际拿到
+     * 什么」，排障者无从核对。现在失败文案一律附上这份列表。
+     */
+    private val receivedMessageIds = LinkedHashSet<Int>()
+
+    private fun noteReceivedMessageId(id: Int) {
+        receivedMessageIds.add(id)
+    }
+
+    private fun receivedIdsSummary(): String =
+        if (receivedMessageIds.isEmpty()) {
+            "无"
+        } else {
+            receivedMessageIds.joinToString("/") { "0x%04x".format(it) }
+        }
+
     /** 0x5703 解析结果（保活期间车机重发 0x5702 时需重新应答）。 */
     @Volatile
     private var wifi: WifiConfiguration? = null
@@ -558,6 +578,10 @@ class Iap2SenderSession(
      */
     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
         val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+        // 修复 P0-3：每轮会话重置「实际收到」台账——旧链路残留的消息 id 混进来，
+        // 失败文案就会谎报（00:32:45.982 那条「既没回 0x4301、也没有 0x5703」正是
+        // 台账跨会话污染的表象）。
+        receivedMessageIds.clear()
         if (!channel.awaitReady(remainingMillis(deadline))) {
             throw IOException("iAP2 链路协商超时")
         }
@@ -1022,6 +1046,8 @@ class Iap2SenderSession(
                             throw IOException(
                                 "未拿到车机热点凭据：车机声明了无线 CarPlay 组件（参24），" +
                                     "但 ${startSessionWindow / 1_000_000_000}s 内既没回 0x4301、也没有 0x5703" +
+                                    "（本轮实际收到：${receivedIdsSummary()}——若列表里有 0x5703 说明凭据已在手，" +
+                                    "本条文案即误报，请据此核对）" +
                                     "——请确认车机已把本机设为 CarPlay 设备" +
                                     "（iDrive：移动设备 → 本机 → Apple CarPlay），然后重连",
                             )
@@ -1029,6 +1055,7 @@ class Iap2SenderSession(
                         throw IOException(
                             "车机无线 CarPlay 未就绪：0x1D01 未声明无线 CarPlay 组件（参24），" +
                                 "清单里也没有 0x5702/0x5703、没声明会发 0x4301" +
+                                "（本轮实际收到：${receivedIdsSummary()}）" +
                                 "——这一刻它自己就没有这个能力，等多久都不会有回音。" +
                                 "请等 30 秒左右让车机的无线栈起来，再重新选一次本机" +
                                 "（2026-11-15 宝马 iD8.5 实测：第 2 次连接时清单才完整，87ms 回 0x5703 即通）",
@@ -2121,6 +2148,8 @@ class Iap2SenderSession(
         // 完整会话录制：原始报文（含 0x1D01 能力清单这类大包）进 session_trace.log，
         // 与 main_debug.log 的摘要行按时间戳对齐，用于事后离线分析拆链/超时。
         frames.forEach { SessionTrace.csm(SessionTrace.Dir.RX, "bt", it.messageId, it.body) }
+        // 修复 P0-3/P2-10：记录本轮实际收到的消息 id，失败文案据此附「实际收到列表」。
+        frames.forEach { noteReceivedMessageId(it.messageId) }
         frames.forEachIndexed { index, frame -> if (index > 0) receivedFrames += frame }
         return frames.first()
     }

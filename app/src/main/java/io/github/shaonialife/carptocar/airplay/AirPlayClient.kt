@@ -6,8 +6,8 @@ import io.github.shaonialife.carptocar.audio.AudioCodec
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
 import io.github.shaonialife.carptocar.audio.AudioSender
-import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.audio.AudioTuning
+import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.CarPlayUplinkHealth
 import io.github.shaonialife.carptocar.iap2.Iap2Csm
@@ -73,10 +73,10 @@ class AirPlayClient(
     private val onPortRefused: ((refused: Int) -> Unit)? = null,
     private val onTransportClosed: ((AirPlayClient, String) -> Unit)? = null,
 ) {
-
     /** 音频 SETUP 时用的车机地址（会话中途要重新核对音量时复用）。 */
     @Volatile
     private var lastAudioHost: String? = null
+
     /**
      * 当前使用的接收端端点。0x4301 晚到 / mDNS 后上线时由主控热更新；
      * 配对循环每轮重试都重新读取，改动在下一轮即生效。
@@ -1114,7 +1114,8 @@ class AirPlayClient(
                         "Content-Length: ${body.size}\r\n" +
                         "CSeq: $eventCseq\r\n\r\n"
                 val plaintext = head.toByteArray(Charsets.US_ASCII) + body
-                io.github.shaonialife.carptocar.util.RtspDump.tx("POST /command", head, body)
+                io.github.shaonialife.carptocar.util.RtspDump
+                    .tx("POST /command", head, body)
                 SessionTrace.rtsp(
                     SessionTrace.Dir.TX,
                     "airplay-event",
@@ -1260,6 +1261,7 @@ class AirPlayClient(
     }
 
     // 手机侧申请与 appState 上报共用一把锁：两路 modesChanged 不交叉，车机看到的归属按序演进
+
     /**
      * 申请主屏。
      *
@@ -2328,6 +2330,12 @@ class AirPlayClient(
     }
 
     /**
+     * 隧道 iAP2 链路此刻能否承载 0x5001（见 [VirtualIap2Link.canSendNowPlaying]）。
+     * 2026-11-24 修复：宿主据此走「隧道就绪走隧道 / 未就绪降级 BT」的单一路径。
+     */
+    fun canSendNowPlaying(): Boolean = obtainIapLink().canSendNowPlaying()
+
+    /**
      * 主动补推一次 0x5001（见 [VirtualIap2Link.pushNowPlaying]）。
      * quiet = 播放位置逐秒补推：照常发包，但不刷日志。
      */
@@ -2861,6 +2869,7 @@ class AirPlayClient(
                 // 352，日志里看着像"PCM 也用 1024"，排障时误导过。
                 "实际 spf=${spfValue ?: "不声明"}）",
         )
+
         // 请求体做两版（差别只在末尾的 ct/sr/vocoderInfo）。**默认发不带的那版**：
         // 奥迪/别克/宝马这些已跑通的车机第一次就 200，永远走不到重试，
         // 这次改动对它们零影响；ID7（Cinemo 组件）三档全 400 才需要第二版。
@@ -3045,7 +3054,8 @@ class AirPlayClient(
         // 第二条流（导航独立流）不重复查音量：音量是会话级的，主流已经查过，
         // 再查只会多两趟 RTSP 往返。
         if (fixVolume) probeAndFixVolume(host)
-        return AudioStreamInfo(            streamConnectionId = connectionId,
+        return AudioStreamInfo(
+            streamConnectionId = connectionId,
             dataPort = dataPort,
             controlPort = portOf(audio["controlPort"]),
             streamKey = streamKey,
@@ -3065,6 +3075,7 @@ class AirPlayClient(
      * ② 若确实处于静音位（≤[MUTE_THRESHOLD_DB]），抬到 [SAFE_VOLUME_DB]。
      * 查询失败/车机不支持都不影响主链路。
      */
+
     /**
      * 会话中途重新核对并纠正车机音量（**幂等**，可随时调）。
      *
@@ -3293,6 +3304,7 @@ class AirPlayClient(
      * 所以同一 bit30 生成多个变体逐个试：被拒自动切下一个，成功变体写进车机记忆，
      * 下次直用。其他格式位（PCM/AAC 位图自带采样率语义）保持单变体不变。
      */
+
     /** Opus 单声道档的构造（A3：采样率由格式位唯一决定，见 [AUDIO_FORMAT_OPUS_16K] 注释）。 */
     private fun opusVariant(
         audioType: String,
@@ -3444,11 +3456,12 @@ class AirPlayClient(
                     AudioProfile(
                         audioType = AUDIO_TYPE_TELEPHONY,
                         formatBit = bit,
-                        sampleRate = if (bit == AUDIO_FORMAT_PCM_44K_STEREO || bit == AUDIO_FORMAT_AAC_LC_44K_STEREO) {
-                            44_100
-                        } else {
-                            48_000
-                        },
+                        sampleRate =
+                            if (bit == AUDIO_FORMAT_PCM_44K_STEREO || bit == AUDIO_FORMAT_AAC_LC_44K_STEREO) {
+                                44_100
+                            } else {
+                                48_000
+                            },
                         latencyMs = latencyFor(info, AUDIO_TYPE_TELEPHONY, streamType),
                         streamType = streamType,
                         codec = codec,
@@ -3603,7 +3616,8 @@ class AirPlayClient(
                 totalBytes += packet.length
                 if (datagrams == 1) {
                     val head =
-                        buf.copyOfRange(0, minOf(16, packet.length))
+                        buf
+                            .copyOfRange(0, minOf(16, packet.length))
                             .joinToString(" ") { "%02x".format(it) }
                     log(
                         "MIC: 首个数据报 ${packet.length}B from " +
@@ -4265,7 +4279,8 @@ class AirPlayClient(
                         "Content-Length: ${body.size}\r\n" +
                         "\r\n"
                 val plaintext = head.toByteArray(Charsets.US_ASCII) + body
-                io.github.shaonialife.carptocar.util.RtspDump.tx("$method $path", head, body)
+                io.github.shaonialife.carptocar.util.RtspDump
+                    .tx("$method $path", head, body)
                 val encryption = cipher
                 SessionTrace.rtsp(
                     SessionTrace.Dir.TX,
@@ -4403,7 +4418,8 @@ class AirPlayClient(
         body: ByteArray,
         head: String,
     ) {
-        io.github.shaonialife.carptocar.util.RtspDump.rx(statusLine, head, body)
+        io.github.shaonialife.carptocar.util.RtspDump
+            .rx(statusLine, head, body)
         val message = RtspMessage(statusLine, body, head)
         message.cseq?.let { responseHeads[it] = head }
         val queue = message.cseq?.let { pendingResponses[it] }

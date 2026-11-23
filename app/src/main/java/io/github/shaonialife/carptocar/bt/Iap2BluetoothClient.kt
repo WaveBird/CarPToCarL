@@ -83,9 +83,16 @@ class Iap2BluetoothClient(
          * 参考实现（link_plus `Iap2RetryBackoff`）用 3s 起步的倍增阶梯，那个下限
          * 在我们这条链路上会踩 15 秒计时器，故保留 16s 起步、把中间档补细。
          */
-        private val RETRY_BACKOFF_MILLIS = longArrayOf(16_000L, 20_000L, 24_000L, 30_000L, 45_000L, 60_000L)
+        /**
+         * 连续失败时的退避阶梯（16s → 20s → 24s → 30s → 45s → 60s）的真源已抽到
+         * [Iap2RetryPolicy]（单测锁住）。这里引用同一数组，保证循环里算出来的
+         * 值与测试期望完全一致。
+         *
+         * 起点必须 ≥ 16 秒（车机 mediaDisconnectTimeout=15s + 1s 余量）。
+         */
+        private val RETRY_BACKOFF_MILLIS = Iap2RetryPolicy.RETRY_LADDER
 
-        /** 会话存活不足这个时长就当作「无效轮」（车机连上就关），计入退避。 */
+        /** 「无效轮」判据的真源在 [Iap2RetryPolicy.nextStreak]：拿到过 0x4301/端点才算有效轮。 */
         private const val SESSION_USEFUL_MILLIS = 3_000L
 
         /** 退避睡眠的分片粒度：20 秒的退避也要能在 stop() 后立刻醒来。 */
@@ -96,10 +103,13 @@ class Iap2BluetoothClient(
         /**
          * 「车机靠近 → 提前重试」的最长等待：把当前这一轮退避截到这里为止。
          *
-         * 物理靠近是「现在值得再试一次」的最强信号（车机刚醒/刚进无线配对窗口），
-         * 而退避上限已经拉到 60 秒。截到 10 秒既不错过窗口，也不会变成密集探测。
+         * 物理靠近是「现在值得再试一次」的最强信号（车机刚醒/刚进无线配对窗口）。
+         * 10s → 16s（2026-11-24 修复 #2，实车日志 L121→L142：NUDGE 生效轮实测 19.00s
+         * 才重连）：截断值低于 16 秒时，车机 ACL 抖动时的每次抢占都会把重试间隔压到
+         * mediaDisconnectTimeout（15s）以下——车机把我们当「还没走」，只重开旧会话
+         * 不启动 projection。下限取 [Iap2RetryPolicy.sleepFloorMillis] 硬保证。
          */
-        private const val NUDGE_MAX_WAIT_MILLIS = 10_000L
+        private const val NUDGE_MAX_WAIT_MILLIS = Iap2RetryPolicy.NUDGE_MAX_WAIT_MILLIS
 
         /**
          * 可发现窗口时长（秒，随 REQUEST_DISCOVERABLE 下发）。
@@ -137,11 +147,30 @@ class Iap2BluetoothClient(
          */
         private const val PASSIVE_FALLBACK_ROUNDS = 2
 
-        /** 被动等待窗口（对照参考实现的 60s/120s 等待窗，取短的一档）。 */
-        private const val PASSIVE_WAIT_MILLIS = 60_000L
+        /**
+         * 被动等待窗口：60s → 30s（2026-11-24 修复 #10）。
+         *
+         * 今晚实车（MGU-55-J）：车机回连全部发生在拆链后 **9 秒内**（L293/474/632/800/
+         * 1001/1353 六次入站全成功）；60 秒窗里只有前 9 秒有用，后 51 秒是纯空等，
+         * 还把整轮节奏拖慢一倍。
+         */
+        private const val PASSIVE_WAIT_MILLIS = 30_000L
 
         /** 被动窗口内的轮询粒度：也决定 stop()/车机连入的响应延迟。 */
         private const val PASSIVE_POLL_MILLIS = 2_000L
+
+        // ---- 可发现续期（2026-11-24 修复 #3）----
+        /**
+         * 可发现窗口「剩多少」就续期：窗口总长 [DISCOVERABLE_WINDOW_SECONDS]（300s），
+         * 剩余不足 60 秒（约一轮退避）时重请求一次，避免车机晚到错过窗口。
+         */
+        private const val DISCOVERABLE_RENEW_BEFORE_MILLIS = 60_000L
+
+        /**
+         * 后台自动恢复（不弹窗）下，连续多少轮拿不到「可发现」才打「请手动点启动连接」
+         * 的升级提示——每轮都提醒等于刷屏，3 轮 ≈ 1 分钟够用户注意到日志/提示。
+         */
+        private const val DISCOVERABLE_ESCALATE_ROUNDS = 3
     }
 
     private var thread: Thread? = null
@@ -179,6 +208,50 @@ class Iap2BluetoothClient(
     @Volatile
     private var senderSession: Iap2SenderSession? = null
 
+    /**
+     * 本次 start() 是不是用户手动「启动连接」——修复 #3（可发现续期）需要它在
+     * connectLoop 每轮首部重新判断「该不该重请求可发现窗口」。后台自动恢复永远
+     * 不弹窗（mcarplay 2026-10-26 实测：后台弹窗被 MIUI 静默吞掉，白弹一次）。
+     */
+    @Volatile
+    private var interactiveStart: Boolean = true
+
+    /**
+     * 当前可发现窗口的截止时刻（uptimeMillis，0 = 没有在跑的窗口）。
+     * 剩余 < [DISCOVERABLE_RENEW_BEFORE_MILLIS] 时在轮首续期。
+     */
+    @Volatile
+    private var discoverableWindowUntilMillis = 0L
+
+    /** 后台模式下连续多少轮没有可发现窗口了（达到 [DISCOVERABLE_ESCALATE_ROUNDS] 升级提示一次）。 */
+    @Volatile
+    private var backgroundDiscoverableFailRounds = 0
+
+    /**
+     * 「请手动点一次启动连接补可发现窗口」的升级提示是否已发（每轮 start() 一次，
+     * 反复提醒只会刷屏）。
+     */
+    @Volatile
+    var needsUserStartupHint: Boolean = false
+        private set
+
+    /**
+     * 本轮 start() 里已经做过「断开配置文件 → 重连」的设备地址（修复 #4）。
+     *
+     * 2026-11-24 实车：同一轮循环里对同一台车机 <2s 内两次 `socket.connect()`
+     * （第一次失败 → 断 HFP/A2DP → 立刻重拨），第二次拨号撞上车机还在恢复
+     * 配置文件的窗口，只换来一次失败，还多断一次音频。每台设备每次 start()
+     * 只允许一次「断配置」兜底，之后的轮次只直连。
+     */
+    private val profileDropTried = HashSet<String>()
+
+    /**
+     * 上一轮会话是否拿到过 0x4301/端点（修复 #1：failStreak 归零判据）。
+     * 由 [runSession] 收尾回填 [Iap2RetryPolicy.nextStreak]。
+     */
+    @Volatile
+    private var lastRoundGotEndpoint: Boolean = false
+
     @Volatile
     private var running = false
 
@@ -203,6 +276,27 @@ class Iap2BluetoothClient(
 
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
     private val iap2ServiceCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * 非目标设备的「SDP 明确没有 …caff」软缓存（修复 #16，2026-11-24 实车 00:27:31：
+     * BMW 71280 被 MISSING 永久拉黑，之后 3 分钟全打在索尼耳机上）。
+     *
+     * 地址 → [NoServiceRecord]（连续命中次数 + 首次判定时刻）。连续 [NO_SERVICE_CONFIRM_ROUNDS]
+     * 次且在 [NO_SERVICE_TTL_MILLIS] 内才允许跳过；过期/未达标重查——车机固件晚开
+     * 无线窗口、SDP 缓存陈旧，都给一条出路。**显式目标永不进这张表**（见修复 #16）。
+     */
+    private class NoServiceRecord(
+        var hits: Int = 0,
+        var firstAtMillis: Long = 0L,
+    )
+
+    private val noServiceSoft = java.util.concurrent.ConcurrentHashMap<String, NoServiceRecord>()
+
+    /** 「SDP 明确没有 …caff」要连续几次才允许跳过（1 次太武断，实车已证明会误杀）。 */
+    private val NO_SERVICE_CONFIRM_ROUNDS = 2
+
+    /** 软跳过结论的存活时间：过这个点就算没满 2 次也重查（固件/窗口可能变了）。 */
+    private val NO_SERVICE_TTL_MILLIS = 60_000L
 
     /**
      * 最近一次 …caff 连接失败的原始原因（IOException 摘要）。
@@ -328,6 +422,33 @@ class Iap2BluetoothClient(
         return PersonalAudioClassifier.looksLikePersonalAudio(deviceClass, name)
     }
 
+    /**
+     * 「SDP 说没有 …caff」的软跳过判定（修复 #16）：同一地址连续
+     * [NO_SERVICE_CONFIRM_ROUNDS] 次 MISSING 才允许跳过，且结论 60s 过期——
+     * 过期或未达标都返回 false（继续探测/拨号）。命中时推进计数。
+     */
+    private fun shouldSkipForNoService(address: String): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        val record = noServiceSoft.compute(address) { _, existing ->
+            if (existing == null) {
+                NoServiceRecord(hits = 1, firstAtMillis = now)
+            } else if (now - existing.firstAtMillis > NO_SERVICE_TTL_MILLIS) {
+                NoServiceRecord(hits = 1, firstAtMillis = now)
+            } else {
+                existing.hits++
+                existing
+            }
+        }
+        return record != null && record.hits >= NO_SERVICE_CONFIRM_ROUNDS
+    }
+
+    /**
+     * 修复 #4 的配额判定：该设备本次 start() 里还能不能做「断配置→重连」。
+     * 首次申请返回 true 并占坑；之后每轮返回 false（只直连，不再动它的音频）。
+     */
+    private fun canDropProfilesOnce(address: String): Boolean =
+        synchronized(profileDropTried) { profileDropTried.add(address) }
+
     /** 「蓝牙已连接→已断开」日志节流时间戳。 */
     private var lastProfileLogAt = 0L
 
@@ -392,6 +513,15 @@ class Iap2BluetoothClient(
         // 每轮启动重置 SDP 结论与跳过日志（新配对/换固件后重新探测）
         iap2ServiceCache.clear()
         skippedNoService.clear()
+        // 修复 #16：软黑名单一并清空——上次进程内判「没有 iAP2 服务」的设备可能已经
+        // 打开无线窗口（固件晚启动是常态），重启 start() 就该给它重新被探到的机会。
+        noServiceSoft.clear()
+        // 修复 #4：「断配置 → 重连」的每设备一次配额随 start() 重置
+        synchronized(profileDropTried) { profileDropTried.clear() }
+        // 修复 #3：交互标记落字段（connectLoop 轮首续期要用），升级提示重新计时
+        this.interactiveStart = interactiveStart
+        needsUserStartupHint = false
+        backgroundDiscoverableFailRounds = 0
         BtSessionGate.targetSoftFallback = false
         BtSessionGate.clearRemoteDisconnectGrace()
         // 用户主动「启动连接」= 给车机端健康判定一次干净的重来机会（可能刚重启过车机）。
@@ -429,53 +559,63 @@ class Iap2BluetoothClient(
      * 竞品 BOX OFF 的做法（见 mcarplay `CARWITH-ENTRY-FINDINGS.md` §蓝牙公告，2026-11-16
      * 静态分析）：无指定目标、开始等待前发 `REQUEST_DISCOVERABLE` 300 秒；已处于可发现
      * （`getScanMode()==23`）时**复用现有窗口、不重复弹窗**。这里照抄同一套判据，外加
-     * 两条自己的边界：
+     * 三条自己的边界：
      *
      *  - [allowSystemDialog]=false（后台自动恢复）→ 绝不弹窗：已可发现就复用，否则只
      *    打一行日志提示用户手动点一次「启动连接」才能补上首配窗口；
      *  - 「已配对」≠「已连通」：bond 存在但从未成功建立过 CarPlay 会话时，车机可能还没
      *    记住本机的无线 CarPlay 能力（首配失败后重试的常态），仍要给窗口；只有
      *    「已配对 **且** 曾经成功连上」才走纯回连、免弹窗。
-     *  - 弹窗时长对齐竞品的 300s：系统默认 120s，而 BT 退避阶梯最长 60s×多轮，
-     *    车机晚到就错过窗口——300s 覆盖两轮退避。
+     *  - 修复 #3：窗口有寿命（300s 只覆盖两轮退避），connectLoop 每轮首部按
+     *    [discoverableWindowUntilMillis] 判「剩 <60s 就续期」——用户点完启动连接后
+     *    坐进车里等红灯的 5 分钟里，窗口不再静默过期。
+     *
+     * @return true = 此刻本机处于可发现状态（或复用了系统窗口）；false = 请求失败/未发起
      */
     @SuppressLint("MissingPermission")
     private fun ensureDiscoverableWindow(
         target: TargetDevicePrefs.Target?,
         allowSystemDialog: Boolean,
-    ) {
+    ): Boolean {
         val adapter =
             runCatching { context.getSystemService(BluetoothManager::class.java)?.adapter }.getOrNull()
-            ?: return
+            ?: return false
         val scanMode =
             runCatching { adapter.scanMode }.getOrDefault(BluetoothAdapter.SCAN_MODE_NONE)
         if (scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
             log("BT-C: 本机已可被发现（scanMode=23）——复用现有窗口，不再请求")
-            return
+            // 系统窗口的到期时刻我们看不到：按「再来一整个窗口」记账，下一轮再据实判定。
+            discoverableWindowUntilMillis =
+                android.os.SystemClock.uptimeMillis() + DISCOVERABLE_WINDOW_SECONDS * 1_000L
+            return true
         }
         if (target != null && targetBondedAndEverConnected(adapter, target)) {
             // 已配对且曾经连上：车机走「回连」路径，CONNECTABLE 就够，不弹窗打扰。
-            return
+            return true
         }
         if (!allowSystemDialog) {
             log(
                 "BT-C: 本机当前不可被发现，且本次是后台自动恢复（不弹窗）——" +
                     "若车机需要重新扫描配对本机，请手动点一次「启动连接」",
             )
-            return
+            return false
         }
-        runCatching {
+        return runCatching {
             context.startActivity(
                 Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
                     .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_WINDOW_SECONDS)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
+            discoverableWindowUntilMillis =
+                android.os.SystemClock.uptimeMillis() + DISCOVERABLE_WINDOW_SECONDS * 1_000L
             log(
-                "BT-C: 已请求可被发现窗口（系统弹窗 ${DISCOVERABLE_WINDOW_SECONDS}s）——" +
+                "BT-C: 已请求可发现窗口（系统弹窗 ${DISCOVERABLE_WINDOW_SECONDS}s）——" +
                     "首次配对请在车机列表里选中本机",
             )
-        }.onFailure { error ->
+            true
+        }.getOrElse { error ->
             log("BT-C: 可发现窗口请求失败（${error.javaClass.simpleName}）——已配对回连不受影响")
+            false
         }
     }
 
@@ -512,6 +652,47 @@ class Iap2BluetoothClient(
         /** 连续「没有有效会话」的轮数，用于 [RETRY_BACKOFF_MILLIS] 退避（连上即断也算）。 */
         var failStreak = 0
         while (running && generation.get() == myGeneration) {
+            // ---- 修复 #3：可发现窗口续期 ----
+            // 首配场景的窗口有寿命（300s 只覆盖两轮退避）；剩不足 60 秒（约一轮退避）
+            // 就在轮首补一次请求，别让车机晚到时窗口已静默过期。后台模式照旧不弹窗，
+            // 只累计失败轮数、到阈值打一次「请手动点启动连接」的升级提示。
+            if (targetProvider() != null || !sessionEverEstablished) {
+                val now = android.os.SystemClock.uptimeMillis()
+                val windowLeft = discoverableWindowUntilMillis - now
+                if (windowLeft < DISCOVERABLE_RENEW_BEFORE_MILLIS) {
+                    val renewed =
+                        ensureDiscoverableWindow(targetProvider(), allowSystemDialog = interactiveStart)
+                    if (renewed) {
+                        backgroundDiscoverableFailRounds = 0
+                    } else if (!interactiveStart) {
+                        backgroundDiscoverableFailRounds++
+                        if (backgroundDiscoverableFailRounds == DISCOVERABLE_ESCALATE_ROUNDS &&
+                            !needsUserStartupHint
+                        ) {
+                            needsUserStartupHint = true
+                            log(
+                                "BT-C: ⚠ 后台已连续 $backgroundDiscoverableFailRounds 轮拿不到「可发现」窗口——" +
+                                    "首次配对（或车机重新扫描）需要本机可被发现，请在 App 点一次「启动连接」" +
+                                    "（会弹系统确认框）或到系统蓝牙设置打开可发现；仅回连（已配对）不受影响",
+                            )
+                        }
+                    }
+                }
+            }
+            // ---- 修复 #11：车机侧拆链后的冷却（与手动断开同级）----
+            // 旧实现只在「用户手动断开」给了 18 秒静默；车机自己关链（bt socket closed,
+            // read return: -1）完全不管，1~7 秒后就带着残留状态重开——车机固件
+            // mediaDisconnectTimeout=15s 还没把它判成「已移除」，照旧只走
+            // keepIAP2Session=1 的「重开旧会话」分支（今晚实车 L460/L790/L992 三轮实测）。
+            val sinceRemote = BtSessionGate.sinceRemoteDisconnect()
+            if (sinceRemote < RETRY_DELAY_MILLIS) {
+                log(
+                    "BT-C: 车机 ${sinceRemote / 1000}s 前刚拆链——补足 ${RETRY_DELAY_MILLIS / 1000}s 静默再拨" +
+                        "（固件 mediaDisconnectTimeout=15s，早了它只重开旧会话）",
+                )
+                sleepQuietly(RETRY_DELAY_MILLIS - sinceRemote + 200)
+                continue
+            }
             // 用户刚手动断开 → 先等车机「忘掉」上一轮，别急着拨。
             //
             // 2026-11-04 奥迪 4910（MIB3 4580）实录：16:22:32.519 手动断开，
@@ -621,10 +802,31 @@ class Iap2BluetoothClient(
                         Iap2Service.HAS
                     }
                 if (gate == Iap2Service.MISSING) {
-                    if (skippedNoService.add(device.address)) {
-                        log("BT-C: 跳过「$name」（SDP 明确不含 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
+                    // 修复 #16：MISSING 不再永久拉黑。2026-11-24 实车 00:27:31：
+                    // BMW 71280 被「SDP 明确不含 iAP2」判死后 3 分钟全打在索尼耳机上
+                    // （L170 → L176/195/208/226）。现在只记软缓存（连续
+                    // [NO_SERVICE_CONFIRM_ROUNDS] 次且 60s TTL 内才跳过），显式目标
+                    // **永不**跳过——用户指定了它，SDP 缺失只记日志。
+                    val isExplicitTarget = targetProvider()?.let { it.address.equals(device.address, true) } == true
+                    if (isExplicitTarget) {
+                        if (skippedNoService.add(device.address)) {
+                            log(
+                                "BT-C: 目标「$name」SDP 明确不含 iAP2 服务——但它是显式目标，照常尝试拨号" +
+                                    "（SDP 缓存可能陈旧；固件晚开无线窗口是常态）",
+                            )
+                        }
+                    } else if (!shouldSkipForNoService(device.address)) {
+                        log(
+                            "BT-C: 「$name」SDP 不含 iAP2 服务（连续判定第 " +
+                                "${noServiceSoft[device.address]?.hits ?: 1}/$NO_SERVICE_CONFIRM_ROUNDS 次）" +
+                                "——未达跳过门槛，本轮仍尝试",
+                        )
+                    } else {
+                        if (skippedNoService.add(device.address)) {
+                            log("BT-C: 跳过「$name」（SDP 连续 $NO_SERVICE_CONFIRM_ROUNDS 次确认无 iAP2 服务——非 CarPlay 设备，保持其音频连接；60s 后重新探测）")
+                        }
+                        continue
                     }
-                    continue
                 }
                 if (gate == Iap2Service.UNKNOWN) {
                     // SDP 没问出结论：先**不动音频**，直接探一次 …caff。
@@ -632,10 +834,10 @@ class Iap2BluetoothClient(
                     // 探不通再看是不是「蓝牙已连接时不开放服务窗口」的机型（奥迪实测），
                     // 此时才断开配置文件重试一次——耳机类设备永远不会被我们断掉音频。
                     var probe = tryConnect(device)
-                    if (probe == null && !looksLikePersonalAudio(device)) {
+                    if (probe == null && !looksLikePersonalAudio(device) && canDropProfilesOnce(device.address)) {
                         val dropped = BtProfiles.disconnect(context, device)
                         if (dropped.isNotEmpty()) {
-                            log("BT-C: $name SDP 未给结论、直连失败——已断开 ${dropped.joinToString("/")} 再试一次")
+                            log("BT-C: $name SDP 未给结论、直连失败——已断开 ${dropped.joinToString("/")} 再试一次（本次 start() 内该设备仅此一次）")
                         }
                         probe = tryConnect(device)
                     }
@@ -644,8 +846,14 @@ class Iap2BluetoothClient(
                         if (lastFailureWasSdpLookup && !looksLikePersonalAudio(device)) {
                             sdpLookupFailures++
                         }
-                        if (skippedNoService.add(device.address)) {
-                            log("BT-C: 跳过「$name」（SDP 未给出结论、直连 …caff 也失败——按非 CarPlay 设备处理）")
+                        // 修复 #16：这条「SDP 未给结论 + 直连失败」同样只进软缓存，
+                        // 不再永久拉黑（同 BMW 71280 误杀的另一半来源）。
+                        if (targetProvider()?.address.equals(device.address, true) != true &&
+                            shouldSkipForNoService(device.address)
+                        ) {
+                            if (skippedNoService.add(device.address)) {
+                                log("BT-C: 跳过「$name」（SDP 未给出结论、直连 …caff 也失败——连续确认按非 CarPlay 处理，60s 后重探）")
+                            }
                         }
                         continue
                     }
@@ -668,8 +876,13 @@ class Iap2BluetoothClient(
                     //
                     // 耳机/音箱例外：哪怕被显式选成目标，也不为探 iAP2 断它的音频——
                     // 正在放的歌会被掐掉，而且它本来就不可能提供 …caff。
+                    //
+                    // 修复 #4：每台设备每次 start() 只允许一次「断配置→重连」。今晚实车
+                    // 同一轮里 <2s 两次 socket.connect()（第一次失败→断配置→立刻重拨），
+                    // 第二次拨号撞上车机还在恢复配置文件的窗口；之后轮次只直连，让
+                    // 「断配置」这类强动作退回成每轮启动的一次性尝试。
                     val dropped =
-                        if (looksLikePersonalAudio(device)) {
+                        if (looksLikePersonalAudio(device) || !canDropProfilesOnce(device.address)) {
                             emptyList<String>()
                         } else {
                             BtProfiles.disconnect(context, device)
@@ -707,7 +920,12 @@ class Iap2BluetoothClient(
                             ) {
                                 "——车机 SDP 里没有无线 CarPlay 的 iAP2 服务（未开无线 CarPlay / 该车型仅支持有线）"
                             } else {
-                                "——车机未就绪或不在无线配对窗口，${RETRY_DELAY_MILLIS / 1000} 秒后重试…"
+                                // 修复 #13：不再写死「16 秒后重试」——退避阶梯在用
+                                // 16/20/24/30/45/60，写死值会误导排障（实车日志实测
+                                // 文案与实际间隔相差最多 44 秒）。真实值由本循环末尾
+                                // 的「下一轮间隔放长到 Xs」行给出。
+                                "——车机未就绪或不在无线配对窗口（本轮失败计 $failStreak，" +
+                                    "具体重试间隔见后续日志）"
                             }
                         log("BT-C: 连接 $name 失败（$reason）$hint")
                     }
@@ -731,11 +949,12 @@ class Iap2BluetoothClient(
                         )
                     }
                 }
-                // 方向兜底：连续多轮「SDP 里根本没有 …caff」时，主动一侧已无意义
-                // （雪铁龙 R4 的 180ms 失败即属此类），切被动等车机连入一段时间。
-                // 补连控制链路期间不切：那会把恢复窗口全花在「等车机自己连进来」上，
-                // 而这时 CarPlay 早就建好了，车机不会再来一次主动建链。
-                if (recoveryPeers == null && sdpLookupFailures > 0) {
+                // 方向兜底（修复 #10，判据放宽）：连续多轮「SDP 里根本没有 …caff」
+                // **或本轮没拿到端点**（lastRoundGotEndpoint == false）都计入被动窗口。
+                // 依据：今晚实车 6 次成功全是车机主动连入（L293/474/632/800/1001/1353），
+                // 主动拨 6 败 0 成——MGU 这类车机只认自己发起的建链，SDP 有没有 …caff
+                // 不该是切被动的唯一门槛。补连控制链路期间不切（恢复窗口别花在干等）。
+                if (recoveryPeers == null && (sdpLookupFailures > 0 || !lastRoundGotEndpoint)) {
                     passiveFailRounds++
                     if (passiveFailRounds >= PASSIVE_FALLBACK_ROUNDS) {
                         passiveFailRounds = 0
@@ -766,23 +985,43 @@ class Iap2BluetoothClient(
             // 「连上就被关」不算成功：2026-10-28 大众实测 52 轮全是「连入 → 0.5 秒被车机
             // 关闭」（车机不在无线窗口/要自己发起）。这类轮次按失败计，否则退避永远回到 3 秒，
             // 每轮白断一次车机、还可能抢掉它主动连入的时机。
+            // 「连上就被关」不算成功：2026-10-28 大众实测 52 轮全是「连入 → 0.5 秒被车机
+            // 关闭」（车机不在无线窗口/要自己发起）。这类轮次按失败计，否则退避永远回到 3 秒，
+            // 每轮白断一次车机、还可能抢掉它主动连入的时机。
+            // 修复 #1：有效轮的唯一判据是「拿到过 0x4301/端点」（[Iap2RetryPolicy.nextStreak]），
+            // 活过 3 秒不再归零——MGU-55-J 的失败形态正是每轮活 20+ 秒却拿不到端点。
             val aliveMillis = android.os.SystemClock.uptimeMillis() - sessionStartedAt
             if (CarPlayUplinkHealth.isDead) {
                 // 车机端 CarPlay 已退出：蓝牙侧它照常识别、照常 ACK，只有 0x4301 永远不来。
                 // 间隔不再一律 60 秒，而是 20→30→45→60 的阶梯：用户当场重启车机时不必
                 // 白等到下一分钟（CarPlayUplinkHealth.nextDeadRetryDelayMillis）。
+                failStreak = Iap2RetryPolicy.nextStreak(failStreak, gotEndpoint = false)
                 val deadDelay = CarPlayUplinkHealth.nextDeadRetryDelayMillis()
                 log(
                     "BT-C: 车机端 CarPlay 已退出——本轮结束，${deadDelay / 1000} 秒后再探" +
                         "（${CarPlayUplinkHealth.describe()}；车机重启好会自动接上）",
                 )
                 sleepBackoff(deadDelay)
-            } else if (aliveMillis < SESSION_USEFUL_MILLIS) {
-                failStreak++
-                sleepBackoff(backoffMillis(failStreak))
             } else {
-                failStreak = 0
-                sleepBackoff(RETRY_DELAY_MILLIS)
+                failStreak = Iap2RetryPolicy.nextStreak(failStreak, gotEndpoint = lastRoundGotEndpoint)
+                if (lastRoundGotEndpoint) {
+                    sleepBackoff(RETRY_DELAY_MILLIS)
+                } else {
+                    if (aliveMillis >= SESSION_USEFUL_MILLIS) {
+                        log(
+                            "BT-C: 会话存活 ${aliveMillis / 1000}s 但没拿到 0x4301/端点——按无效轮计退避" +
+                                "（实车 MGU-55-J：连上、走完身份、20+ 秒后被拆链，0x4301 从未到手）",
+                        )
+                    }
+                    val backoff = backoffMillis(failStreak)
+                    if (failStreak >= 3) {
+                        log(
+                            "BT-C: 已连续 $failStreak 轮没拿到端点——下一轮间隔放长到 ${backoff / 1000}s" +
+                                "（这台车机可能只在自己愿意时发起：被动监听一直在，不必密集探测）",
+                        )
+                    }
+                    sleepBackoff(backoff)
+                }
             }
         }
         log("BT-C: 客户端已停止")
@@ -887,12 +1126,18 @@ class Iap2BluetoothClient(
     }
 
     /**
-     * 软回退池的准入：这台设备还值不值得当车机试一次。
+     * 软回退池的准入：这台设备还值不值得当车机试一次（修复 #15，改「正向证据」制）。
      *
-     * - 本轮已经判定「不是车机」（跳过过 / SDP 明确说没有 …caff）→ 不再拨，避免每轮都去
-     *   打扰同一台设备；
-     * - SDP 里明确广播了 …caff → 就是车机（哪怕 Class of Device 报成了音频类）；
-     * - 其余靠 [looksLikePersonalAudio] 排除耳机/音箱。
+     * 旧行为「拿不到 Class of Device 就当不是耳机」在一加 16 上把索尼 WF-SP700N
+     * 放进了候选池（2026-11-24 实车 L163 → L176/195/208/226：3 分钟 4 次全打在耳机上）。
+     * 新判据——**要有正向证据才拨**，三者缺一不进池：
+     *  1. SDP 里明确广播了 …caff（它自己说自己是 CarPlay 配件）；
+     *  2. CoD 拿得到且不是音频类（系统明确说它不是耳机/音箱）；
+     *  3. 是显式目标（用户点名，见调用处——显式目标不经本函数过滤）。
+     *
+     * CoD 为 null 且没有 …caff 的设备（索尼耳机在 Android 16 的常态）本轮不拨：
+     * 拨不进去还断它音频，纯负收益。`wf-`/`wh-` 型号前缀补进 [PersonalAudioClassifier]
+     * 的名字兜底，覆盖「CoD 有但名字是唯一线索」的场景。
      */
     @SuppressLint("MissingPermission")
     private fun keepAsSoftCandidate(device: BluetoothDevice): Boolean {
@@ -905,6 +1150,15 @@ class Iap2BluetoothClient(
                 false
             }
         if (advertisesIap2) return true
+        val deviceClass =
+            try {
+                device.bluetoothClass?.deviceClass
+            } catch (_: SecurityException) {
+                null
+            }
+        // 正向证据制：CoD 缺失 + 没有 …caff → 不拨（2026-11-24 实车：消灭连索尼耳机）。
+        // 名字兜底仍在：名字像耳机（含 wf-/wh- 前缀）也拒，其余 CoD 非音频的照旧准入。
+        if (deviceClass == null) return false
         return !looksLikePersonalAudio(device)
     }
 
@@ -923,17 +1177,22 @@ class Iap2BluetoothClient(
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
         // stop() 只有能拿到 socket 引用才能 close() 打断它，否则线程会滞留。
         currentSocket.set(socket)
-        return try {
+        // 修复 #5：建链中标记——音频守卫见 true 就不做设备级 disconnect()（会拆掉
+        // 正在建立的 ACL）。finally 保证任何退出路径都清掉。
+        BtSessionGate.outboundConnecting = true
+        try {
             socket.connect()
             lastConnectError = null
             lastFailureWasSdpLookup = false
-            socket
+            return socket
         } catch (error: IOException) {
             lastConnectError = error.message ?: error.javaClass.simpleName
             lastFailureWasSdpLookup = false
             currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
-            null
+            return null
+        } finally {
+            BtSessionGate.outboundConnecting = false
         }
     }
 
@@ -1015,6 +1274,14 @@ class Iap2BluetoothClient(
             runCatching { socket.close() }
             channel.close()
             log("BT-C: 本轮会话结束（客户端仍在运行，将自动重连）")
+            // 修复 #1：回填「本轮拿到过 0x4301 没有」，connectLoop 据此决定 failStreak
+            // 归零还是继续爬梯（不再按「活过 3 秒」判定——MGU-55-J 每轮都活过 3 秒
+            // 却从未拿到 0x4301，旧判据让退避阶梯永远停在第一档）。
+            lastRoundGotEndpoint = owned && gotStartSession
+            // 修复 #11：链路终结（含车机拆链）进入与手动断开同级的车机侧冷却窗口。
+            if (remoteLoss) {
+                BtSessionGate.noteRemoteDisconnectAt()
+            }
             // 只统计「本轮到死都没拿到 0x4301 且是自然结束」的轮次：用户主动停止、或为换链路
             // 而退役控制会话，都不是车机的态度，计进去会让「连续两轮」变得廉价。
             // 成功那条路已在会话内 noteStartSession() 清零，这里不必重复。
@@ -1089,15 +1356,20 @@ class Iap2BluetoothClient(
      * 退避睡眠：分片检查 [running]，让 stop() 能立刻打断 20 秒的长退避
      * （整段 `Thread.sleep` 会让关闭会话时线程还挂着睡满一轮）。
      *
-     * 同时消费 [nudgePending]：车机靠近时不干等满一轮，把截止时刻收到最多 10 秒。
+     * 同时消费 [nudgePending]：车机靠近时不干等满一轮，把截止时刻收到
+     * [NUDGE_MAX_WAIT_MILLIS]；但**任何截断后的剩余睡眠都不得低于
+     * [Iap2RetryPolicy.sleepFloorMillis]**（= max(NUDGE 窗, 退避起点) = 16s）——
+     * 车机 ACL 抖动时频繁抢占空口，等于替车机续 mediaDisconnectTimeout（15s），
+     * 那正是 2026-11-24 实车「每 1~7 秒重开旧会话全失败」的直接诱因之一。
      */
     private fun sleepBackoff(millis: Long) {
         val started = android.os.SystemClock.uptimeMillis()
-        var deadline = started + millis
+        val floor = Iap2RetryPolicy.sleepFloorMillis()
+        var deadline = started + maxOf(millis, floor)
         while (running && android.os.SystemClock.uptimeMillis() < deadline) {
             if (nudgePending) {
                 nudgePending = false
-                val capped = started + NUDGE_MAX_WAIT_MILLIS
+                val capped = maxOf(started + NUDGE_MAX_WAIT_MILLIS, started + floor)
                 if (capped < deadline) deadline = capped
             }
             sleepQuietly(BACKOFF_POLL_MILLIS)
@@ -1282,9 +1554,47 @@ object BtSessionGate {
     @Volatile
     private var remoteDisconnectAt: Long = 0L
 
+    /**
+     * 出站 RFCOMM **正在建链中**（createRfcomm/connect 已发起、尚未成功或失败）。
+     *
+     * 修复 #5（2026-11-24 实车 00:26 段）：音频配置守卫的设备级 `disconnect()` 兜底
+     * 会把这条正在建立的 ACL 连同配置文件一起拆掉——守卫踢 HFP 的那一刻恰逢
+     * socket.connect() 进行中，链路直接断，拨号轮全部失败。设备级断开前必须确认
+     * 这个标志为 false；守卫的 [guardAudioProfiles] shouldPause 也把它算进去。
+     */
+    @Volatile
+    var outboundConnecting: Boolean = false
+
     /** 记一次「用户手动断开」。 */
     fun noteManualStop() {
         manualStopAt = android.os.SystemClock.uptimeMillis()
+        // 修复 #11：手动断开也是「链路终结」的一种，统一纳入拆链后冷却窗口。
+        noteRemoteDisconnectAt()
+    }
+
+    /**
+     * 最近一次「**任意**链路终结」的时刻（uptimeMillis，0 = 本次进程还没断过链）。
+     *
+     * 修复 #11（2026-11-24）：`REACTIVATE_COOLDOWN_MILLIS` 的语义从「手动断开专用」
+     * 扩成「任何一次链路终结后」——手动断开（[noteManualStop]）、车机侧拆链
+     * （`runSession` 收尾 `remoteLoss` 为真）、我们主动退役控制会话都会调
+     * [noteRemoteDisconnectAt]。依据：固件 `mediaDisconnectTimeout=15s` 对「设备
+     * 还在不在」的判定不看断链是谁发起的，三种路径都只会在 15 秒内撞上
+     * `keepIAP2Session=1` 的旧会话分支（今晚实车 L460/L790/L992，1~7 秒重开全失败）。
+     */
+    @Volatile
+    var remoteDisconnectAtMillis: Long = 0L
+
+    /** 记一次「任意链路终结」（修复 #11）。 */
+    fun noteRemoteDisconnectAt() {
+        remoteDisconnectAtMillis = android.os.SystemClock.uptimeMillis()
+    }
+
+    /** 距上次任意链路终结多少毫秒；从未断过返回 [Long.MAX_VALUE]。 */
+    fun sinceRemoteDisconnect(): Long {
+        val at = remoteDisconnectAtMillis
+        if (at == 0L) return Long.MAX_VALUE
+        return android.os.SystemClock.uptimeMillis() - at
     }
 
     /** 距上次手动断开多少毫秒；本次进程没手动断过返回 [Long.MAX_VALUE]。 */
