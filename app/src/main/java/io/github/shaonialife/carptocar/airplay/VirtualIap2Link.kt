@@ -815,6 +815,17 @@ class VirtualIap2Link(
                     // 记忆键 = 车机身份 + " tunnel"：与蓝牙链路的记忆互不污染
                     mfiIdentity = mfiIdentityOf(params) + " tunnel"
                 }
+                // 1.2.103：隧道识别完成即视为已订阅 NowPlaying。BMW MGU（010309 日志）
+                // 在隧道上可收清单声明 0x5001 却从不发 0x5000 订阅——若等订阅，
+                // 歌名永远到不了车机首页卡片。真 iPhone 在 CarPlay 会话里也是
+                // 「识别完就推」，不依赖显式订阅。车机若真发了 0x5000，
+                // 上面 START_NOW_PLAYING_UPDATES 分支会照常处理（幂等）。
+                if (onTunnel && receives?.contains(Iap2MessageIds.NOW_PLAYING_UPDATE) == true) {
+                    nowPlayingSubscribed = true
+                    lastPushedNowPlayingKey = null
+                    lastNowPlayingPollMs = nowMillis()
+                    log("IAPLINK: 隧道识别完成 + 可收清单含 0x5001 → 视为已订阅 NowPlaying（挂起周期补推）")
+                }
                 sendCsmLocked(ids.IDENTIFICATION_ACCEPTED)
                 // 声明会发 0xAA06 的车机（如宝马 iD8/MGU WLAN）首帧 0xAA00 要带空参数 0：先取序列号，再拉完整证书
                 val serialFirst = sends?.contains(MFI_AUTH_SERIAL) == true
@@ -924,7 +935,11 @@ class VirtualIap2Link(
             }
 
             Iap2MessageIds.START_NOW_PLAYING_UPDATES -> {
-                if (!mib3) return
+                // 1.2.103：隧道形态也接受订阅。BMW MGU（010309 日志）在 WiFi 隧道上
+                // 可收清单声明 0x5001 却从不发 0x5000，而下方推送门禁要求
+                // nowPlayingSubscribed——纯隧道会话里歌名永远到不了车机首页卡片。
+                // 隧道上收到订阅（少见）或首次识别完成（常见）都应放行推送。
+                if (!mib3 && !onTunnel) return
                 // 每次（重）订阅都是全新上下文：清掉上次的内容键，允许同歌再推一次；
                 // 同时挂起周期补推——空态不是终点，歌名晚到时由节拍自愈。
                 nowPlayingSubscribed = true
@@ -935,12 +950,12 @@ class VirtualIap2Link(
                     lastPushedNowPlayingKey = nowPlayingKey(nowPlaying)
                     sendNowPlayingLocked(nowPlaying)
                     log(
-                        "IAPLINK: MIB3 0x5000 → 0x5001（歌名=${nowPlaying.title ?: "?"}" +
+                        "IAPLINK: ${if (mib3) "MIB3" else "隧道"} 0x5000 → 0x5001（歌名=${nowPlaying.title ?: "?"}" +
                             " 歌手=${nowPlaying.artist ?: "?"} 状态=${nowPlaying.status})",
                     )
                 } else {
                     sendRawCsmLocked(MIB3_NOW_PLAYING_UPDATE_IDLE)
-                    log("IAPLINK: MIB3 0x5000 → 0x5001（空态，无正在播放；已挂起周期补推）")
+                    log("IAPLINK: ${if (mib3) "MIB3" else "隧道"} 0x5000 → 0x5001（空态，无正在播放；已挂起周期补推）")
                 }
             }
 
