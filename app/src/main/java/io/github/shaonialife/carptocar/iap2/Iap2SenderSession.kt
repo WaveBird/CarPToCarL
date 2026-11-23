@@ -259,6 +259,14 @@ class Iap2SenderSession(
     private var wifiGen: ReceiverProfile.WifiGen = ReceiverProfile.WifiGen.UNKNOWN
 
     /**
+     * 本轮车机身份键（`name model manufacturer`，与 [ReceiverProfile.identityKeyOf] 同源）。
+     *
+     * 单独留一份的理由：记忆写入点在 0x5703 的处理分支里，那里离 0x1D01 的解析局部变量
+     * 已经隔了几十行；重算一遍等于把「身份怎么拼」写第二份，早晚漂移。
+     */
+    private var receiverIdentityText: String = "unknown"
+
+    /**
      * 「车机没声明能收」的处理已收口到 [AccessoryDeclaration.noteSend]：
      * 绝大多数消息只记 WARN 照发（清单只能证明「有」不能证明「没有」），
      * 只有 `0xA100` / `0xFFF0` 两条有真机重启证据的 MIB3 专用消息按声明裁掉。
@@ -739,6 +747,12 @@ class Iap2SenderSession(
                     // 真车死锁解药（catplay CarPlayInviter 实证）：车机在 WiFi 网络上发现手机的
                     // _carplay-ctrl._tcp 后主动发 GET /ctrl-int/1/connect 邀请，**邀请成功才发 0x4301**。
                     // 因此这里必须立即通知主控绑 WiFi + 广播 ctrl（带真实蓝牙 MAC 作 TXT id）。
+                    // 同时落一条**车机记忆**：这台车机走过旧代协议。它的 0x1D01 可收清单会
+                    // 在 12/13 项之间抖动（仅差 0x5702），下一轮若漏报就会被画像误判成 NEW、
+                    // 不发 0x5702、还开严格模式再裁一次，整轮报废（2026-11-23 19:13:11 实测）。
+                    if (WifiGenMemory.markLegacy(context, receiverIdentityText)) {
+                        log("iap2 车机记忆：该接收端走过旧代 WiFi 协议（0x5703）——此后清单漏项不改判")
+                    }
                     onWifiCredentials?.invoke(parsed)
                     parsed
                 }
@@ -1171,6 +1185,7 @@ class Iap2SenderSession(
 
     /** 是否已因 0xAA06（认证序列号）重发过「索取完整证书」——只补一次，避免与车机互相追。 */
     private var fullCertificateRequested = false
+
     /**
      * 设备状态问候：0x4E0D 无线会话标识 / 0x4E0A 语言 / 0x4E09 设备名 /
      * 0x4E0B 设备时间 / 0x4E0C 设备 UUID。
@@ -1281,6 +1296,7 @@ class Iap2SenderSession(
      * **车机零回帧时直接跳过催问**（见 [lastNudgePeerFrames]）：催问里的问候是 ACK
      * 待确认的，喂给一个已经不回 ACK 的会话等于自己触发重传看门狗拆链。
      */
+
     /**
      * 车机 **AirPlay 端口一直不开**（7000 反复 `ECONNREFUSED`）时的一次「叫醒」。
      *
@@ -1677,7 +1693,9 @@ class Iap2SenderSession(
     private val nowPlayingRetryDelaysMs = longArrayOf(1_500, 4_000, 8_000, 15_000, 25_000)
 
     /** 单调递增的订阅代次：新订阅作废旧的重试任务。 */
-    private val npGeneration = java.util.concurrent.atomic.AtomicInteger()
+    private val npGeneration =
+        java.util.concurrent.atomic
+            .AtomicInteger()
 
     /** 0x5001 重试专用单线程（daemon）：不占用 iAP2 收包线程，会话结束自动退出进程。 */
     private val nowPlayingRetry =
@@ -1723,10 +1741,11 @@ class Iap2SenderSession(
         // 凭据到手，不用再催了（催问频率与日志噪音都到此为止）。
         if (awaitingStartSession) {
             awaitingStartSession = false
-            log("iap2 催问共 ${nudgeCount} 次后收到可用 0x4301——停止催问")
+            log("iap2 催问共 $nudgeCount 次后收到可用 0x4301——停止催问")
         }
         // 车机可能周期性重发同一份 0x4301：详情只在端点变化时打，避免刷日志。
-        if (endpoint.hashCode() != lastLateStartSessionSignature) {            lastLateStartSessionSignature = endpoint.hashCode()
+        if (endpoint.hashCode() != lastLateStartSessionSignature) {
+            lastLateStartSessionSignature = endpoint.hashCode()
             log(
                 "iap2 rx=0x4301（晚到，Phase 1 之后）airPlayPort=${endpoint.airPlayPort} " +
                     "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKey?.take(16)}… " +
@@ -2042,11 +2061,13 @@ class Iap2SenderSession(
                 // 会让人以为清单没声明，和上面那行「StartHID=会发」自相矛盾。
                 log(
                     "iap2 ${HID_WAIT_NANOS / 1_000_000_000}s 内未收到 0x6800 StartHID" +
-                        (if (accessoryDeclaresSend(Iap2MessageIds.START_HID) == true) {
-                            "（车机声明会发，可能等 0x4300 之后才开 HID）——继续"
-                        } else {
-                            "（车机未声明清单，按不发处理）——继续"
-                        }),
+                        (
+                            if (accessoryDeclaresSend(Iap2MessageIds.START_HID) == true) {
+                                "（车机声明会发，可能等 0x4300 之后才开 HID）——继续"
+                            } else {
+                                "（车机未声明清单，按不发处理）——继续"
+                            }
+                        ),
                 )
                 return
             }
@@ -2220,7 +2241,6 @@ class Iap2SenderSession(
         )
     }
 
-
     private fun logIdentification(frame: Iap2Csm.Frame) {
         val params = Iap2Csm.parseParams(frame.body).associateBy { it.id }
         val name = params[0]?.value?.asStringOrEmpty()
@@ -2283,11 +2303,25 @@ class Iap2SenderSession(
                         currentLanguage = components.currentLanguage,
                         wirelessCarPlayComponent = components.wirelessCarPlayDeclared,
                         navigationDisplayComponent = components.navigationDisplayDeclared,
+                        // 记忆优先判据：这台车机回过 0x5703 就永远是旧代协议。
+                        // 见 WifiGenMemory 类注释（MGU 清单 12/13 项抖动实测）。
+                        // 素材与 ReceiverProfile.identityKeyOf 完全一致（name+model+manufacturer）。
+                        knownLegacyWifi =
+                            WifiGenMemory.isKnownLegacy(
+                                context,
+                                listOfNotNull(name, model, manufacturer)
+                                    .map { it.trim() }
+                                    .filter { it.isNotEmpty() }
+                                    .joinToString(" ")
+                                    .ifBlank { "unknown" },
+                            ),
                     ),
                 )
             log(ReceiverProfile.describe(profile))
             // 画像结论是本轮 WiFi 分派的唯一依据（见 wifiGen 字段注释）
             wifiGen = profile.wifiGen
+            // 身份键随本轮留存：0x5703 到达时要用它写「这台车机走旧代协议」的记忆
+            receiverIdentityText = profile.identityKey
             // 新协议车机：可收清单升格为**硬门禁**（清单之外不发，协议骨架除外）。
             // 依据见 AccessoryDeclaration 类注释第 3 条：GM/Cinemo 三台都是
             // 「ACK 完我们最后一条 → 只剩 ff550200ee10 心跳」，而奥迪走 LEGACY
@@ -2310,8 +2344,9 @@ class Iap2SenderSession(
                 MfiLengthMemory.forgetPreference(context, profile.identityKey)
                 ProtocolAudit.record(
                     ProtocolAudit.Code.ERA_SWITCHED,
-                    detail = "${generationChange.from.era}/${generationChange.from.wifiGen}" +
-                        " → ${generationChange.to.era}/${generationChange.to.wifiGen}",
+                    detail =
+                        "${generationChange.from.era}/${generationChange.from.wifiGen}" +
+                            " → ${generationChange.to.era}/${generationChange.to.wifiGen}",
                 )
             }
             val dispatchHint =
@@ -2368,7 +2403,7 @@ class Iap2SenderSession(
                     kindBytes[0].toInt() and 0xFF
                 }
             val name = sub[1]?.value?.asStringOrEmpty() ?: "?"
-            parts += "${name}(id=$kind)"
+            parts += "$name(id=$kind)"
         }
         if (parts.isNotEmpty()) log("iap2 0x1d01 传输组件：" + parts.joinToString(" / "))
     }

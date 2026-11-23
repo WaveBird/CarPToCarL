@@ -66,6 +66,14 @@ object ReceiverProfile {
         val wirelessCarPlayComponent: Boolean? = null,
         /** 0x1D01 参数 30：导航引导显示组件（投仪表/HUD 的官方声明）。 */
         val navigationDisplayComponent: Boolean? = null,
+        /**
+         * 该车机**历史上回过 0x5703**（见 [WifiGenMemory]）。null/false = 无记忆。
+         *
+         * 这条信号优先级最高：它来自车机的**真实行为**，比单轮清单可靠。BMW MGU-55-J
+         * 的可收清单会在 12/13 项之间抖动（仅差 0x5702 一项），单靠清单会把同一台车机
+         * 在 LEGACY 与 NEW 之间来回误判（2026-11-23 19:13:11 那轮整轮报废）。
+         */
+        val knownLegacyWifi: Boolean = false,
     )
 
     data class Profile(
@@ -120,6 +128,15 @@ object ReceiverProfile {
 
         val wifiGen =
             when {
+                // 记忆优先：这台车机回过 0x5703 = 旧代协议已被它的行为证实。
+                // 清单只能证明「有」，不能证明「没有」——单轮漏项（BMW MGU 丢 0x5702）
+                // 绝不能把已证实的事实翻成 NEW，否则不发 0x5702、还开严格模式再裁一次，
+                // 整轮必然报废（2026-11-23 19:13:11 实测）。
+                signals.knownLegacyWifi -> {
+                    reasons += "车机记忆：该接收端曾回 0x5703 —— 清单漏项不改判，仍走旧协议"
+                    WifiGen.LEGACY
+                }
+
                 signals.sendIds == null && signals.receiveIds == null -> {
                     reasons += "0x1D01 未提供收/发清单"
                     WifiGen.UNKNOWN

@@ -119,6 +119,9 @@ class VirtualIap2Link(
     /** 上次周期查询时刻（[nowMillis] 时钟）；0 = 还没查过。 */
     private var lastNowPlayingPollMs = 0L
 
+    /** 「0x5001 因会话未识别而未发出」的归因日志时刻（30 秒限流，只影响日志）。 */
+    private var lastNowPlayingSkipLogMs = 0L
+
     // ---- 封面文件传输（session 12）状态 ----
     /** 正在传的封面 id；0 = 没有在传。 */
     private var artworkPendingId = 0
@@ -254,6 +257,17 @@ class VirtualIap2Link(
         return { !linkClosed && epoch == current }
     }
 
+    /**
+     * 当前 iAP2 会话形态的日志标签。
+     *
+     * **必须如实区分**，否则排障会被日志带偏：`onTunnel`（type-130 隧道真的建成）与
+     * `mib3Armed`（识别/MFi 骨架跑在 RTSP 控制通道的 POST /command 上）是两条完全
+     * 不同的通路，但两者共用本类的识别/MFi 代码。旧实现把两种形态的日志都硬编码成
+     * 「隧道」，导致 2026-11-23 的日志被读成「隧道已建立」——实际全天
+     * `TUNNEL: SETUP 应答无 dataPort`，隧道一次都没建成。
+     */
+    private fun formLabel(): String = if (tunnelWriter() != null) "隧道" else "控制通道"
+
     /** 使异步排队中的控制通道写与应答立即失效；若对端在 MFi 挑战期间拆链则同步记录硬拒绝。 */
     fun close() {
         val wasOpen = !linkClosed
@@ -302,10 +316,19 @@ class VirtualIap2Link(
      * CarLife 0x10035 到达的——若订阅先于歌名，就会停在空态。所以歌名就绪后必须
      * 由外部主动补推一次。链路尚未建立（MIB3 未识别）时静默忽略。
      */
+
     /** @param quiet 播放位置逐秒补推：照常发包，但不刷日志（否则每秒一行）。 */
     fun pushNowPlaying(quiet: Boolean = false) {
         synchronized(lock) {
-            if (!mib3Identified && !tunnelIdentified) return
+            if (!mib3Identified && !tunnelIdentified) {
+                // 静默丢弃是「首页媒体卡永远空白」最难查的形态：宿主明明调了推送、
+                // 蓝牙链路也回了成功，但这条 WiFi 侧通路其实连识别都没走完。
+                // 2026-11-23 晚间 532 秒的会话里，车机没有主动发起 iAP2（停在
+                // NEGOTIATING），0x5001 全部落到蓝牙侧并发给了已经切到 WiFi 的车机，
+                // 日志上一条错误都没有。这里必须留一行可解释的痕迹（限流，别刷屏）。
+                noteNowPlayingSkippedLocked()
+                return
+            }
             val nowPlaying = nowPlayingProvider?.invoke() ?: return
             lastPushedNowPlayingKey = nowPlayingKey(nowPlaying)
             sendNowPlayingLocked(nowPlaying)
@@ -316,6 +339,18 @@ class VirtualIap2Link(
                 )
             }
         }
+    }
+
+    /** 「0x5001 未发」的归因日志，30 秒最多一行（逐秒进度补推也会走到这里）。 */
+    private fun noteNowPlayingSkippedLocked() {
+        val now = nowMillis()
+        if (lastNowPlayingSkipLogMs != 0L && now - lastNowPlayingSkipLogMs < 30_000L) return
+        lastNowPlayingSkipLogMs = now
+        log(
+            "IAPLINK: 0x5001 未发出——iAP2 控制面带内会话尚未识别" +
+                "（mib3Identified=$mib3Identified tunnelIdentified=$tunnelIdentified " +
+                "link=${engine.state}）——车机首页媒体卡此时收不到歌名",
+        )
     }
 
     /**
@@ -712,7 +747,7 @@ class VirtualIap2Link(
         val frame = Iap2Csm.encode(messageId, body)
         val ok = engine.sendControl(frame, nowMillis())
         log(
-            "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
+            "IAPLINK: ${formLabel()} tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B ok=$ok",
         )
         SessionTrace.csm(SessionTrace.Dir.TX, "tunnel", messageId, body, if (ok) "" else "send-failed")
@@ -733,7 +768,7 @@ class VirtualIap2Link(
         if (messageId >= 0 && !AccessoryDeclaration.noteSend(messageId, "tunnel", log)) return
         val ok = engine.sendControl(frame, nowMillis())
         log(
-            "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
+            "IAPLINK: ${formLabel()} tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B raw ok=$ok",
         )
         if (messageId >= 0) {
@@ -771,7 +806,7 @@ class VirtualIap2Link(
                         .parseParams(frame.body)
                         .associateBy { it.id }
                 log(
-                    "IAPLINK: 隧道 rx 0x1d01 接收端身份 " +
+                    "IAPLINK: ${formLabel()} rx 0x1d01 接收端身份 " +
                         "name=${params[0]?.value?.decodeToString()?.trimEnd('\u0000')} " +
                         "model=${params[1]?.value?.decodeToString()?.trimEnd('\u0000')}",
                 )
@@ -1040,7 +1075,8 @@ class VirtualIap2Link(
                         log(
                             "IAPLINK: ★ 导航引导 CSM 0x${frame.messageId.toString(16)} " +
                                 "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B " +
-                                "params=" + navParams.joinToString(",") {
+                                "params=" +
+                                navParams.joinToString(",") {
                                     "#${it.id}=" + it.value.joinToString("") { b -> "%02x".format(b) }
                                 } +
                                 " hex=" + frame.body.joinToString(" ") { "%02x".format(it) },
@@ -1427,6 +1463,7 @@ class VirtualIap2Link(
         const val DEVICE_TIME = 0x4E0B
         const val DEVICE_LANGUAGE = 0x4E0A
         const val DEVICE_INFORMATION_UPDATE = 0x4E09
+
         /** 0xA100 AUX 状态。**已停发**（见 [sendMib3BurstLocked]），常量保留备恢复。 */
         const val AUX_STATUS_NOTIFICATION = 0xA100
         const val START_COMMUNICATIONS_UPDATES = 0x4157

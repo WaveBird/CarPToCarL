@@ -85,9 +85,30 @@ class ReceiverProfileTest {
         assertTrue(p.reasons.any { it.contains("0x4301 提供") })
     }
 
+    /**
+     * 车机记忆优先于单轮清单：BMW MGU-55-J 的可收清单在 12/13 项之间抖动
+     * （仅差 `0x5702` 一项）。19:13:11 那轮漏报 → 旧实现判 NEW → 不发 0x5702
+     * 且开严格模式再裁一次 → 整轮报废（2026-11-23 实测）。
+     * 只要该车机回过一次 0x5703，这类漏项就必须不改判。
+     */
     @Test
-    fun sparseSendListAloneStaysUnknown() {
-        // 单份稀疏清单（2 项）无 0x5703：不判「新」——奥迪的反例证明稀疏清单
+    fun knownLegacyWifiOverridesFullListsWithoutOldProtocol() {
+        val p =
+            ReceiverProfile.classify(
+                ReceiverProfile.Signals(
+                    // 与 wifiGenNewWhenFullListsLackOldProtocol 完全相同的清单形态
+                    sendIds = setOf(0x4301, 0x5000, 0x5002, 0x5200, 0x5203, 0xae00, 0xae02, 0x4157),
+                    receiveIds = setOf(0x4300, 0x4e09, 0xaa00, 0xaa02, 0x5001, 0x5201, 0x4158),
+                    // ……但这台车机历史上回过 0x5703
+                    knownLegacyWifi = true,
+                ),
+            )
+        assertEquals(ReceiverProfile.WifiGen.LEGACY, p.wifiGen)
+        assertTrue(p.reasons.any { it.contains("车机记忆") })
+    }
+
+    @Test
+    fun sparseSendListAloneStaysUnknown() { // 单份稀疏清单（2 项）无 0x5703：不判「新」——奥迪的反例证明稀疏清单
         // 不列 0x57xx 也可以走旧协议
         val p =
             ReceiverProfile.classify(
@@ -191,8 +212,9 @@ class ReceiverProfileTest {
         val legacy =
             ReceiverProfile.classify(
                 ReceiverProfile.Signals(
-                    features = (AirPlayFeatures.parse("0x44540380,0x61") ?: 0L) and
-                        AirPlayFeatures.HK_PAIRING_AND_ENCRYPT.inv(),
+                    features =
+                        (AirPlayFeatures.parse("0x44540380,0x61") ?: 0L) and
+                            AirPlayFeatures.HK_PAIRING_AND_ENCRYPT.inv(),
                     sendIds = setOf(0x5703),
                 ),
             )
