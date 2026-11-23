@@ -65,7 +65,8 @@ flowchart TB
    0x5001 只能落到蓝牙链路。而车机已在 19:15:33.932 关掉 RFCOMM 并把 iAP2 迁到 WiFi，
    **蓝牙侧发出的 0x5001 它不再消费**——`fire-and-forget` 又不报错，日志一片干净。
 2. **「控制通道保活」不是第一优先级**：会话 #6 的 control EOF 发生在识别完成后 2 秒，
-   那是车机侧行为（`appStates=2:0`，CarPlay app 未激活），不是我们消息断供导致的。
+   那是车机侧行为（详见 §5 勘误：`appStates=2:0` 是「无通话」，**不是** CarPlay 未激活），
+   不是我们消息断供导致的。
 
 ### 1.2 复审新增的头号根因：0x1D01 清单抖动 → 代际误判 → 整轮报废
 
@@ -209,7 +210,7 @@ flowchart TB
 - 车机在订阅应答（0x4155/0x4158/0x4171/0x5201）发完后 ~0.2s 关控制通道：`POST 失败 - 控制通道已关闭（CSeq=30 POST /command）`。
 
 **已修正的因果（复审 §1.1）**：会话 #6 的 control EOF 不是「消息断供」导致的保活失败，而是
-车机侧行为（`appStates=2:0`，CarPlay app 未激活）。真正让后续所有推送失效的是**会话 #7 的 iAP2
+车机侧行为（勘误见 §5：`appStates=2:0` = 无通话，语义正常）。真正让后续所有推送失效的是**会话 #7 的 iAP2
 链路压根没建立**——车机没主动发 marker，我们的 detect 它不回 SYN，`mib3Identified` 恒 false。
 
 因此「控制通道保活」不再是第一优先级实验。**新的第一优先级是 §9-F1**（代际误判堵死连接）
@@ -252,7 +253,14 @@ sequenceDiagram
 
 三个具体缺陷：
 1. **requestUI 的"先让出再拿回"**（`MODE: requestUI 且主屏在本机——已执行让出再拿回跳变`）在 MGU 上适得其反：让出动作被 HMI 读成"手机放弃"，随即改判永久=车机。晚间 19:25:04.032 拿回 → 04.068 车机秒收回，就是这条拉锯。
-2. **无"自动进首页"信号**：全程 `appStates=2:0`（CarPlay appState 未激活）。真 iPhone 会在会话激活时给车机一个我们没发的信号（候选：0x4E0D WirelessCarPlayUpdate、requestUI 主动发起、或 /play 态唤醒），导致问题 3。
+2. **无"自动进首页"信号**（原因待查）。真 iPhone 在会话激活后会让车机自动切入 CarPlay UI，
+   我们不会；候选信号：0x4E0D WirelessCarPlayUpdate、主动 requestUI、或车机侧"已配置设备"标记。
+
+   > **勘误（2026-11-23 晚）**：首版据此写过「`appStates=2:0` = CarPlay app 未激活」，
+   > 这是**误读**。`AirPlayResourceState.kt:518-520` 的常量是
+   > `APP_STATE_SPEECH=1 / APP_STATE_PHONE_CALL=2 / APP_STATE_TURN_BY_TURN=3`，
+   > 所以 `appStates=2:0,3:0,1:0` 的正确含义是「无通话、无导航播报、无语音」——**完全正常**，
+   > 真 iPhone 在没打电话时也报同样的值。问题 3 与 appStates 无关，不要再沿这条线找。
 3. **暂停冻结联动**：MediaSession 暂停 → 冻结 0x5001 + 引擎静音 PCM，车机若在此时退出 UI，恢复后没有任何"重新唤醒 UI"的路径。
 
 ---
