@@ -66,11 +66,14 @@ import io.github.shaonialife.carptocar.net.CarNetworkReadiness
 import io.github.shaonialife.carptocar.net.CarPlayCtrlAdvertiser
 import io.github.shaonialife.carptocar.net.CarPlayServiceBrowser
 import io.github.shaonialife.carptocar.net.EndpointHosts
+import io.github.shaonialife.carptocar.net.HistoricalEndpointProbe
 import io.github.shaonialife.carptocar.net.HotspotHint
 import io.github.shaonialife.carptocar.net.NetworkReusePolicy
 import io.github.shaonialife.carptocar.net.SilentJoinPolicy
+import io.github.shaonialife.carptocar.net.SpecifierFailoverPolicy
 import io.github.shaonialife.carptocar.net.WifiCarPlayConnector
 import io.github.shaonialife.carptocar.net.WifiJoinGate
+import io.github.shaonialife.carptocar.net.WifiSuggestionChannel
 import io.github.shaonialife.carptocar.net.WifiLinkWatchdog
 import io.github.shaonialife.carptocar.net.WifiSavedNetworks
 import io.github.shaonialife.carptocar.protocol.Capability
@@ -304,6 +307,16 @@ object SessionController {
      * 12 秒的取值：覆盖参考实现实测 15.73s 里「系统侧关联」那一段，又不至于把失败场景拖太久。
      */
     private const val SUGGESTION_SILENT_WAIT_MS = 12_000L
+
+    /**
+     * 建议通道已生效时给「系统自动关联」的短窗（审计 B1/B2）。
+     *
+     * 已保存目标 + 建议授权过的场景，系统进范围就会自动关联——这个短窗多数时候
+     * 几秒内就中（实车：车机回连后关联在 1~3s 内完成），中了就完全跳过 specifier
+     * 的 15s 预算；没中再走完整入网。取值与一次 specifier 快路预算同量级，既不
+     * 明显拖慢失败场景，又能接住绝大多数自动关联。
+     */
+    private const val SUGGESTION_SHORT_WINDOW_MS = 6_000L
 
     /**
      * 建议兜底连续失败多少次后不再白等。
@@ -1455,6 +1468,32 @@ object SessionController {
      * 建议未授权时每轮会白等，用预算把「白等」限制成最多两次。
      */
     private val silentJoinPolicy = SilentJoinPolicy(SILENT_JOIN_MAX_MISSES)
+
+    /**
+     * WiFi 建议通道的登记状态（去重 + 已授权记忆），见 [WifiSuggestionChannel]。
+     * 审计 B1：0x5703/0x4301 两条路同轮各登记一次建议，specifier 失败兜底还会再登记
+     * （实车日志双条「已登记热点建议」）。登记成功一次后本进程不再重复登记；已生效的
+     * 建议通道让入网顺序收敛为「复用 → 建议短窗 → specifier」。
+     */
+    private val suggestionChannel = WifiSuggestionChannel()
+
+    /**
+     * specifier 失败后的改道策略，见 [SpecifierFailoverPolicy]。
+     * 审计 B2：建议通道已授权时 specifier Unavailable 多半是「确认框无人点」，注定失败，
+     * 失败 1 次即改走 awaitAssociation 建议关联短窗，不再 force 自动重试烧满 25s 预算。
+     */
+    private val specifierFailoverPolicy = SpecifierFailoverPolicy()
+
+    /** 本轮 specifier 已连续失败的次数（B2 改道判据）。 */
+    @Volatile
+    private var specifierConsecutiveFailures = 0
+
+    /** 端点解析的历史地址快连探测（审计 B4），探测实现可换便于测试。 */
+    private val historicalEndpointProbe = HistoricalEndpointProbe()
+
+    /** 最近一次收到凭据的 SSID（B1：SSID 变更时清建议授权记忆）。 */
+    @Volatile
+    private var lastSuggestionSsid: String? = null
 
     /** DCL 双检锁的可发布字段（无 volatile 的双检锁是坏发布——虽然当前仅主线程调用，别留隐患）。 */
     @Volatile
@@ -3273,6 +3312,12 @@ object SessionController {
         lastWifiPsk = wifi.passphrase
         // 完整凭据留给「网络被动断开后自动重绑」用（见 onCarWifiLost）
         lastCarWifi = wifi
+        // 审计 B1：车机换热点名/换密码（0x5703 重新下发）时，上一条 SSID 的授权记忆
+        // 不再可信——清掉，让建议通道按新凭据重新走「登记 → 等授权」。
+        if (lastSuggestionSsid != null && lastSuggestionSsid != wifi.ssid) {
+            suggestionChannel.clearAuthorized(lastSuggestionSsid!!)
+        }
+        lastSuggestionSsid = wifi.ssid
         phaseHint = "拿到车机热点凭据，绑定 WiFi…"
         appendLog(">>> 拿到车机热点凭据（0x5703）——立即绑定 WiFi + 广播 _carplay-ctrl")
         // ctrl 广播已在 startConnection 时发布（catplay：连接前保持发布能力在线）。
@@ -3364,11 +3409,31 @@ object SessionController {
             // 1) WLAN 开关。shell 不可用时跳过检查——requestNetwork 会以 Unavailable 反馈。
             if (shellReady && shellWifiDisabled() && !waitForWifiEnabled()) return@run
             if (connectCancelled) return@run
-            // 1.5) 先登记 WiFi 建议（幂等，不弹框）：登记越早，系统越可能在我们要用时
+            // 1.5) 登记 WiFi 建议（幂等，不弹框）：登记越早，系统越可能在我们要用时
             // 就已经把手机连上热点。授权过一次后系统进范围自动关联，这是无人点屏的
             // 唯一可行路径（BMW iD9 只给 27s，人来不及点就断链）。
-            wifiConnector?.registerSuggestion(wifi.ssid, wifi.passphrase, wifi.securityType)
+            // 审计 B1：0x5703 与 0x4301 两条路同轮各登记一次（实车日志双条「已登记热点建议」），
+            // specifier 失败兜底还会再登记一次——收敛为：已登记组合不重复登记；
+            // 建议通道已生效（授权/关联过）时直接走「建议关联短窗」，specifier 降为兜底。
+            registerSuggestionOnce(wifi)
             if (!stillWanted()) return@run
+            // B1：已保存目标 + 建议通道已生效 → 先给建议关联一个短窗（零交互），
+            // 短窗内连上就不再走 specifier（省 15s specifier 预算）。
+            if (suggestionChannel.isAuthorized(wifi.ssid)) {
+                appendLog("WIFI: 建议通道已生效——先给系统关联一个短窗（${SUGGESTION_SHORT_WINDOW_MS / 1000}s），不重复登记")
+                val connector = wifiConnector
+                val adopted =
+                    connector?.awaitAssociation(wifi.ssid, SUGGESTION_SHORT_WINDOW_MS) { connectCancelled || !stillWanted() }
+                if (adopted != null) {
+                    boundCarSsid = wifi.ssid
+                    appendLog("WIFI: 建议通道短窗内已关联 \"${wifi.ssid}\"——跳过 specifier（零交互入网）")
+                    phaseHint = "已加入车机热点"
+                    ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
+                    appendLog(">>> WiFi 已就位（建议通道），ctrl 广播已重新注册，等待车机 ctrl 邀请")
+                    return@run
+                }
+                appendLog("WIFI: 建议短窗未连上——继续按「复用 → specifier → 建议」走完整入网")
+            }
             // 2) 入网（复用 → 静默 → 确认框，见 joinCarWifiOnce）
             when (val result = joinCarWifiSpecifier(wifi, shellReady)) {
                 is WifiCarPlayConnector.JoinResult.Joined -> Unit
@@ -3381,6 +3446,28 @@ object SessionController {
                 WifiCarPlayConnector.JoinResult.Unavailable -> retryJoinSpecifierSilently(wifi, shellReady)
             }
         }
+    }
+
+    /**
+     * 审计 B1：建议登记去重。同一 `(SSID,密码,安全类型)` 组合登记成功过就不再重复调
+     * `WifiManager.addNetworkSuggestions`（每轮多条 binder 调用 + 双条日志；系统虽返回
+     * ADD_DUPLICATE，但「建议网络是系统级自动连接」，登记一次长期有效）。SSID 或密码
+     * 变更（车机改热点）才重新登记。0x5703 与 0x4301 两条路径共用此处，specifier 路径
+     * 因此只在一处发起登记。
+     */
+    private fun registerSuggestionOnce(wifi: Iap2SenderSession.WifiConfiguration) {
+        if (!suggestionChannel.shouldRegister(wifi.ssid, wifi.passphrase, wifi.securityType)) {
+            appendLog("WIFI: 热点建议 \"${wifi.ssid}\" 本进程已登记过——跳过重复登记（审计 B1）")
+            return
+        }
+        if (wifiConnector?.registerSuggestion(wifi.ssid, wifi.passphrase, wifi.securityType) == true) {
+            suggestionChannel.recordRegistered(wifi.ssid, wifi.passphrase, wifi.securityType)
+        }
+    }
+
+    /** B2：本轮 specifier 每次失败都要计数（改道判据）；成功即清零。 */
+    private fun noteSpecifierResult(joined: Boolean) {
+        specifierConsecutiveFailures = if (joined) 0 else specifierConsecutiveFailures + 1
     }
 
     /**
@@ -3414,6 +3501,9 @@ object SessionController {
         }
         phaseHint = "正在加入车机热点 ${wifi.ssid}…（不影响移动数据）"
         val result = joinCarWifiOnce(connector, wifi, force)
+        // 审计 B2：specifier 的成败是改道判据的输入——连续失败次数在入口统一记账，
+        // 成功清零（失败后走建议关联短窗、不再 force 重试）。
+        noteSpecifierResult(result is WifiCarPlayConnector.JoinResult.Joined)
         if (result is WifiCarPlayConnector.JoinResult.Joined) {
             boundCarSsid = wifi.ssid
             if (wifiLinkLost) {
@@ -3697,6 +3787,9 @@ object SessionController {
                 isCancelled = { connectCancelled || budgetLeft() <= 0L },
             )
         silentJoinPolicy.recordResult(wifi.ssid, silent != null)
+        // 审计 B1/B2：建议真的连上过 = 建议通道已授权/生效。之后入网顺序收敛为
+        // 「复用 → 建议短窗 → specifier」，specifier 失败 1 次即改道（B2）。
+        if (silent != null) suggestionChannel.markAuthorized(wifi.ssid)
         if (silent != null) {
             appendLog(">>> 静默入网成功：\"${wifi.ssid}\" 已由系统自动连上并绑定（全程无弹框）")
             return WifiCarPlayConnector.JoinResult.Joined(silent)
@@ -3797,6 +3890,34 @@ object SessionController {
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
     ): Boolean {
+        // 审计 B2：建议通道已授权/已生效时，specifier Unavailable 多半是「系统确认框无人点」
+        // ——车上没人点屏，这条通道注定失败。失败 1 次即改走 awaitAssociation（建议关联）
+        // 短窗，不再 force 自动重试烧满 25s WiFi 总预算（实车证据：审计原文「每次绕过 5s
+        // 去重 force=true」连续 N 次）。保留 specifier 重试能力于「建议未授权」场景。
+        val authorized = suggestionChannel.isAuthorized(wifi.ssid)
+        if (authorized && !specifierFailoverPolicy.shouldRetrySpecifier(authorized, specifierConsecutiveFailures)) {
+            appendLog(
+                "WIFI: 建议通道已生效且 specifier 已失败——不再 force 自动重试（审计 B2）：" +
+                    "改等建议关联短窗（${SUGGESTION_SHORT_WINDOW_MS / 1000}s）",
+            )
+            val connector = wifiConnector
+            val adopted =
+                connector?.awaitAssociation(wifi.ssid, SUGGESTION_SHORT_WINDOW_MS) { connectCancelled }
+            if (adopted != null) {
+                boundCarSsid = wifi.ssid
+                phaseHint = "已加入车机热点"
+                ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
+                appendLog(">>> WiFi 已就位（建议关联短窗），ctrl 广播已重新注册")
+                return true
+            }
+            phaseHint = "未能加入车机热点——下一轮连接会自动再试"
+            settleWifiHint("建议关联短窗仍未加入 ${wifi.ssid}")
+            appendLog(
+                "WIFI: 建议关联短窗 ${SUGGESTION_SHORT_WINDOW_MS / 1000}s 内未成 \"${wifi.ssid}\"——" +
+                    "本轮到此为止，不打扰用户（不烧满 25s 预算）",
+            )
+            return false
+        }
         for (attempt in 1..SPECIFIER_AUTO_RETRY_TIMES) {
             if (connectCancelled) {
                 // 修复 #6：取消早退也要收口「加入热点中」（实车 00:24 卡住的同款残留）。
@@ -4002,12 +4123,28 @@ object SessionController {
     private var wifiSsidUnreadableLogged = false
 
     /**
+     * 「本机没有 shell 身份」的记忆位（审计 B3）：Shizuku 已移除后 `cmd wifi status`
+     * 恒失败，但旧实现每 5s 都要 spawn 一次 shell 进程、白等满 5s 超时才落到框架路径
+     * （保活期 5 分钟 = 60 次无效 shell）。首次失败即置位，本进程不再重试 shell。
+     */
+    @Volatile
+    private var shellWifiStatusUnavailable = false
+
+    /** 最近一次 WiFi 状态观察结果（B3：轮询循环复用，避免每 5s 重读）。 */
+    @Volatile
+    private var lastWifiStatus: Pair<Boolean, String?> = true to null
+
+    /**
      * WiFi 开关与当前连接的 SSID。
      *
-     * 两条来源，**先 shell 后框架**：
+     * 两条来源，**先 shell 后框架**（shell 有恒不可用记忆位，审计 B3）：
      *  1. `cmd wifi status`（要有 shell 身份，Shizuku/root 在时才有），输出形如
-     *     `Wifi is enabled` + `Wifi is connected to "Redmi K40"`；
+     *     `Wifi is enabled` + `Wifi is connected to "Redmi K40"`。**首次**失败即记住
+     *     「shell 恒不可用」，此后不再 spawn shell 进程——旧实现每 5s 白跑一次 5s
+     *     超时的 shell（2026-11-25 审计 B3：保活期 5 分钟 60 次无效调用）；
      *  2. [frameworkWifiStatus]：不需要任何特权，只要给了定位 / 附近设备权限。
+     *     它读的是 ConnectivityManager 的内存态（毫秒级），且有
+     *     `registerNetworkCallback` 的事件驱动兜底（见 [watchForPendingStartSession]）。
      *
      * 为什么必须补第 2 条（2026-11-07 别克 E2LB 现场）：Shizuku 移除后 `cmd wifi status`
      * 一律失败，于是这里永远返回「已开、SSID=null」，日志里一直写「Wi-Fi=已开但未连接任何
@@ -4015,15 +4152,21 @@ object SessionController {
      * 兜底路径靠 SSID 非空才会弹窗，读不到 SSID 等于这条路根本走不到（空等 5 分钟超时）。
      */
     private fun shellWifiStatus(): Pair<Boolean, String?> {
-        val result = SysShell.exec("cmd wifi status", 5_000L)
-        if (result.ok) {
-            val enabled = !result.output.contains("Wifi is disabled")
-            // 老 ROM 写 `connected to "X"`，新 ROM（13+）写 `SSID: "X"`——两种都收。
-            val ssid =
-                Regex("connected to \"(.*)\"").find(result.output)?.groupValues?.get(1)
-                    ?: Regex("SSID: \"(.*)\"").find(result.output)?.groupValues?.get(1)
-            if (!ssid.isNullOrEmpty()) return enabled to ssid
-            if (!enabled) return false to null
+        if (!shellWifiStatusUnavailable) {
+            val result = SysShell.exec("cmd wifi status", 5_000L)
+            if (result.ok) {
+                val enabled = !result.output.contains("Wifi is disabled")
+                // 老 ROM 写 `connected to "X"`，新 ROM（13+）写 `SSID: "X"`——两种都收。
+                val ssid =
+                    Regex("connected to \"(.*)\"").find(result.output)?.groupValues?.get(1)
+                        ?: Regex("SSID: \"(.*)\"").find(result.output)?.groupValues?.get(1)
+                if (!ssid.isNullOrEmpty()) return enabled to ssid
+                if (!enabled) return false to null
+            } else {
+                // 审计 B3：shell 路径恒不可用（无 Shizuku/root），记住后不再每 5s 重试。
+                shellWifiStatusUnavailable = true
+                appendLog("WIFI: cmd wifi status 不可用（无 shell 身份）——记住后不再重复尝试 shell（审计 B3）")
+            }
         }
         val (enabled, ssid) = frameworkWifiStatus()
         if (ssid == null && enabled && !wifiSsidUnreadableLogged) {
@@ -4219,7 +4362,23 @@ object SessionController {
                 if (pendingWatchGeneration.get() != generation) return@run
                 // 晚到 0x4301 已触发新一轮交接——观察任务让位。
                 if (sessionStarting) return@run
-                val (wifiEnabled, currentSsid) = shellWifiStatus()
+                // 审计 B3：WiFi 状态观察改事件驱动。wifiConnector 已挂 registerNetworkCallback
+                // （断线由 onLost 回调驱动，WifiCarPlayConnector.handleNetworkLost），这里的
+                // 5s 轮询不再每轮执行 shell/框架读——只做纯内存的 networkSnapshot（毫秒级），
+                // snapshot 读不到 SSID（无权限场景）时才低频兜底读一次框架状态（30s 一次，
+                // 兜底顺带接住「系统悄悄换网但没触发我们回调」的少数机型）。
+                if (tick % 6 == 1) {
+                    // 30s 一拍的低频兜底（诊断需要时才做完整读）。
+                    lastWifiStatus = shellWifiStatus()
+                }
+                val snapshotSsid =
+                    wifiConnector
+                        ?.networkSnapshot(lastWifiStatus.second)
+                        ?.associatedSsid
+                // snapshot 命中 SSID = 事件驱动路径已给出答案（内存 binder 读，零开销）；
+                // 没命中（手机没挂网 / 读不到 SSID）沿用低频兜底的结果。
+                val wifiEnabled = lastWifiStatus.first
+                val currentSsid = snapshotSsid ?: lastWifiStatus.second
                 // 每 30s 落一行：没有它，等待期在日志里只剩车机心跳，用户/排查都看不出在等什么。
                 if (tick % 6 == 0) {
                     val waited = (android.os.SystemClock.uptimeMillis() - watchStartedAt) / 1_000
@@ -5879,6 +6038,22 @@ object SessionController {
         val needPort = effective.airPlayPort <= 0
         if (!needHost && !needPort) return effective
 
+        // 审计 B4：进入 mDNS 等待**之前**先快连历史地址。lastKnown（跨轮保留）与
+        // ctrl 邀请来源地址在已保存目标场景几乎总是可用，且车机 IP 在同一热点会话内
+        // 不变——直接 TCP 连历史 IP:7000，~1.5s 快速超时，可连即直接用；不可连再走
+        // 完整 NSD 发现（NSD 保留为回退与失效更新路径）。实车证据：车机 mDNS 记录
+        // 闪断（onServiceLost「服务消失 CarPlay」）后旧实现等满 ENDPOINT_RESOLVE_WAIT_MS，
+        // mDNS 不稳定机型每轮白等 6~18s。
+        val historical = probeHistoricalEndpoint(effective, source)
+        if (historical != null) {
+            appendLog(
+                ">>> [$source] 历史端点 ${historical.host}:${historical.port} 快连可用（审计 B4）——跳过 mDNS 等待",
+            )
+            return effective.copy(
+                ipAddresses = if (needHost) listOf(historical.host) + effective.ipAddresses else effective.ipAddresses,
+                airPlayPort = if (needPort) historical.port else effective.airPlayPort,
+            )
+        }
         phaseHint = "mDNS 解析车机地址…"
         appendLog(">>> [$source] 0x4301 端点不完整（port=${effective.airPlayPort} ips=${effective.ipAddresses}），取 mDNS 车机 _airplay._tcp…")
         // 用常驻发现器的缓存（绑网时已开始后台发现，通常此时已命中）。
@@ -5920,6 +6095,37 @@ object SessionController {
      * IPv4 → 全局 IPv6 → 链路本地 IPv6 重排，顺序只影响同类型内部）。
      * 其余字段只在缺失时补（0x4301 的权威值不覆盖）。
      */
+    /**
+     * 审计 B4：端点解析前对「历史地址」做一次快速 TCP 探测。
+     *
+     * 候选顺序（可信度从高到低）：
+     *  1. ctrl 邀请来源地址 [invitePeerHost]（车机亲手连过我们，一手证据）；
+     *  2. mDNS 跨轮缓存 [CarPlayServiceBrowser.lastKnownEndpoint]（上轮解析过的车机地址）；
+     *  3. 端点自带的 IPv4（0x4301 常带一个可连地址）。
+     * 端口：端点已带端口用端口，否则 7000（AirPlay 固定约定）。
+     *
+     * @return 第一个可连的历史地址；全部失败返回 null（调用方回退 mDNS）。
+     */
+    private fun probeHistoricalEndpoint(
+        endpoint: Iap2SenderSession.CarPlayEndpoint,
+        source: String,
+    ): HistoricalEndpointProbe.ProbeHit? {
+        val port = if (endpoint.airPlayPort > 0) endpoint.airPlayPort else 7000
+        val candidates =
+            buildList {
+                invitePeerHost()?.let { add(it) }
+                endpointBrowser?.lastKnownEndpoint()?.host?.hostAddress
+                    ?.takeIf { EndpointHosts.isIpv4(it) && !EndpointHosts.isPlaceholder(it) }
+                    ?.let { add(it) }
+                addAll(EndpointHosts.candidates(endpoint.ipAddresses.filter { EndpointHosts.isIpv4(it) }))
+            }.distinct()
+        if (candidates.isEmpty()) return null
+        appendLog(
+            ">>> [$source] mDNS 等待前先快连历史地址（审计 B4）：${candidates.joinToString(" / ")}:$port（~1.5s 超时）",
+        )
+        return historicalEndpointProbe.probe(candidates, port)
+    }
+
     private fun mergeBrowserEndpoint(
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         info: android.net.nsd.NsdServiceInfo,
@@ -7991,7 +8197,27 @@ object SessionController {
             // 届时下面那条 specifier 请求会立刻拿到 onAvailable（网络已存在，
             // 系统不再要求确认），整条链路才能真正做到「上车即连」。
             val connector = wifiConnector
-            connector?.registerSuggestion(wifiConfig.ssid, wifiConfig.passphrase, wifiConfig.securityType)
+            // 审计 B1：0x4301 路径不再自己直接登记建议——与 0x5703 共用 registerSuggestionOnce
+            // 的去重（同一轮两条路各登记一次是实车日志里「双条已登记热点建议」的来源）。
+            connector?.let { registerSuggestionOnce(wifiConfig) }
+            // 审计 B1：建议通道已生效时入网顺序收敛为「复用 → 建议短窗 → specifier」——
+            // 建议网络是系统级自动连接，已授权场景 specifier 的确认框路径不该是首选。
+            if (connector != null && suggestionChannel.isAuthorized(wifiConfig.ssid)) {
+                appendLog(
+                    "WIFI[$source]: 建议通道已生效——先给系统关联一个短窗（${SUGGESTION_SHORT_WINDOW_MS / 1000}s），不重复登记",
+                )
+                val adopted =
+                    connector.awaitAssociation(wifiConfig.ssid, SUGGESTION_SHORT_WINDOW_MS) {
+                        connectCancelled || !ownsAttempt(attempt)
+                    }
+                if (adopted != null) {
+                    boundCarSsid = wifiConfig.ssid
+                    appendLog("WIFI[$source]: 建议通道短窗内已关联 \"${wifiConfig.ssid}\"——跳过 specifier（零交互入网）")
+                    continueWithNetwork(true)
+                    return@run
+                }
+                appendLog("WIFI[$source]: 建议短窗未连上——继续按「复用 → specifier → 建议」走完整入网")
+            }
             while (ownsAttempt(attempt)) {
                 // Shizuku 已移除：没有 shell 特权。
                 val shellReady = false
