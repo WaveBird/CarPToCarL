@@ -469,4 +469,79 @@ class AirPlayResourceStateTest {
         // 只写「借用 1 个」看不出是谁借的——车机借屏的动机全在 borrowID 里
         assertTrue(state.describe(), state.describe().contains("借用 phoneCall@解借1000"))
     }
+
+    /**
+     * 1.2.107 修复 A2 的判定输入：车机 take permanent 后「entity 可能被 requestUI
+     * 申请翻回手机，但 permanentEntity 仍是车机」——这层分离正是 fighting 的判定依据。
+     * 实车 194036：19:35:43 take permanent（永久=车机）→ 19:35:44 requestUI 申请
+     * acquired=true（entity=手机）→ 19:35:47 车机再 take 收回 → 19:35:50 拆链。
+     */
+    @Test
+    fun `车机 take permanent 后永久归属仍在车机——requestUI 申请成功也改变不了它`() {
+        val state = AirPlayResourceState()
+        // 19:35:43：车机 take permanent（transferType=1 takeConstraint=500）
+        state.applyCarChange(
+            mapOf<Any?, Any?>(
+                "resources" to
+                    listOf(
+                        mapOf<Any?, Any?>(
+                            "resourceID" to 1,
+                            "transferType" to 1,
+                            "takeConstraint" to 500,
+                            "transferPriority" to 500,
+                        ),
+                    ),
+            ),
+        )
+        assertFalse("车机接管后手机不持屏", state.phoneOwnsScreen)
+        assertTrue("永久归属在车机", state.screenPermanentOwnerIsCar)
+
+        // 19:35:44：requestUI 走 overrideBorrow 申请成功——entity 翻回手机
+        // （状态机的 claim() 会把永久归属也重置为手机；1.2.107 的 A2 防护因此必须
+        // 在**申请前**读永久归属快照，见 CarPlayResourceStreams.applyScreen。）
+        val acquired =
+            state.acquireScreen(
+                fromRequestUi = true,
+                respectBorrow = false,
+            ) { true }
+        assertTrue("申请发布成功（实车日志 acquired=true）", acquired)
+        assertTrue("entity 翻回手机", state.phoneOwnsScreen)
+        assertFalse("claim() 语义：申请成功后永久归属回到手机（车机随后用 changeModes 复述改回）", state.screenPermanentOwnerIsCar)
+
+        // 19:35:47：车机再 take permanent——永久归属翻回车机，fighting 复核据此拦下一轮
+        state.applyCarChange(
+            mapOf<Any?, Any?>(
+                "resources" to
+                    listOf(
+                        mapOf<Any?, Any?>(
+                            "resourceID" to 1,
+                            "transferType" to 1,
+                            "takeConstraint" to 500,
+                            "transferPriority" to 500,
+                        ),
+                    ),
+            ),
+        )
+        assertTrue("车机收回后永久归属在车机", state.screenPermanentOwnerIsCar)
+        assertFalse(state.phoneOwnsScreen)
+    }
+
+    @Test
+    fun `车机 transferType=2 归还后永久归属回到手机`() {
+        val state = AirPlayResourceState()
+        state.applyCarChange(
+            mapOf<Any?, Any?>(
+                "resources" to
+                    listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 1, "takeConstraint" to 500)),
+            ),
+        )
+        assertTrue(state.screenPermanentOwnerIsCar)
+        state.applyCarChange(
+            mapOf<Any?, Any?>(
+                "resources" to listOf(mapOf<Any?, Any?>("resourceID" to 1, "transferType" to 2)),
+            ),
+        )
+        assertTrue(state.phoneOwnsScreen)
+        assertFalse(state.screenPermanentOwnerIsCar)
+    }
 }

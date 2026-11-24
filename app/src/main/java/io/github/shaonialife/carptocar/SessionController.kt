@@ -5125,7 +5125,8 @@ object SessionController {
         val context = appContext?.applicationContext
         val secret = currentSharedSecret
         val started =
-            context != null && secret != null &&
+            context != null &&
+                secret != null &&
                 applyAudioOwnership(context, client, secret, true)
         appendLog(
             if (started) {
@@ -6541,7 +6542,8 @@ object SessionController {
                                 CTRL_INVITE_WAIT_MS,
                                 receiverControlled,
                                 effectiveEndpoint,
-                            ) && receiverControlled
+                            ) &&
+                            receiverControlled
                         ) {
                             // 没等到本轮新邀请就不连：保留发现与蓝牙监听，等车机邀请或回连再起一轮
                             phaseHint = "等待车机发出新的连接邀请"
@@ -7180,9 +7182,26 @@ object SessionController {
                                         "changeModes" -> resourceStreams?.reconcile()
 
                                         "requestUI" -> {
-                                            pendingScreenRequestFromCarUi.set(true)
-                                            appendLog("RESOURCE: 收到车机 requestUI，解除借用限制并申请取回主屏")
-                                            resourceStreams?.requestScreen(fromRequestUi = true)
+                                            val url =
+                                                (command["params"] as? Map<*, *>)
+                                                    ?.get("url")
+                                                    ?.toString()
+                                                    ?.trim()
+                                                    .orEmpty()
+                                            // 修复 A1（1.2.107，P2-12）：requestUI 去重冷却——同一 URL
+                                            // 3 秒内只处理第一次。实车 194036 日志 19:35:44.406 /
+                                            // 19:35:45.396 / 19:35:45.630 / 19:35:45.824——车机 HMI
+                                            // 重绘风暴 400ms 内连发 3 次 requestUI，每次都触发一轮
+                                            // 「让出→拿回」跳变，被车机读成归属争夺（fighting）。
+                                            // 判定抽在 RequestUiFightingGuard（可单测）。
+                                            if (requestUiDedupGuard.shouldProcessRequestUi(url)) {
+                                                pendingScreenRequestFromCarUi.set(true)
+                                                appendLog(
+                                                    "RESOURCE: 收到车机 requestUI，url=${url.ifEmpty { "(-)" }}" +
+                                                        "——解除借用限制并申请取回主屏",
+                                                )
+                                                resourceStreams?.requestScreen(fromRequestUi = true)
+                                            }
                                         }
 
                                         // C3：车机（配件侧）下发的昼夜状态——上游 1.2.79
@@ -8017,6 +8036,16 @@ object SessionController {
 
     @Volatile
     private var iapEventMessageCount = 0
+
+    /**
+     * requestUI 去重冷却（修复 A1，1.2.107）：跨会话复用同一把判定（3 秒内同一 URL 只处理
+     * 第一次）。判定逻辑与单测在 [RequestUiFightingGuard]——本轮 AirPlay 会话与 requestUI
+     * 处理共用，跳变层面的防护在 CarPlayResourceStreams 自己的 guard 实例里。
+     */
+    private val requestUiDedupGuard =
+        io.github.shaonialife.carptocar.airplay.RequestUiFightingGuard(
+            { android.os.SystemClock.elapsedRealtime() },
+        ) { message -> appendLog("RESOURCE: $message") }
 
     /**
      * 车机事件通道收到的命令条数（任何 `type` 都算）。

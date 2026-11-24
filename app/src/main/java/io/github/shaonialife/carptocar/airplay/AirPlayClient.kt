@@ -1000,6 +1000,16 @@ class AirPlayClient(
         synchronized(transportLock) {
             if (cancelled || if (event) eventCommandSocket !== owner else socket !== owner) return
             log("AIRPLAY: 远端${if (event) "事件" else "控制"}通道结束 - $reason")
+            if (!event && reason.contains("EOF") && sessionEstablished) {
+                // 1.2.107 归因提示（实车 194036：19:35:47 车机 take permanent 后 19:35:50
+                // 拆 BT 链路 + control EOF，车机 …caff 服务关闭、之后 4 分钟拨号全败）：
+                // EOF 若发生在主屏归属切换（take permanent / requestUI 拉锯）之后，
+                // 疑似车机对归属争夺（fighting）的拆链——检查 requestUI 处理。
+                log(
+                    "AIRPLAY: control EOF——若发生在主屏归属切换后，疑似车机对归属争夺的拆链，" +
+                        "检查 requestUI 处理（当前主屏归属：${resourceState.describe().substringBefore(' ')}）",
+                )
+            }
             if (sessionEstablished) cancelled = true
             closeTransport(local = false)
         }
@@ -1177,6 +1187,12 @@ class AirPlayClient(
 
     /** 主屏当前是否归手机（供交接/UI 判定；车机没声明归属时恒为 true）。 */
     val phoneOwnsScreen: Boolean get() = resourceState.phoneOwnsScreen
+
+    /**
+     * 主屏**永久**归属是否在车机（1.2.107 修复 A2）：requestUI 处理在决定要不要执行
+     * 「让出→拿回」前先复核这一位——车机刚 take permanent 时不跳变，避免 fighting。
+     */
+    val screenPermanentOwnerIsCar: Boolean get() = resourceState.screenPermanentOwnerIsCar
     val phoneOwnsAudio: Boolean get() = resourceState.phoneOwnsAudio
     val phoneBorrowsAudio: Boolean get() = resourceState.phoneBorrowsAudio
     val resourceDescription: String get() = resourceState.describe()

@@ -159,6 +159,17 @@ class AirPlayResourceState {
     /** 主屏当前是否归手机。旧行为（车机没声明）下恒为 true。 */
     val phoneOwnsScreen: Boolean get() = synchronized(lock) { resources.getValue(RESOURCE_SCREEN).entity == ENTITY_PHONE }
 
+    /**
+     * 主屏**永久**归属是否在车机（1.2.107 修复 A2）。
+     *
+     * 与 [phoneOwnsScreen] 的区别：手机按 requestUI 申请成功后 entity 会翻回手机，但
+     * `permanentEntity` 只有车机自己发 `transferType=2`（归还）才会变——实车 19:35:43
+     * 车机 take permanent 后「entity=手机 / 永久=车机」，这种状态下再执行让出拿回
+     * 就是归属争夺（fighting），实车 19:35:50 车机因此拆掉整条会话。
+     */
+    val screenPermanentOwnerIsCar: Boolean
+        get() = synchronized(lock) { resources.getValue(RESOURCE_SCREEN).permanentEntity == ENTITY_CAR }
+
     /** 主音频当前是否归手机。 */
     val phoneOwnsAudio: Boolean get() = synchronized(lock) { resources.getValue(RESOURCE_AUDIO).entity == ENTITY_PHONE }
 

@@ -31,7 +31,6 @@ internal class CarPlayResourceStreams(
     /** 单调时钟（只用于日志里的「存活多久 / 等了多久」，可注入便于单测）。 */
     private val nowMs: () -> Long = { android.os.SystemClock.elapsedRealtime() },
 ) {
-
     private val worker =
         Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "carplay-resource-streams").apply { isDaemon = true }
@@ -64,6 +63,19 @@ internal class CarPlayResourceStreams(
     private var streamStartedAtMs = 0L
     private var waitStartedAtMs = 0L
 
+    // ---- 1.2.107 requestUI fighting 防护（P2-12）----
+    // 实车 194036 日志 19:35:43 车机 take permanent 后，19:35:44.406–19:35:45.824
+    // 400ms 内 3 次 requestUI，我们每次都「让出→拿回」，19:35:47 车机再 take permanent、
+    // 19:35:50 拆 BT 链路 + control EOF——归属争夺（fighting）直接把会话吵死了。
+    // 状态与判定抽成 [RequestUiFightingGuard]（可单测），本类只做流启停编排。
+    private val fightingGuard = RequestUiFightingGuard(nowMs, log)
+
+    /** 本会话内禁用「让出→拿回」（guard 维护，调试/诊断可见）。 */
+    val surrenderRetakeBanned: Boolean get() = fightingGuard.surrenderRetakeBanned
+
+    /** 上次记录的永久归属（修复 B：只在「刚变成车机」那条沿打一次日志）。 */
+    private var lastKnownPermanentCar = false
+
     /** 车机持有主屏、视频暂停中（控制会话仍在）。 */
     @Volatile
     var screenPaused = initialSender == null
@@ -91,8 +103,30 @@ internal class CarPlayResourceStreams(
             if (fromRequestUi) screenRequestFromCarUi = true
         }
 
-    /** 车机改判资源或源端播放意图变化后对齐屏幕/音频流。 */
-    fun reconcile() = post {}
+    /**
+     * 车机改判资源或源端播放意图变化后对齐屏幕/音频流。
+     *
+     * 1.2.107 修复 A4：`changeModes` 到达时 AirPlayClient 已先 `applyCarChange` 更新归属，
+     * 这里顺带完成「让出拿回后等车机复述」的确认——复述仍是车机就计一次收回，连续
+     * 2 次本会话禁用让出拿回（见 [onCarEcho]）。
+     */
+    fun reconcile() =
+        post {
+            // 修复 B（1.2.107）：车机 take permanent（transferType=1 takeConstraint=500，如
+            // 倒车回收/HMI 切原生界面）时明确记录归属迁移——**不触发任何「申请回」动作**，
+            // 保持视频热备等车机 requestUI。实车 194036：19:35:43 take permanent 后
+            // requestUI 三连跳对抗，19:35:50 车机拆链 control EOF。
+            val permanentCarNow = client.screenPermanentOwnerIsCar
+            if (permanentCarNow && !lastKnownPermanentCar) {
+                log(
+                    "MODE: 主屏永久归属已变为车机（车机 HMI 切换/倒车回收，或本机主动「返回原车」）——" +
+                        "保持视频热备，等待车机 requestUI 或用户操作" +
+                        "（不做申请回，避免归属争夺；实车 19:35:43 take permanent → 19:35:50 拆链）",
+                )
+            }
+            lastKnownPermanentCar = permanentCarNow
+            fightingGuard.onCarEcho(permanentCarNow)
+        }
 
     fun close() {
         closed = true
@@ -124,12 +158,28 @@ internal class CarPlayResourceStreams(
     private fun applyScreen() {
         val fromCarUiNow = screenRequestFromCarUi
         var published = false
+        // 修复 A2/B1（1.2.107）：永久归属复核必须发生在**申请之前**——申请成功会把
+        // entity 翻回手机（1.2.106 实车 19:35:44.424 acquired=true），但不代表车机认账：
+        // 1.9s 后（19:35:47.504）它就再 take permanent 收回。申请前先取快照。
+        val permanentOwnerCarBeforeClaim = client.screenPermanentOwnerIsCar
         if (screenRequested && !client.phoneOwnsScreen) {
             // 实验开关打开时「尊重借用」：车机说有人在借（转向影像/倒车）就不去抢。
             // 旧行为 overrideBorrow=true 会在借用期间直接冲掉借用，车机随即把它夺回去，
             // 我们白付一轮 SETUP/RECORD。
-            published = client.acquireScreenResource(screenRequestFromCarUi, respectBorrow = keepScreenStreamOnTake)
-            log("MODE: 申请主屏 fromRequestUi=$screenRequestFromCarUi acquired=$published")
+            //
+            // 修复 B1：车机刚 take permanent（永久=车机）时，来自 requestUI 的申请被
+            // 「永久归属复核」拦下不执行——发出去也只会被车机一个往返夺回。
+            val blockedByPermanentCar = screenRequestFromCarUi && permanentOwnerCarBeforeClaim
+            published =
+                if (blockedByPermanentCar) {
+                    false
+                } else {
+                    client.acquireScreenResource(screenRequestFromCarUi, respectBorrow = keepScreenStreamOnTake)
+                }
+            log(
+                "MODE: 申请主屏 fromRequestUi=$screenRequestFromCarUi acquired=$published" +
+                    if (blockedByPermanentCar) "（车机永久持有中，不申请——等待车机 requestUI 或 HMI 操作）" else "",
+            )
         }
         screenRequested = false
         screenRequestFromCarUi = false
@@ -140,12 +190,33 @@ internal class CarPlayResourceStreams(
         // 全部无跳变，车机停在原车界面）。顺序刻意不重发 RECORD：这台车对
         // 重复 RECORD 过敏（补发后 1.79~2.03s 拆链）。
         if (fromCarUiNow && client.phoneOwnsScreen) {
-            // C1：返回值必须赋给 published（1.2.76 就是这么写的）。否则后面
-            // `if (!published) client.republishModes()` 会再发一次，车机收到
-            // 2→1→1 三次归属变化。
-            published = client.retakeScreenForUiRequest()
+            // requestUI 跳变判定抽到 [RequestUiFightingGuard]（1.2.107，P2-12）：
+            // 永久归属复核（A2）/ 跳变节流（A3）/ 收回禁用（A3）都在 guard 里，
+            // 这里只按判定结果编排。注意用**申请前**的永久归属快照——申请本身
+            // 会把 permanentEntity 翻回手机（状态机语义），但车机并没有认账。
+            when (fightingGuard.decideRetake(permanentOwnerCarBeforeClaim)) {
+                RequestUiFightingGuard.RetakeDecision.PROCEED -> {
+                    // C1：返回值必须赋给 published（1.2.76 就是这么写的）。否则后面
+                    // `if (!published) client.republishModes()` 会再发一次，车机收到
+                    // 2→1→1 三次归属变化。
+                    published = client.retakeScreenForUiRequest()
+                    // 修复 A4：跳变发布成功 ≠ 稳定。实车 19:35:44.541 拿回接受=true，
+                    // 1.9s 后（19:35:47.504）车机就再 take permanent 收回。确认要等
+                    // 车机下一次 changeModes 复述（guard.onCarEcho），确认前按
+                    // 「暂归手机（车机可能收回）」对待。
+                    fightingGuard.onRetakePublished()
+                    log(
+                        "MODE: requestUI 且主屏在本机——已执行让出再拿回跳变（ok=$published）+ 补关键帧" +
+                            if (published) " · 暂归手机（车机可能收回，等复述确认）" else "",
+                    )
+                }
+                else -> {
+                    // SKIP_*：不执行让出拿回（原因已由 guard 打日志），只补关键帧。
+                    // 永久归属在车机 / 节流窗口内 / 本会话已禁用——三种情况都纯等待。
+                    log("MODE: requestUI 跳变被 fighting 防护拦截——只补关键帧，纯等待")
+                }
+            }
             sender?.requestKeyFrame()
-            log("MODE: requestUI 且主屏在本机——已执行让出再拿回跳变（ok=$published）+ 补关键帧")
         }
         val owned = client.phoneOwnsScreen
         val warmAlive = screenStreaming && sender?.isRunning == true

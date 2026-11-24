@@ -62,6 +62,21 @@ object PersonalAudioClassifier {
 
     fun isAudioDeviceClass(deviceClass: Int?): Boolean = deviceClass != null && deviceClass in AUDIO_DEVICE_CLASSES
 
+    /**
+     * WiFi Direct 命名排除（1.2.107 修复 D）。
+     *
+     * `CX_*`（如 `CX_BTFC4BBCD57C61`）是车机 WiFi Direct（P2P）虚拟接口的命名，
+     * 不是蓝牙 RFCOMM 目标——它出现在已配对列表里（部分车机把 P2P 口也写进 bond），
+     * 但对它拨 `…caff` 只会得到 `read failed`。2026-11-24 实车 194036：19:36–19:38
+     * `BT-C: 连接 CX_BTFC4BBCD57C61 失败` 反复出现约 4 次，白白消耗退避轮次。
+     */
+    const val WIFIDIRECT_NAME_PREFIX = "cx_"
+
+    fun looksLikeWifiDirectInterface(name: String?): Boolean {
+        val lower = name?.trim()?.lowercase().orEmpty()
+        return lower.startsWith(WIFIDIRECT_NAME_PREFIX)
+    }
+
     fun looksLikePersonalAudioName(name: String?): Boolean {
         val lower = name?.trim()?.lowercase().orEmpty()
         if (lower.isEmpty()) return false
@@ -75,5 +90,5 @@ object PersonalAudioClassifier {
     fun looksLikePersonalAudio(
         deviceClass: Int?,
         name: String?,
-    ): Boolean = isAudioDeviceClass(deviceClass) || looksLikePersonalAudioName(name)
+    ): Boolean = isAudioDeviceClass(deviceClass) || looksLikePersonalAudioName(name) || looksLikeWifiDirectInterface(name)
 }

@@ -79,4 +79,26 @@ class PersonalAudioClassifierTest {
         assertFalse(PersonalAudioClassifier.looksLikePersonalAudioName("MBUX 29573"))
         assertFalse(PersonalAudioClassifier.looksLikePersonalAudioName("BMW 71280"))
     }
+
+    @Test
+    fun `WiFi Direct 接口名 CX_ 前缀被排除出拨号候选——2026-11-24 实车修复 D`() {
+        // 194036 日志 19:36–19:38：`BT-C: 连接 CX_BTFC4BBCD57C61 失败` 反复约 4 次。
+        // CX_* 是车机 WiFi Direct（P2P）虚拟接口命名，不是 RFCOMM/iAP2 目标。
+        assertTrue(PersonalAudioClassifier.looksLikeWifiDirectInterface("CX_BTFC4BBCD57C61"))
+        assertTrue(PersonalAudioClassifier.looksLikeWifiDirectInterface("cx_btfc4bbcd57c61"))
+        assertTrue(PersonalAudioClassifier.looksLikeWifiDirectInterface(" CX_BTFC4BBCD57C61 "))
+        // 只匹配前缀，不误伤车机名
+        assertFalse(PersonalAudioClassifier.looksLikeWifiDirectInterface("BMW 71280"))
+        assertFalse(PersonalAudioClassifier.looksLikeWifiDirectInterface("MBUX 29573"))
+        assertFalse(PersonalAudioClassifier.looksLikeWifiDirectInterface(null))
+        assertFalse(PersonalAudioClassifier.looksLikeWifiDirectInterface(""))
+        // 整链判定（looksLikePersonalAudio）也应把 CX_* 拒之门外
+        assertTrue(PersonalAudioClassifier.looksLikePersonalAudio(null, "CX_BTFC4BBCD57C61"))
+        assertTrue(
+            PersonalAudioClassifier.looksLikePersonalAudio(
+                android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_UNCATEGORIZED,
+                "CX_BTFC4BBCD57C61",
+            ),
+        )
+    }
 }
