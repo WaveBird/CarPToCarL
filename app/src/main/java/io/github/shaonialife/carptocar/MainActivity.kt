@@ -57,6 +57,7 @@ import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.legal.DisclaimerDialog
 import io.github.shaonialife.carptocar.legal.DisclaimerPrefs
 import io.github.shaonialife.carptocar.legal.needsDisclaimerAtLaunch
+import io.github.shaonialife.carptocar.net.NetworkReusePolicy
 import io.github.shaonialife.carptocar.session.ConnectionPreflight
 import io.github.shaonialife.carptocar.session.PermissionRepair
 import io.github.shaonialife.carptocar.ui.DarkMessageDialog
@@ -3026,12 +3027,17 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (closePicker) targetPicker?.dismiss()
         val previous = TargetDevicePrefs.get(this)
+        // 审计 E1（docs/flow-audit-20261125.md）：换目标设备时清掉动态网段兜底记忆——
+        // 旧目标的网段对新车没有意义，留着会让网关兜底拒绝正确复用（白 join 一次）。
+        if (previous != null && previous.address != device.address) {
+            NetworkReusePolicy.forgetSessionScopedPrefix()
+        }
         TargetDevicePrefs.set(this, TargetDevicePrefs.Target(device.address, name))
         log(
             "TARGET: 目标车机已设为「$name」(${device.address})" +
                 "——出站只连该设备、入站拒绝其它设备" +
                 if (previous != null && previous.address != device.address) {
-                    "（原目标「${previous.name}」）"
+                    "（原目标「${previous.name}」；动态网段兜底记忆已清，恢复静态默认）"
                 } else {
                     ""
                 },

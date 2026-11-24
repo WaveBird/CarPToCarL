@@ -593,6 +593,16 @@ class Iap2BluetoothClient(
                 android.os.SystemClock.uptimeMillis() + DISCOVERABLE_WINDOW_SECONDS * 1_000L
             return true
         }
+        // 审计 A1（docs/flow-audit-20261125.md）：已保存目标且已配对 → 免窗口。
+        // 车机走「回连」（它回连 …cafe 或接受本机拨号 …caff），CONNECTABLE 就够，
+        // 可发现窗口对这个场景不提供任何新信息。1.2.93 的「已配对在场不弹窗」与
+        // 1.2.94 的「bond+曾连通免弹」由此统一收进 directPolicy 同一判定入口
+        // （shouldRequestDiscoverableWindow），不再维护两套判断。
+        val savedTargetBonded = target != null && isSavedTargetBonded(adapter, target)
+        if (target != null && !directPolicy.shouldRequestDiscoverableWindow(savedTargetBonded)) {
+            log("BT-C: 已保存目标已配对——跳过可发现窗口请求（scanMode 保持 CONNECTABLE）")
+            return true
+        }
         if (target != null && targetBondedAndEverConnected(adapter, target)) {
             // 已配对且曾经连上：车机走「回连」路径，CONNECTABLE 就够，不弹窗打扰。
             return true
@@ -631,6 +641,21 @@ class Iap2BluetoothClient(
      * 「曾经成功」以 [sessionEverEstablished] 为准（进程内存活；进程重启后回退为
      * 「只查 bond」——重启后首配窗口多给一次，代价只是一次可跳过的弹窗）。
      */
+    /**
+     * 保存目标是否已在 [BluetoothAdapter.bondedDevices] 中命中（地址匹配）。
+     * 审计 A1（docs/flow-audit-20261125.md）的免窗口判据：只看 bond 存在与否，
+     * 不要求 `sessionEverEstablished`——进程重启后它回到 false，旧判据会在
+     * 「已配对+上次会话成功」的场景多打升级提示甚至多弹一次可跳过的系统窗。
+     */
+    @SuppressLint("MissingPermission")
+    private fun isSavedTargetBonded(
+        adapter: BluetoothAdapter,
+        target: TargetDevicePrefs.Target,
+    ): Boolean =
+        runCatching {
+            adapter.bondedDevices.any { TargetDevicePrefs.matches(target, it.address) }
+        }.getOrDefault(false)
+
     @SuppressLint("MissingPermission")
     private fun targetBondedAndEverConnected(
         adapter: BluetoothAdapter,
@@ -655,30 +680,49 @@ class Iap2BluetoothClient(
         var passiveFailRounds = 0
         /** 连续「没有有效会话」的轮数，用于 [RETRY_BACKOFF_MILLIS] 退避（连上即断也算）。 */
         var failStreak = 0
+        /** 免窗口日志只打一条（审计 A1）：false=还没打过，true=已打过，bond 解除时复位重打。 */
+        var directRoundDiscoverableSkipLogged = false
         while (running && generation.get() == myGeneration) {
             // ---- 修复 #3：可发现窗口续期 ----
             // 首配场景的窗口有寿命（300s 只覆盖两轮退避）；剩不足 60 秒（约一轮退避）
             // 就在轮首补一次请求，别让车机晚到时窗口已静默过期。后台模式照旧不弹窗，
             // 只累计失败轮数、到阈值打一次「请手动点启动连接」的升级提示。
+            //
+            // 审计 A1（docs/flow-audit-20261125.md）：续期与请求共用同一个免窗口判据
+            // （directPolicy.shouldRequestDiscoverableWindow，bonded 命中即免）——
+            // 已保存目标+已配对时车机走回连，每轮续期只提供 binder 成本不提供新信息。
             if (targetProvider() != null || !sessionEverEstablished) {
-                val now = android.os.SystemClock.uptimeMillis()
-                val windowLeft = discoverableWindowUntilMillis - now
-                if (windowLeft < DISCOVERABLE_RENEW_BEFORE_MILLIS) {
-                    val renewed =
-                        ensureDiscoverableWindow(targetProvider(), allowSystemDialog = interactiveStart)
-                    if (renewed) {
-                        backgroundDiscoverableFailRounds = 0
-                    } else if (!interactiveStart) {
-                        backgroundDiscoverableFailRounds++
-                        if (backgroundDiscoverableFailRounds == DISCOVERABLE_ESCALATE_ROUNDS &&
-                            !needsUserStartupHint
-                        ) {
-                            needsUserStartupHint = true
-                            log(
-                                "BT-C: ⚠ 后台已连续 $backgroundDiscoverableFailRounds 轮拿不到「可发现」窗口——" +
-                                    "首次配对（或车机重新扫描）需要本机可被发现，请在 App 点一次「启动连接」" +
-                                    "（会弹系统确认框）或到系统蓝牙设置打开可发现；仅回连（已配对）不受影响",
-                            )
+                val renewTarget = targetProvider()
+                val savedTargetBonded =
+                    renewTarget?.let {
+                        isSavedTargetBonded(adapter, it)
+                    } ?: false
+                if (!directPolicy.shouldRequestDiscoverableWindow(savedTargetBonded)) {
+                    if (!directRoundDiscoverableSkipLogged) {
+                        log("BT-C: 已保存目标已配对——跳过可发现窗口续期（scanMode 保持 CONNECTABLE）")
+                        directRoundDiscoverableSkipLogged = true
+                    }
+                } else {
+                    directRoundDiscoverableSkipLogged = false
+                    val now = android.os.SystemClock.uptimeMillis()
+                    val windowLeft = discoverableWindowUntilMillis - now
+                    if (windowLeft < DISCOVERABLE_RENEW_BEFORE_MILLIS) {
+                        val renewed =
+                            ensureDiscoverableWindow(targetProvider(), allowSystemDialog = interactiveStart)
+                        if (renewed) {
+                            backgroundDiscoverableFailRounds = 0
+                        } else if (!interactiveStart) {
+                            backgroundDiscoverableFailRounds++
+                            if (backgroundDiscoverableFailRounds == DISCOVERABLE_ESCALATE_ROUNDS &&
+                                !needsUserStartupHint
+                            ) {
+                                needsUserStartupHint = true
+                                log(
+                                    "BT-C: ⚠ 后台已连续 $backgroundDiscoverableFailRounds 轮拿不到「可发现」窗口——" +
+                                        "首次配对（或车机重新扫描）需要本机可被发现，请在 App 点一次「启动连接」" +
+                                        "（会弹系统确认框）或到系统蓝牙设置打开可发现；仅回连（已配对）不受影响",
+                                )
+                            }
                         }
                     }
                 }

@@ -67,8 +67,7 @@ class DirectConnectPolicy(
      * 直达路径本轮要不要先过 SDP 闸门：只有**首轮**查（拿诊断信息，实车 2026-11-23
      * 的误拉黑正说明 SDP 结论值得留档），之后一律跳过直接拨 …caff。
      */
-    fun shouldRunSdpGate(mode: CandidateMode): Boolean =
-        mode == CandidateMode.DIRECT && !directSdpChecked
+    fun shouldRunSdpGate(mode: CandidateMode): Boolean = mode == CandidateMode.DIRECT && !directSdpChecked
 
     /** 首轮 SDP 已做（无论结论 HAS/MISSING/UNKNOWN——显式目标 MISSING 只记日志不跳过）。 */
     fun noteDirectSdpDone() {
@@ -108,4 +107,20 @@ class DirectConnectPolicy(
      * 反复拨、还被断音频），用户明确要求「已保存目标就只连它」。
      */
     fun shouldEnableSoftFallback(hasSavedTarget: Boolean): Boolean = !hasSavedTarget
+
+    /**
+     * 可发现窗口（请求/续期）此刻是否还需要——审计 A1（`docs/flow-audit-20261125.md`）。
+     *
+     * 已保存目标且 `bondedDevices` 命中时，车机走「回连」路径（它回连 …cafe 或接受本机
+     * 拨号），CONNECTABLE 就够——可发现窗口对这个场景**不提供任何新信息**，每轮续期
+     * 只是重复 binder 调用，进程重启后还会因 `sessionEverEstablished=false` 多打
+     * 「请手动点启动连接」升级提示（实车 1.2.109 形态）。首配场景 bond 必然不在
+     * 已配对列表（未命中 → 照常请求），不会误伤首配弹窗能力。
+     *
+     * 1.2.93「已配对目标在场不弹窗」与 1.2.94「bond 在且曾连通免弹」两条旧判据由此
+     * 统一收进同一入口：bond 命中即免窗口（曾连通只是 bond 命中的子集）。
+     *
+     * @param targetBonded 保存目标是否在 `adapter.bondedDevices` 中命中（地址匹配）
+     */
+    fun shouldRequestDiscoverableWindow(targetBonded: Boolean): Boolean = !targetBonded
 }

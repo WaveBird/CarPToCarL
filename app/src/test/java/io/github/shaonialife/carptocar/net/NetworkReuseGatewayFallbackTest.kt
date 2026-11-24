@@ -90,4 +90,60 @@ class NetworkReuseGatewayFallbackTest {
         assertTrue(decision is Decision.Reuse)
         assertTrue(decision.reason.contains("来自上次成功 join"))
     }
+
+    // ---- 审计 E1（docs/flow-audit-20261125.md）：网段兜底记忆要有失效机制 ----
+
+    /** 会话收尾（retireSessionResources 调 forgetSessionScopedPrefix）→ 动态记忆复位。 */
+    @Test
+    fun `会话收尾后动态网段记忆复位`() {
+        NetworkReusePolicy.rememberSuccessfulJoinPrefix("10.174.189.66")
+        NetworkReusePolicy.forgetSessionScopedPrefix()
+        // 记忆清掉后网关兜底退回静态默认 172.16.222.：旧车机网段 10.174.189.x 不再命中。
+        val snapshot =
+            CarNetworkSnapshot(
+                expectedSsid = "AUDI-AID",
+                boundSsid = null,
+                associatedSsid = null,
+                hasBoundNetwork = false,
+                hasAddress = false,
+                gateway = "10.174.189.1",
+            )
+        val observation = CarNetworkReadiness.inspect(snapshot)
+        assertTrue(
+            "失效后旧网段不得再兜底复用",
+            NetworkReusePolicy.decide(observation, snapshot) is Decision.Rejoin,
+        )
+    }
+
+    /** 换目标设备（TargetDevicePrefs 变更调 forgetSessionScopedPrefix）→ 动态记忆复位。 */
+    @Test
+    fun `换目标设备后动态网段记忆复位`() {
+        NetworkReusePolicy.rememberSuccessfulJoinPrefix("10.174.189.66")
+        NetworkReusePolicy.forgetSessionScopedPrefix()
+        val snapshot =
+            CarNetworkSnapshot(
+                expectedSsid = "DIRECT-BMW 71280",
+                boundSsid = null,
+                associatedSsid = null,
+                hasBoundNetwork = false,
+                hasAddress = false,
+                gateway = "10.174.189.1",
+            )
+        val observation = CarNetworkReadiness.inspect(snapshot)
+        assertTrue(NetworkReusePolicy.decide(observation, snapshot) is Decision.Rejoin)
+        // 静态默认 172.16.222.（MGU-55-J 已验证值）保留：复位只清动态覆盖。
+        val bmwSnapshot =
+            CarNetworkSnapshot(
+                expectedSsid = "DIRECT-BMW 71280",
+                boundSsid = null,
+                associatedSsid = null,
+                hasBoundNetwork = false,
+                hasAddress = false,
+                gateway = "172.16.222.97",
+            )
+        val bmwObservation = CarNetworkReadiness.inspect(bmwSnapshot)
+        val bmwDecision = NetworkReusePolicy.decide(bmwObservation, bmwSnapshot)
+        assertTrue("静态默认兜底必须保留", bmwDecision is Decision.Reuse)
+        assertFalse(bmwDecision.reason.contains("来自上次成功 join"))
+    }
 }

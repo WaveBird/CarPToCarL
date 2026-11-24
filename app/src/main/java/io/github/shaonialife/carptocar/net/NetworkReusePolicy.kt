@@ -46,6 +46,30 @@ object NetworkReusePolicy {
                 }
     }
 
+    /**
+     * 会话收尾/换目标时失效动态网段记忆（审计 E1，`docs/flow-audit-20261125.md`）。
+     *
+     * 1.2.109 的网关兜底使用「上次成功 join 网段」记忆：用户换一台车（不同网段热点）
+     * 且新热点 SSID 不可读时，旧网段兜底会**拒绝正确复用**（gateway 不匹配旧前缀 →
+     * Rejoin，白 join 一次后才在新 join 成功时更新）。记忆是进程内存（进程重启本来就
+     * 清），这里补的正是「同进程跨车」这个洞：静态默认 `172.16.222.`（MGU-55-J 的
+     * 已验证值）保留不删——兜底只是退回静态默认，不会变空。`onInvalidated` 由调用方
+     * 注入（SessionController 传 appendLog），测试传 `{}`；缺省空表示不打日志。
+     */
+    fun forgetSessionScopedPrefix() {
+        val had = lastSuccessfulJoinPrefix != null
+        lastSuccessfulJoinPrefix = null
+        if (had) {
+            onInvalidated?.invoke(
+                "WIFI: 会话收尾/换目标——动态网段记忆已失效（网关兜底回退静态默认 $DEFAULT_CAR_IPV4_PREFIX）",
+            )
+        }
+    }
+
+    /** 失效时的一行日志（SessionController 注入 appendLog；测试传 null 关闭）。 */
+    @Volatile
+    var onInvalidated: ((String) -> Unit)? = null
+
     /** 仅供单测复位。 */
     internal fun resetRememberedPrefix() {
         lastSuccessfulJoinPrefix = null

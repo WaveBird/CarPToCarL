@@ -487,6 +487,9 @@ object SessionController {
         // 横屏兼容写入失败的原因（user build 限制 / shell 无权限）只有这里能落盘：
         // 车机侧设置面板的 toast 只给用户看，排查需要日志。
         AppOrientationCompat.diagSink = ::appendLog
+        // 审计 E1（docs/flow-audit-20261125.md）：动态网段记忆失效时落一行日志
+        // （见 forgetSessionScopedPrefix）。
+        NetworkReusePolicy.onInvalidated = ::appendLog
         // 主线程调用 shell 的告警（历史上两次真机 ANR 都源于此；HKS 下 logcat 不可读）
         SysShell.violationSink = ::appendLog
         installNowPlayingBridge()
@@ -1839,6 +1842,16 @@ object SessionController {
 
     private fun ownsAttempt(attempt: Int): Boolean = connectionAttempt.get() == attempt && !connectCancelled
 
+    /**
+     * join 前的蓝牙链路活性预检（1.2.109 修复 1 / 审计 E3，`docs/flow-audit-20261125.md`）。
+     *
+     * 0x5703 与 0x4301 两个入口共用：链路已死时凭据/端点已过时，再 join 只是白耗 25s
+     * WiFi 总预算（实车证据：`CarPToCarL-log-20261124-194036.txt` 19:32-19:35 多个
+     * 22-26s 短命会话）。iAP2 已迁到 WiFi 隧道（sessionActive）不算链路死，照常放行；
+     * bluetoothServer 未装配（controlLinkAlive 为 null）时不拦截，与旧行为一致。
+     */
+    private fun bluetoothLinkDeadForJoin(): Boolean = bluetoothServer?.controlLinkAlive() == false
+
     private fun requireAttempt(attempt: Int) {
         if (!ownsAttempt(attempt)) throw InterruptedException("连接轮次已取消或替换")
     }
@@ -3082,6 +3095,10 @@ object SessionController {
     private fun retireSessionResources() {
         val retired = currentClient
         currentClient = null
+        // 审计 E1（docs/flow-audit-20261125.md）：动态网段兜底记忆随会话失效——换一台
+        // 车（不同网段热点）且新热点 SSID 不可读时，旧网段兜底会拒绝正确复用
+        // （gateway 不匹配旧前缀 → 白 join 一次）。静态默认 172.16.222. 保留。
+        NetworkReusePolicy.forgetSessionScopedPrefix()
         resourceStreams?.close()
         resourceStreams = null
         retired?.cancelled = true
@@ -3244,7 +3261,7 @@ object SessionController {
         // 跳过 join 让 BT 监听尽快接住车机回连、拿新凭据。iAP2 已迁到 WiFi 隧道
         // （`SESSION 结束——…iAP2 已迁到 WiFi 隧道…继续推流`）不算链路死，照常放行。
         // bluetoothServer 未装配（controlLinkAlive 为 null）时不拦截：与旧行为一致。
-        if (bluetoothServer?.controlLinkAlive() == false) {
+        if (bluetoothLinkDeadForJoin()) {
             phaseHint = "蓝牙链路已断——等待车机重新回连…"
             appendLog(
                 "WIFI: 蓝牙链路已断——跳过本轮 join（凭据已过时），" +
@@ -7953,6 +7970,20 @@ object SessionController {
         // 端点先于 0x5703 到达（或上一轮换网失败）：同样走应用专属网络。
         // 不能再用「按 TRANSPORT_WIFI 盲绑当前任意 WiFi」——切网途中会绑到旧网络，
         // AirPlay 必然连不上，且会把无互联网热点留在系统默认网络里。
+        // 审计 E3（docs/flow-audit-20261125.md）：0x4301 端点交接路径与 0x5703 共用同一
+        // 链路预检（bluetoothLinkDeadForJoin）。0x4301 到达时若 BT 控制链路已死（车机
+        // 拆链后补发的晚到端点、或车机已退出 CarPlay），不烧 25s 入网预算——与 1.2.109
+        // 修的形态同源。iAP2 已迁 WiFi 隧道时放行的语义不变。预检放在
+        // connectBudget.enter(WIFI) 之前：跳过 join 时连 WIFI 阶段都计时不开始。
+        if (bluetoothLinkDeadForJoin()) {
+            phaseHint = "蓝牙链路已断——等待车机重新回连…"
+            appendLog(
+                "WIFI: 蓝牙链路已断——跳过本轮 join（凭据已过时），" +
+                    "等待车机重新回连下发新凭据（不消耗 25s WiFi 总预算）",
+            )
+            releaseAttempt(attempt)
+            return
+        }
         connectBudget.enter(ConnectStage.WIFI)
         Bg.run("wifi-join-on-endpoint") {
             // 第一步永远是登记「WiFi 建议」——幂等、不等结果、不弹框。

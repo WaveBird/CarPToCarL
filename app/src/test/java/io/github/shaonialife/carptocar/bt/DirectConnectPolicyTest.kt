@@ -105,4 +105,20 @@ class DirectConnectPolicyTest {
         assertTrue(policy.shouldRunSdpGate(mode))
         assertFalse(policy.shouldRecheckBonded())
     }
+
+    // ---- 审计 A1（docs/flow-audit-20261125.md）：已保存目标+已配对免可发现窗口 ----
+
+    /** 已保存目标且 bonded 命中 → 不请求/续期可发现窗口（车机走回连，CONNECTABLE 就够）。 */
+    @Test
+    fun `bonded 命中时不再请求可发现窗口`() {
+        val policy = DirectConnectPolicy()
+        assertFalse(policy.shouldRequestDiscoverableWindow(targetBonded = true))
+    }
+
+    /** bonded 未命中（首配场景，bond 必然不在列表）→ 照常请求窗口。 */
+    @Test
+    fun `bonded 未命中时照常请求可发现窗口`() {
+        val policy = DirectConnectPolicy()
+        assertTrue(policy.shouldRequestDiscoverableWindow(targetBonded = false))
+    }
 }
