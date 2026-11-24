@@ -513,6 +513,10 @@ class Iap2BluetoothClient(
         // 每轮启动重置 SDP 结论与跳过日志（新配对/换固件后重新探测）
         iap2ServiceCache.clear()
         skippedNoService.clear()
+        // 1.2.108：直达路径状态随 start() 重置——首轮 SDP 标志、连续 socket 失败
+        // 计数、bondedDevices 兜底复查标记、轮次计数都回到初值。
+        directPolicy.reset()
+        directRoundCount = 0
         // 修复 #16：软黑名单一并清空——上次进程内判「没有 iAP2 服务」的设备可能已经
         // 打开无线窗口（固件晚启动是常态），重启 start() 就该给它重新被探到的机会。
         noServiceSoft.clear()
@@ -751,14 +755,32 @@ class Iap2BluetoothClient(
                 sleepQuietly(2_000)
                 continue
             }
+            // 直达路径精简日志（可选 debug 级）：每轮一条，说明本轮跳过了列表扫描。
+            // directRound 判定提前到候选选取之前（1.2.108）。
+            val directRound = recoveryPeers == null &&
+                targetProvider() != null &&
+                !BtSessionGate.targetSoftFallback
+            if (directRound) {
+                directRoundCount++
+                log(
+                    "BT-C: 已保存目标直达拨号 ${targetProvider()?.name ?: "?"}" +
+                        "（跳过列表扫描，第 $directRoundCount 轮）",
+                )
+            }
             val candidates =
                 if (recoveryPeers == null) {
                     candidateDevices(adapter)
                 } else {
-                    val hit =
-                        candidateDevices(adapter).filter {
-                            it.address.equals(recoveryPeers, ignoreCase = true)
+                    // 1.2.108：恢复补连路径保持现状——它本来就走「按地址直达」语义。
+                    // 注意此处仍需 bondedDevices 匹配（直达目标可能被删配对后补连无意义），
+                    // 故显式以 LEGACY 模式取列表再按地址过滤，不经直达单元素路径。
+                    val bonded =
+                        try {
+                            adapter.bondedDevices?.toList().orEmpty()
+                        } catch (_: SecurityException) {
+                            emptyList()
                         }
+                    val hit = bonded.filter { it.address.equals(recoveryPeers, ignoreCase = true) }
                     if (hit.isEmpty()) {
                         log("BT-C: 要补连的控制链路目标「$recoveryPeers」已不在已配对列表——放弃补连")
                         BtSessionGate.clearLinkLost()
@@ -792,13 +814,29 @@ class Iap2BluetoothClient(
                 // 没有 iAP2 服务，连不上还白白被断 HFP/A2DP（设备级断开兜底更会波及
                 // 其它在线设备）——确认提供 …caff 才进入「断开+连接」流程。选定目标
                 // 的设备不过闸（用户显式指定，保持原路径与时序）。
+                // 1.2.108 直达路径：有保存目标且未软回退时，「SDP 闸门」只做**首轮一次**
+                // （拿诊断结论；2026-11-23 实车证据：SDP 结论值得留档，但每轮都查会误拉黑
+                // 真车机 3 分钟）。首轮之后一律跳过 SDP 直接拨 …caff。
+                // 显式目标 MISSING 仍只记日志不跳过（1.2.106 起的豁免，保持生效）。
                 val gate =
                     if (targetProvider() == null || BtSessionGate.targetSoftFallback) {
                         // 软回退（目标连不上、放开限制）也过闸：否则会把已配对的耳机、
                         // 蓝牙键盘（AB Shutter3）、音箱全试一遍，既断别人的音频又拖慢
                         // 重试节奏（2026-10-26 雪铁龙日志实测）。
                         awaitIap2Service(device)
+                    } else if (directRound && !directPolicy.directSdpChecked) {
+                        val result = awaitIap2Service(device)
+                        // 无论结论如何，首轮只此一次：后续轮不再做 SDP 查询。
+                        directPolicy.noteDirectSdpDone()
+                        if (result == Iap2Service.MISSING) {
+                            log(
+                                "BT-C: 直达首轮 SDP：目标「$name」明确不含 iAP2 服务——按显式目标豁免，" +
+                                    "照常拨号（SDP 缓存可能陈旧；固件晚开无线窗口是常态）",
+                            )
+                        }
+                        result
                     } else {
+                        // 直达第 2 轮起（或非直达的显式目标）：跳过 SDP，直接拨。
                         Iap2Service.HAS
                     }
                 if (gate == Iap2Service.MISSING) {
@@ -932,13 +970,49 @@ class Iap2BluetoothClient(
                 }
             }
             if (connected == null) {
+                // 1.2.108 直达路径：连续 N 轮拨号全部 `read failed/socket closed`（链路层
+                // 失败）才做一次 bondedDevices 兜底复查——典型场景是用户在系统设置里把
+                // 保存的目标删除了配对，直达路径不查列表不会自己发现。复查结果只打
+                // 日志供诊断，**不影响直达路径继续尝试**（2026-11-24 19:31 实车：
+                // bondedDevices 快照瞬时残缺曾让旧实现误判「目标不在列表」空转 6 秒，
+                // 所以这里绝不能因为复查为空就停拨）。
+                if (directRound) {
+                    val allSocketFailed =
+                        lastConnectError?.contains("read failed", ignoreCase = true) == true ||
+                            lastConnectError?.contains("socket closed", ignoreCase = true) == true
+                    directPolicy.noteRoundOutcome(allSocketFailed)
+                    if (directPolicy.shouldRecheckBonded()) {
+                        val bondedNow =
+                            runCatching { adapter.bondedDevices?.toList().orEmpty() }.getOrDefault(emptyList())
+                        val stillBonded =
+                            bondedNow.any { TargetDevicePrefs.matches(targetProvider()!!, it.address) }
+                        val verdict =
+                            if (stillBonded) {
+                                "仍在已配对列表（链路层失败另有原因）"
+                            } else {
+                                "已不在已配对列表（可能被用户在系统设置删除配对）"
+                            }
+                        log(
+                            "BT-C: 直达拨号已连续 ${directPolicy.bondedRecheckAfterRounds} 轮 read failed/socket closed" +
+                                "——兜底复查 bondedDevices：目标$verdict——仅记录，直达路径继续尝试",
+                        )
+                    }
+                }
                 // 目标连续连不上 → 放开目标限制（见 BtSessionGate.targetSoftFallback）。
                 // 只在「用户指定了目标」时计数，且只降级一次。
                 // 补连控制链路期间（recoveryPeers != null）不计数：那不是「这次坐的是另一台车」，
                 // 放开限制只会让补连轮次去拨耳机/音箱，白白浪费恢复窗口。
+                // 1.2.108：软回退（目标连续失败后放开目标限制、去试其它已配对设备）
+                // **仅当没有保存目标时**才允许启用——有保存目标时永不尝试其它设备
+                // （实车 WF-SP700N 教训：放开限制后索尼耳机被当车机候选反复拨、还被断
+                // 音频）。用户确认：已保存目标就只连它，连不上是车机状态问题，不是
+                // 「该换一台设备连」的信号。
+                // 旧行为（1.2.107 及以前）在有保存目标时也会启用软回退，现按
+                // [DirectConnectPolicy.shouldEnableSoftFallback] 收口。
                 if (recoveryPeers == null &&
                     targetProvider() != null &&
-                    !BtSessionGate.targetSoftFallback
+                    !BtSessionGate.targetSoftFallback &&
+                    directPolicy.shouldEnableSoftFallback(hasSavedTarget = targetProvider() != null)
                 ) {
                     targetFailRounds++
                     if (targetFailRounds >= TARGET_FALLBACK_ROUNDS) {
@@ -1065,12 +1139,48 @@ class Iap2BluetoothClient(
     }
 
     /**
+     * 1.2.108「已保存目标直达连接」决策内核（可单测，见 [DirectConnectPolicy]）。
+     * 每次 start() 重置（首轮 SDP 标志 / 连续 socket 失败计数 / 复查标记）。
+     */
+    private val directPolicy = DirectConnectPolicy()
+
+    /** 直达路径的轮次计数（start() 重置；用于精简日志「第 n 轮」）。 */
+    private var directRoundCount = 0
+
+    /**
      * 候选设备：优先 SDP 缓存里带配件端 UUID 的已配对设备；
      * 缓存缺失时退化为全部已配对设备（connect 时的 SDP 查询会自行过滤）。
      * 指定了目标车机时**只返回该设备**（用户配对了多台车机时避免误连）。
+     *
+     * ## 1.2.108：已保存目标 → 直达路径（不查 bondedDevices）
+     *
+     * 旧行为每轮重新遍历 `bondedDevices` 再过滤，实车代价（2026-11-23/24 证据）：
+     *  - 真车机被 SDP 误判拉黑 3 分钟（`SDP 明确不含 iAP2 服务`）；
+     *  - `bondedDevices` 快照瞬时残缺（19:31）→ 误判「目标不在已配对列表」空转 6 秒；
+     *  - 17PM 配对了多台设备，每轮全部白查。
+     *
+     * 现在 targetProvider 有保存目标且未软回退时，**直接用目标 MAC
+     * `getRemoteDevice` 构造单元素列表返回**——不读 bondedDevices、不做列表过滤。
+     * 手机对未配对地址调 `getRemoteDevice` 是合法的（拨号会失败但不会崩），
+     * 而实际场景目标必然已配对；bondedDevices 复查降级为连续多轮 socket 失败后的
+     * 兜底诊断（见 [connectLoop] 里 directPolicy.shouldRecheckBonded 的调用处）。
      */
     @SuppressLint("MissingPermission")
     private fun candidateDevices(adapter: android.bluetooth.BluetoothAdapter): List<BluetoothDevice> {
+        // 直达路径：有保存目标且未软回退时直接 getRemoteDevice，不碰 bondedDevices
+        // （用户确认：已选定并保存目标时不应再轮询列表——像 iPhone 一样直奔目标地址）。
+        val target = targetProvider()
+        if (target != null &&
+            !BtSessionGate.targetSoftFallback &&
+            directPolicy.candidateMode(
+                hasSavedTarget = true,
+                softFallbackActive = BtSessionGate.targetSoftFallback,
+                forAddress = null,
+            ) == DirectConnectPolicy.CandidateMode.DIRECT
+        ) {
+            // 精简日志已在 connectLoop 轮首统一打（每轮一条），这里不再重复。
+            return listOf(adapter.getRemoteDevice(target.address))
+        }
         val bonded =
             try {
                 adapter.bondedDevices?.toList().orEmpty()
