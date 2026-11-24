@@ -66,6 +66,30 @@ class Iap2BluetoothServer(
          * 见 [BtSocketClosePool] 的类注释。
          */
         private val closePool = BtSocketClosePool()
+
+        /**
+         * 「这条 RFCOMM 链路此刻算不算活着」——纯判定（不碰 Android API，单测可覆盖），
+         * 0x5703 到手时的 join 预检用（1.2.109 修复 1）。
+         *
+         * 实车证据（2026-11-24 晚 `CarPToCarL-log-20261124-194036.txt`）：join 失败或
+         * WiFi 未就绪时 iAP2 会话仍挂着、车机在等，约 22s 后车机不耐烦拆链
+         * （19:32-19:35 多个 22-26s 短命会话），之后一切重来。链路已死时再发起 join
+         * 只是白白消耗 25s WiFi 总预算——凭据已经过时，新一轮必须等车机重连、重发
+         * 0x5703。
+         *
+         * 判定两层：
+         *  - iAP2 已迁到 WiFi 隧道（`sessionActive=true`，日志
+         *    `SESSION 结束——…iAP2 已迁到 WiFi 隧道…继续推流`）→ 放行。那是无线
+         *    CarPlay 的正常交接，RFCOMM 断开不是链路死。
+         *  - 其余场景：通道不存在 / 没就绪 / 引擎已终结（socket closed 或 EOF 已登记）
+         *    → 死；通道活着 → 放行。
+         */
+        fun controlLinkAlive(channel: Iap2LinkChannel?): Boolean =
+            if (BtSessionGate.sessionActive) {
+                true
+            } else {
+                channel != null && channel.isAlive && BtSessionGate.iap2Ready
+            }
     }
 
     private var serverSocket: AtomicReference<BluetoothServerSocket?> = AtomicReference(null)
@@ -338,6 +362,19 @@ class Iap2BluetoothServer(
                 },
             )
         }
+    }
+
+    /**
+     * 实例入口：取当前控制通道交给 [Companion.controlLinkAlive] 判活。
+     * 0x5703 到手时的 join 预检（1.2.109 修复 1）调这里。
+     */
+    fun controlLinkAlive(): Boolean {
+        if (!running) return false
+        val channel =
+            synchronized(channelLock) {
+                activeChannel?.takeIf { BtSessionGate.ownsControl(it) }
+            }
+        return Companion.controlLinkAlive(channel)
     }
 
     /** 主动结束当前 BT 控制会话（不影响监听）。用于 AirPlay 配对前复现控制通道退役状态。 */

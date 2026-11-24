@@ -2686,6 +2686,9 @@ object SessionController {
                     // 网络一就绪就改口：入网流程还要收尾（绑定后的 ctrl 广播重注册、
                     // 门闸记账），但「连没连上热点」这一刻就有答案了。见 phaseHint 注释。
                     connector.onReady = { ssid, _, ip ->
+                        // 修复 2（1.2.109）：记住「真正连上」时的网段——网关兜底判定用
+                        // （上次成功 join 的网段比静态默认 172.16.222. 更可信）
+                        NetworkReusePolicy.rememberSuccessfulJoinPrefix(ip)
                         if (HotspotHint.isJoining(phaseHintValue)) {
                             phaseHint = HotspotHint.ready(ip)
                             appendLog(
@@ -3234,6 +3237,21 @@ object SessionController {
             appendLog("0x5703 冗余凭据（会话推流中）——保持现有 WiFi 绑定与 ctrl 广播不变")
             return
         }
+        // 修复 1（1.2.109）——join 前的蓝牙链路活性预检。实车证据：2026-11-24 晚
+        // `CarPToCarL-log-20261124-194036.txt`，join 失败 / WiFi 未就绪时 iAP2 会话
+        // 还挂着、车机在等，约 22s 后车机拆链、之后一切重来（19:32-19:35 多个 22-26s
+        // 短命会话）。链路已死时凭据已经过时，再 join 只是白耗 25s WiFi 总预算；
+        // 跳过 join 让 BT 监听尽快接住车机回连、拿新凭据。iAP2 已迁到 WiFi 隧道
+        // （`SESSION 结束——…iAP2 已迁到 WiFi 隧道…继续推流`）不算链路死，照常放行。
+        // bluetoothServer 未装配（controlLinkAlive 为 null）时不拦截：与旧行为一致。
+        if (bluetoothServer?.controlLinkAlive() == false) {
+            phaseHint = "蓝牙链路已断——等待车机重新回连…"
+            appendLog(
+                "WIFI: 蓝牙链路已断——跳过本轮 join（凭据已过时），" +
+                    "等待车机重新回连下发新凭据（不消耗 25s WiFi 总预算）",
+            )
+            return
+        }
         ssidSink?.invoke(wifi.ssid)
         lastWifiPsk = wifi.passphrase
         // 完整凭据留给「网络被动断开后自动重绑」用（见 onCarWifiLost）
@@ -3431,8 +3449,12 @@ object SessionController {
         where: String,
         waitForAddress: Boolean = true,
     ): android.net.Network? {
-        val observation = CarNetworkReadiness.inspect(connector.networkSnapshot(expectedSsid))
-        val decision = NetworkReusePolicy.decide(observation)
+        val snapshot = connector.networkSnapshot(expectedSsid)
+        val observation = CarNetworkReadiness.inspect(snapshot)
+        // 修复 2（1.2.109）：SSID 读不到（位置服务关闭）时原判「手机上没有任何 WiFi
+        // 网络 → 重新入网」。实车 194036：手机全程在 172.16.222.105（车机热点网段），
+        // 却每轮误判重 join。这里把快照一并递给判定器，ABSENT 时由网关兜底救回。
+        val decision = NetworkReusePolicy.decide(observation, snapshot)
         if (NetworkReusePolicy.shouldLog(decision)) {
             appendLog("WIFI[$where] " + NetworkReusePolicy.describe(decision))
         }

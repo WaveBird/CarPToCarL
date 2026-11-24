@@ -20,6 +20,37 @@ object NetworkReusePolicy {
     /** 等 DHCP 给出地址的上限。超过就别等了，交给完整入网流程重来。 */
     const val WAIT_FOR_ADDRESS_MILLIS = 3_000L
 
+    /**
+     * 车机热点网段前缀（/24 前 3 段）。实车 2026-11-24：手机全程拿 `172.16.222.105`，
+     * 车机固定为 `172.16.222.97`（mDNS/ctrl 邀请多方印证）。静态默认值可被
+     * [rememberSuccessfulJoinPrefix] 覆盖——上次**真正连上**的网段比默认值更可信
+     * （不同车机网段不同）。
+     */
+    const val DEFAULT_CAR_IPV4_PREFIX = "172.16.222."
+
+    @Volatile
+    private var lastSuccessfulJoinPrefix: String? = null
+
+    /**
+     * 记一次「真正成功 join」后的本机 IPv4 网段前缀（`172.16.222.` 形态，/24）。
+     * 由调用方在 join 成功、拿到地址时喂进来（喂 null 清除）。
+     */
+    fun rememberSuccessfulJoinPrefix(localIpv4: String?) {
+        lastSuccessfulJoinPrefix =
+            localIpv4
+                ?.takeIf { it.count { c -> c == '.' } == 3 }
+                ?.let { base ->
+                    val parts = base.trim().split('.')
+                    val octets = parts.mapNotNull { it.toIntOrNull() }
+                    if (octets.size == 4 && octets.all { it in 0..255 }) parts.take(3).joinToString(".") + "." else null
+                }
+    }
+
+    /** 仅供单测复位。 */
+    internal fun resetRememberedPrefix() {
+        lastSuccessfulJoinPrefix = null
+    }
+
     sealed interface Decision {
         /** 一句话「为什么这么判」，直接进日志（与 UI 共用）。 */
         val reason: String
@@ -46,15 +77,56 @@ object NetworkReusePolicy {
         ) : Decision
     }
 
-    fun decide(observation: CarNetworkReadiness.Observation): Decision =
-        when (observation.state) {
-            CarNetworkReadiness.State.READY -> Decision.Reuse(observation.detail)
-            CarNetworkReadiness.State.ADOPT -> Decision.AdoptNow(observation.detail)
-            CarNetworkReadiness.State.NOT_READY ->
-                Decision.WaitForAddress(observation.detail, WAIT_FOR_ADDRESS_MILLIS)
-            CarNetworkReadiness.State.WRONG_NETWORK -> Decision.Rejoin(observation.detail)
-            CarNetworkReadiness.State.ABSENT -> Decision.Rejoin(observation.detail)
-        }
+    fun decide(observation: CarNetworkReadiness.Observation): Decision = decide(observation, null)
+
+    /**
+     * 判定入口（保留原 [decide] 单参签名——调用点很多，不破坏）：多带一份快照，
+     * SSID 全读不到时才有机会走网关兜底。
+     *
+     * 优先级：READY/ADOPT/WAIT/WRONG_NETWORK 原语义不动（它们不依赖 SSID 可读性）；
+     * **只有** [CarNetworkReadiness.State.ABSENT]（原判「手机上没有任何 WiFi 网络」）
+     * 且快照确认 SSID 全都读不到（位置服务关闭的典型形态）时，才试网关兜底。
+     *
+     * 实车证据（2026-11-24 晚 `194036`）：手机全程在 `172.16.222.105`（车机热点网段，
+     * 网关=车机自己），却因 SSID 读不到每轮被判「手机上没有任何 WiFi 网络 → 重新入网」，
+     * 白白重 join。
+     */
+    fun decide(
+        observation: CarNetworkReadiness.Observation,
+        snapshot: CarNetworkSnapshot?,
+    ): Decision {
+        val base =
+            when (observation.state) {
+                CarNetworkReadiness.State.READY -> Decision.Reuse(observation.detail)
+                CarNetworkReadiness.State.ADOPT -> Decision.AdoptNow(observation.detail)
+                CarNetworkReadiness.State.NOT_READY ->
+                    Decision.WaitForAddress(observation.detail, WAIT_FOR_ADDRESS_MILLIS)
+                CarNetworkReadiness.State.WRONG_NETWORK -> Decision.Rejoin(observation.detail)
+                CarNetworkReadiness.State.ABSENT -> Decision.Rejoin(observation.detail)
+            }
+        if (base !is Decision.Rejoin || observation.state != CarNetworkReadiness.State.ABSENT) return base
+        val shot = snapshot ?: return base
+        // SSID 读得到而判成 ABSENT 是真没连（兜底只服务「SSID 不可读」这一种形态）
+        if (!shot.ssidUnknown) return base
+        return gatewayFallback(shot) ?: base
+    }
+
+    /**
+     * 网关兜底（1.2.109 修复 2，私有——不改任何调用点接口）：SSID 不可读、但默认网络
+     * 的网关 IP 落在车机网段——这台手机几乎必然挂在车机热点上（车机热点网关=车机自己，
+     * 车机是热点里唯一在 7000/5001 端口上应答的设备）。按「已在车机热点」处理，
+     * 走 READY 复用分支。
+     */
+    private fun gatewayFallback(snapshot: CarNetworkSnapshot): Decision? {
+        val gateway = snapshot.gateway?.takeIf { it.isNotBlank() && !EndpointHosts.isPlaceholder(it) } ?: return null
+        val remembered = lastSuccessfulJoinPrefix
+        val prefix = remembered ?: DEFAULT_CAR_IPV4_PREFIX
+        if (!gateway.startsWith(prefix)) return null
+        return Decision.Reuse(
+            "SSID 不可读但网关判定已在车机热点（gateway=$gateway，网段 $prefix" +
+                if (remembered != null) "，来自上次成功 join）" else "）——复用现有网络，跳过重新入网",
+        )
+    }
 
     /** 这条判定值不值得写进日志（`Reuse` 的常态复用不刷屏，由调用方自己补一行）。 */
     fun shouldLog(decision: Decision): Boolean = decision !is Decision.Reuse
