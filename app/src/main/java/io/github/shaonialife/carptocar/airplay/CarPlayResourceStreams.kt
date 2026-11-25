@@ -110,7 +110,7 @@ internal class CarPlayResourceStreams(
      * 这里顺带完成「让出拿回后等车机复述」的确认——复述仍是车机就计一次收回，连续
      * 2 次本会话禁用让出拿回（见 [onCarEcho]）。
      */
-    fun reconcile() =
+    fun reconcile(fromCarScreenChange: Boolean = false) =
         post {
             // 修复 B（1.2.107）：车机 take permanent（transferType=1 takeConstraint=500，如
             // 倒车回收/HMI 切原生界面）时明确记录归属迁移——**不触发任何「申请回」动作**，
@@ -125,7 +125,10 @@ internal class CarPlayResourceStreams(
                 )
             }
             lastKnownPermanentCar = permanentCarNow
-            fightingGuard.onCarEcho(permanentCarNow)
+            // 仅车机涉及主屏资源的 changeModes 才喂给 onCarEcho，避免纯音频切换或本机播放意图洗白计数。
+            if (fromCarScreenChange) {
+                fightingGuard.onCarEcho(permanentCarNow)
+            }
         }
 
     fun close() {
@@ -157,12 +160,13 @@ internal class CarPlayResourceStreams(
 
     private fun applyScreen() {
         val fromCarUiNow = screenRequestFromCarUi
+        val wasOwnedBeforeApply = client.phoneOwnsScreen
         var published = false
         // 修复 A2/B1（1.2.107）：永久归属复核必须发生在**申请之前**——申请成功会把
         // entity 翻回手机（1.2.106 实车 19:35:44.424 acquired=true），但不代表车机认账：
         // 1.9s 后（19:35:47.504）它就再 take permanent 收回。申请前先取快照。
         val permanentOwnerCarBeforeClaim = client.screenPermanentOwnerIsCar
-        if (screenRequested && !client.phoneOwnsScreen) {
+        if (screenRequested && !wasOwnedBeforeApply) {
             // 实验开关打开时「尊重借用」：车机说有人在借（转向影像/倒车）就不去抢。
             // 旧行为 overrideBorrow=true 会在借用期间直接冲掉借用，车机随即把它夺回去，
             // 我们白付一轮 SETUP/RECORD。
@@ -189,7 +193,7 @@ internal class CarPlayResourceStreams(
         // CarPlay 界面（2026-11-22 15:49 实测：合并时误删此分支后 18 次 requestUI
         // 全部无跳变，车机停在原车界面）。顺序刻意不重发 RECORD：这台车对
         // 重复 RECORD 过敏（补发后 1.79~2.03s 拆链）。
-        if (fromCarUiNow && client.phoneOwnsScreen) {
+        if (fromCarUiNow && wasOwnedBeforeApply && client.phoneOwnsScreen) {
             // requestUI 跳变判定抽到 [RequestUiFightingGuard]（1.2.107，P2-12）：
             // 永久归属复核（A2）/ 跳变节流（A3）/ 收回禁用（A3）都在 guard 里，
             // 这里只按判定结果编排。注意用**申请前**的永久归属快照——申请本身

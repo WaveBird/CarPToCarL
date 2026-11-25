@@ -50,8 +50,9 @@ internal class RequestUiFightingGuard(
     private var lastRetakeJumpAtMs = -1L
     private var retakeOverturnedCount = 0
     private var retakeAwaitingCarEcho = false
+    private var bannedAtMs = -1L
 
-    /** 连续 2 次「拿回成功但车机改判收回」后本会话禁用让出拿回。 */
+    /** 连续 2 次「拿回成功但车机改判收回」后进入禁用冷却（超过 [RETAKE_BAN_COOLDOWN_MS] 后自愈解禁）。 */
     @Volatile
     var surrenderRetakeBanned = false
         private set
@@ -73,10 +74,17 @@ internal class RequestUiFightingGuard(
             return false
         }
         lastHandledByUrl[key] = now
-        // 防御：URL 种类有限，超出就清一轮，免得被未知 URL 撑大。
+        // 防御：超出上限时只淘汰已过期的条目（而非 clear 全部），保留仍在冷却中的 URL。
+        // 旧实现 clear() 会把尚在冷却期的 URL 也一并清掉，导致去重窗口被击穿。
         if (lastHandledByUrl.size > MAX_TRACKED_URLS) {
-            lastHandledByUrl.clear()
-            lastHandledByUrl[key] = now
+            val expiredBefore = now - REQUEST_UI_DEDUPE_WINDOW_MS
+            lastHandledByUrl.entries.removeAll { it.value < expiredBefore }
+            // 淘汰后仍然超限（极端情况：短时间内涌入 >8 个不同 URL 且全都在冷却中），
+            // 移除最早的那个，确保不会无限增长。
+            if (lastHandledByUrl.size > MAX_TRACKED_URLS) {
+                val oldest = lastHandledByUrl.entries.minByOrNull { it.value }
+                oldest?.let { lastHandledByUrl.remove(it.key) }
+            }
         }
         return true
     }
@@ -89,12 +97,21 @@ internal class RequestUiFightingGuard(
      *   transferType=2 才会变——这正是 fighting 的判定输入）。
      */
     fun decideRetake(screenPermanentOwnerIsCar: Boolean): RetakeDecision {
-        if (surrenderRetakeBanned) return RetakeDecision.SKIP_BANNED
+        val now = nowMs()
+        if (surrenderRetakeBanned) {
+            if (bannedAtMs >= 0L && now - bannedAtMs >= RETAKE_BAN_COOLDOWN_MS) {
+                surrenderRetakeBanned = false
+                retakeOverturnedCount = 0
+                bannedAtMs = -1L
+                log("requestUI 让出拿回禁用已满 ${RETAKE_BAN_COOLDOWN_MS / 1000}s 冷却——自动解禁，恢复正常切屏判断")
+            } else {
+                return RetakeDecision.SKIP_BANNED
+            }
+        }
         if (screenPermanentOwnerIsCar) {
             log("requestUI 时主屏永久归属在车机——不执行让出拿回（避免 fighting），等待车机复述或 HMI 操作")
             return RetakeDecision.SKIP_PERMANENT_CAR
         }
-        val now = nowMs()
         val sinceLast = if (lastRetakeJumpAtMs < 0) Long.MAX_VALUE else now - lastRetakeJumpAtMs
         if (sinceLast < RETAKE_JUMP_MIN_INTERVAL_MS) {
             log(
@@ -136,7 +153,10 @@ internal class RequestUiFightingGuard(
                         ""
                     },
             )
-            if (retakeOverturnedCount >= RETAKE_BAN_THRESHOLD) surrenderRetakeBanned = true
+            if (retakeOverturnedCount >= RETAKE_BAN_THRESHOLD) {
+                surrenderRetakeBanned = true
+                bannedAtMs = nowMs()
+            }
             return true
         }
         retakeOverturnedCount = 0
@@ -153,6 +173,9 @@ internal class RequestUiFightingGuard(
 
         /** 修复 A3：两次让出拿回跳变之间的最小间隔。 */
         const val RETAKE_JUMP_MIN_INTERVAL_MS = 1_500L
+
+        /** 禁用跳变后的自愈冷却时间：避免整趟行程永久无法通过车机点击 CarPlay 切回。 */
+        const val RETAKE_BAN_COOLDOWN_MS = 60_000L
 
         private const val MAX_TRACKED_URLS = 8
     }

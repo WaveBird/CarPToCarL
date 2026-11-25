@@ -347,6 +347,7 @@ class Iap2BluetoothServer(
         } catch (error: IOException) {
             log("SESSION 失败: ${error.message}")
         } finally {
+            val remoteLoss = !channel.closedLocally
             synchronized(channelLock) {
                 if (activeChannel === channel) {
                     activeChannel = null
@@ -355,6 +356,10 @@ class Iap2BluetoothServer(
                 }
             }
             channel.close()
+            // 入站蓝牙在 AirPlay 交接前被车机拆链：同样登记车机侧冷却窗口，避免出站 Client 立刻顶上撞 15s 媒体断开超时。
+            if (remoteLoss && !BtSessionGate.sessionActive) {
+                BtSessionGate.noteRemoteDisconnectAt()
+            }
             // 两条完全不同的撤退路径，日志必须能分辨（否则用户以为「蓝牙连上就断 = App 有 bug」）：
             //  - sessionActive=true：AirPlay 已在 WiFi 上跑起来，接收端把 iAP2 迁到控制通道
             //    隧道（VirtualIap2Link）后**主动关掉 RFCOMM**。WinPlay 1.2.4 实测：

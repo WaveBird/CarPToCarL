@@ -220,6 +220,19 @@ object ConnectionPreflight {
     private var lastLoggedAtMillis = 0L
 
     /**
+     * D1 修复：inspect() 结果短期缓存（与日志去重 [REPEAT_QUIET_MILLIS] 同窗口）。
+     *
+     * 14 项检查都是系统 API 或 shell 读取——重连循环里多次 log() 调用在 20 秒内
+     * 重复跑所有检查没有意义（蓝牙开关 / 权限 / 位置服务在秒级时间窗内不会变化）。
+     * 缓存同一份 Report，只在签名过期后才重新 inspect。
+     */
+    @Volatile
+    private var cachedReport: Report? = null
+
+    @Volatile
+    private var cachedReportAtMillis = 0L
+
+    /**
      * 体检并落日志（同类结论 20 秒内只打一行摘要，避免重连循环刷屏）。
      *
      * 调用点：`MainActivity.ensureBluetoothReady`（用户点连接的前置检查，也是权限
@@ -229,9 +242,14 @@ object ConnectionPreflight {
         context: Context,
         sink: (String) -> Unit,
     ): Report {
-        val report = inspect(context)
-        val signature = report.signature()
         val now = SystemClock.uptimeMillis()
+        // D1：20 秒内使用缓存的 Report，不重新跑 14 项检查。
+        val report = cachedReport?.takeIf { now - cachedReportAtMillis < REPEAT_QUIET_MILLIS }
+            ?: inspect(context).also {
+                cachedReport = it
+                cachedReportAtMillis = now
+            }
+        val signature = report.signature()
         if (signature == lastSignature && now - lastLoggedAtMillis < REPEAT_QUIET_MILLIS) {
             sink("PREFLIGHT: 与上次相同——${report.headline()}")
             return report

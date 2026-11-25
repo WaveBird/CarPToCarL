@@ -517,6 +517,7 @@ class Iap2BluetoothClient(
         // 计数、bondedDevices 兜底复查标记、轮次计数都回到初值。
         directPolicy.reset()
         directRoundCount = 0
+        lastRoundGotEndpoint = false
         // 修复 #16：软黑名单一并清空——上次进程内判「没有 iAP2 服务」的设备可能已经
         // 打开无线窗口（固件晚启动是常态），重启 start() 就该给它重新被探到的机会。
         noServiceSoft.clear()
@@ -1072,6 +1073,8 @@ class Iap2BluetoothClient(
                 // 依据：今晚实车 6 次成功全是车机主动连入（L293/474/632/800/1001/1353），
                 // 主动拨 6 败 0 成——MGU 这类车机只认自己发起的建链，SDP 有没有 …caff
                 // 不该是切被动的唯一门槛。补连控制链路期间不切（恢复窗口别花在干等）。
+                // 本轮拨号未建立任何连接：复位上一轮端点标记，确保连续失败后能正常切入被动等待窗口。
+                lastRoundGotEndpoint = false
                 if (recoveryPeers == null && (sdpLookupFailures > 0 || !lastRoundGotEndpoint)) {
                     passiveFailRounds++
                     if (passiveFailRounds >= PASSIVE_FALLBACK_ROUNDS) {
@@ -1094,8 +1097,9 @@ class Iap2BluetoothClient(
                 continue
             }
             if (generation.get() != myGeneration) {
-                // stop() 与 connect() 成功竞争：本线程已过期，不建会话
-                currentSocket.getAndSet(null)?.let { runCatching { it.close() } }
+                // stop() 与 connect() 成功竞争：本线程已过期，只关自己的 connected，绝不误关新世代的 currentSocket
+                runCatching { connected.close() }
+                currentSocket.compareAndSet(connected, null)
                 return
             }
             val sessionStartedAt = android.os.SystemClock.uptimeMillis()
@@ -1489,6 +1493,10 @@ class Iap2BluetoothClient(
         // 递增世代：即便有线程卡在 connect()，事后也会因世代不符自杀，不会在下次启动时复活
         generation.incrementAndGet()
         BtSessionGate.clearLinkLost()
+        // E2 修复：stop() 时复位软回退态，避免下次启动沿用上一次的降级决策。
+        // 场景：上次连的是 B 车、目标 A 连不上触发软回退；本次重新启动连接时
+        // 目标 A 已在范围内，但软回退仍为 true，出站不再优先目标、入站也不再拒绝非目标。
+        BtSessionGate.targetSoftFallback = false
         detachCurrentSession()
         thread?.interrupt()
         thread = null

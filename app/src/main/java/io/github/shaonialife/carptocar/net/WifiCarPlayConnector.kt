@@ -258,18 +258,33 @@ class WifiCarPlayConnector(
         val result = AtomicReference<Network?>(null)
         val unavailable = AtomicBoolean(false)
         val readyReported = AtomicBoolean(false)
+        val timedOutOrCancelled = AtomicBoolean(false)
         val newCallback =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    val bound = connectivityManager.bindProcessToNetwork(network)
-                    boundNetwork.set(network)
-                    result.set(network)
-                    log("WiFi: 已加入应用专属网络 \"$ssid\"（$network bindProcessToNetwork=$bound）——不影响其它应用联网")
-                    // 旧网络的监听到此为止：绑定已经换到新的这条，断线改由本回调负责
-                    if (keptCallback != null && keptCallback !== this) {
-                        runCatching { connectivityManager.unregisterNetworkCallback(keptCallback) }
+                    val acceptedByLock =
+                        synchronized(this@WifiCarPlayConnector) {
+                            if (timedOutOrCancelled.get() || callback.get() !== this) {
+                                false
+                            } else {
+                                val bound = connectivityManager.bindProcessToNetwork(network)
+                                log("WiFi: 已加入应用专属网络 \"$ssid\"（$network bindProcessToNetwork=$bound）——不影响其它应用联网")
+                                if (!bound) {
+                                    false
+                                } else {
+                                    boundNetwork.set(network)
+                                    result.set(network)
+                                    // 旧网络的监听到此为止：绑定已经换到新的这条，断线改由本回调负责
+                                    if (keptCallback != null && keptCallback !== this) {
+                                        runCatching { connectivityManager.unregisterNetworkCallback(keptCallback) }
+                                    }
+                                    true
+                                }
+                            }
+                        }
+                    if (acceptedByLock) {
+                        reportReady(network)
                     }
-                    reportReady(network)
                     latch.countDown()
                 }
 
@@ -325,10 +340,17 @@ class WifiCarPlayConnector(
             state = awaitJoin(latch, SystemClock.uptimeMillis() + graceMillis, isCancelled)
         }
         if (state < 0) {
+            synchronized(this) { timedOutOrCancelled.set(true) }
             restoreOrRelease(newCallback, keptNetwork, keptCallback)
             return JoinResult.Unavailable
         }
-        val network = result.get()
+        val network =
+            synchronized(this) {
+                result.get() ?: run {
+                    timedOutOrCancelled.set(true)
+                    null
+                }
+            }
         if (network == null) {
             val window =
                 if (graceMillis > 0) {

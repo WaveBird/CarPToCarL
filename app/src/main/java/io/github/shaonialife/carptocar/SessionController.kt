@@ -832,6 +832,20 @@ object SessionController {
     private var lastPositionLogAtMs = 0L
 
     /**
+     * C2 修复：0x5001 实际发包的最小间隔（毫秒）。
+     *
+     * 变化驱动（歌名变化 → pushNowPlayingAll）与逐秒补推（pushNowPlayingPosition）
+     * 两条通道可能在同一时刻同时触发。如果 pushNowPlayingAll 刚发了一帧，
+     * 50ms 后 pushNowPlayingPosition 又发一帧——内容几乎完全相同，纯冗余。
+     * 这里用一个全局最小间隔把它们合并：500ms 内的第二次发送直接跳过。
+     */
+    @Volatile
+    private var lastNowPlayingSentAtMs = 0L
+
+    /** C2：两次 0x5001 发送之间的最小间隔。 */
+    private const val NOW_PLAYING_MIN_INTERVAL_MS = 500L
+
+    /**
      * 只推「播放位置」的 0x5001（约每秒一次）。
      *
      * 与 [pushNowPlayingAll] 的区别：不改内容去重键、不刷每行日志、只走 WiFi 隧道
@@ -842,10 +856,13 @@ object SessionController {
         // 设备的直接诱因;冻结期间车机侧进度停在暂停那一刻,与真实体验一致。
         if (mediaSessionPaused) return
         val now = android.os.SystemClock.elapsedRealtime()
+        // C2 节流：与 pushNowPlayingAll 共享最小间隔，避免变化驱动刚发、补推又发。
+        if (now - lastNowPlayingSentAtMs < NOW_PLAYING_MIN_INTERVAL_MS) return
         if (now - lastPositionLogAtMs >= 10_000L) {
             lastPositionLogAtMs = now
             appendLog("CARLIFE: 进度 ${currentElapsedMs()}ms → 静默补推 0x5001（每秒）")
         }
+        lastNowPlayingSentAtMs = now
         currentClient?.pushNowPlaying(quiet = true)
     }
 
@@ -883,16 +900,20 @@ object SessionController {
         val np = buildNowPlaying(includeArtwork = false) ?: return
         val key = "${np.title}|${np.artist}"
         if (key == lastPushedNowPlayingKey) return
-        lastPushedNowPlayingKey = key
         val client = currentClient
         val tunnelReady = client?.canSendNowPlaying() == true
         if (tunnelReady) {
+            lastPushedNowPlayingKey = key
+            // C2：标记发送时刻，让逐秒补推在短窗内不重复发。
+            lastNowPlayingSentAtMs = android.os.SystemClock.elapsedRealtime()
             // 隧道就绪：BT 侧不再补发（消除「未发出 → 又从 BT 发」的矛盾）。
             client?.pushNowPlaying()
             return
         }
         val btReady = BtSessionGate.hasActiveControl
         if (btReady) {
+            lastPushedNowPlayingKey = key
+            lastNowPlayingSentAtMs = android.os.SystemClock.elapsedRealtime()
             appendLog("IAPLINK: 隧道未就绪（NEGOTIATING/未识别），降级 BT 推送 0x5001（歌名=${np.title ?: "?"}）")
             bluetoothServer?.pushNowPlaying()
             bluetoothClient?.pushNowPlaying()
@@ -1969,9 +1990,13 @@ object SessionController {
     @Volatile
     private var pendingEndpointUpdate: Iap2SenderSession.CarPlayEndpoint? = null
 
-    /** 用户取消连接：配对线程在关键检查点看到后中止（mDNS/配对等待无法中途打断，粒度秒级）。 */
+    /** 取消当前连接轮次（用户取消或 BT 链路断开）：配对线程在关键检查点看到后中止。 */
     @Volatile
     var connectCancelled: Boolean = false
+
+    /** 用户显式取消或断开（区别于 BT 断链：BT 断链仅中止旧轮次，不应封锁车机 WiFi 邀请与自动重试）。 */
+    @Volatile
+    private var userCancelled: Boolean = false
 
     /**
      * 本轮会话是否已经被**真实结束**（车机关掉事件通道 / 推流线程收尾）。
@@ -2079,6 +2104,7 @@ object SessionController {
 
     /** 取消「连接中」：停链路 + 置取消标志，卡在错误网络/等待回连时用户可主动脱身。 */
     fun cancelConnecting(context: Context) {
+        userCancelled = true
         connectCancelled = true
         appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路")
         disconnect(context)
@@ -2495,7 +2521,7 @@ object SessionController {
      * 继续怼只会刷屏并把 CarLife 引擎反复踢下线。
      */
     private fun scheduleConnectRetry(reason: String) {
-        if (connectCancelled || !sessionWanted || isStreaming()) return
+        if (userCancelled || !sessionWanted || isStreaming()) return
         val target = lastSessionTarget ?: return
         var delay = 0L
         var attempt = 0
@@ -2535,7 +2561,7 @@ object SessionController {
                     appendLog("RETRY: 等待期间已有新一轮接手（车机邀请/用户操作）——本次重试作废")
                     return@run
                 }
-                if (connectCancelled || !sessionWanted || isStreaming() || sessionStarting) {
+                if (userCancelled || !sessionWanted || isStreaming() || sessionStarting) {
                     appendLog("RETRY: 条件已变（取消/正在连/已出画面）——跳过本次重试")
                     return@run
                 }
@@ -2557,7 +2583,7 @@ object SessionController {
      * 推流中的邀请只记录、不重建（见 [onCtrlInviteWhileStreaming]）。
      */
     private fun onCtrlInvite(receiverId: String?) {
-        if (connectCancelled) return
+        if (userCancelled) return
         if (isStreaming()) {
             onCtrlInviteWhileStreaming(receiverId)
             return
@@ -2608,7 +2634,7 @@ object SessionController {
         }
         appendLog("CTRL: 车机邀请到达（receiver=${receiverId ?: "?"}）且当前空闲——立即发起一轮连接")
         Bg.run("ctrl-invite-connect") {
-            if (connectCancelled || !sessionWanted || isStreaming()) return@run
+            if (userCancelled || !sessionWanted || isStreaming()) return@run
             onCarPlayEndpoint(target.endpoint, "车机 ctrl 邀请触发", onCurrentWifi = target.onCurrentWifi)
         }
     }
@@ -2897,6 +2923,7 @@ object SessionController {
      * 幂等：已有会话时 BT 组件的 start() 自行短路，不会双开。
      */
     fun startConnection(context: Context) {
+        userCancelled = false
         connectCancelled = false
         // 新一轮 = 新的一致性审计：清空上一轮的问题清单，并把输出口接到本控制器的
         // appendLog（logcat + 文件 + 界面三路都走它，用户导出日志即带走整份清单）。
@@ -2996,6 +3023,7 @@ object SessionController {
             return
         }
         ensure(context)
+        userCancelled = false
         connectCancelled = false
         sessionWanted = true
         compatSuppressed = false
@@ -3055,7 +3083,9 @@ object SessionController {
 
     private fun disconnectNow(context: Context) {
         val hadProjection = CarPlayService.mediaProjection != null
-        // 用户终态：解冻恢复不得再自动把会话拉起来
+        // 用户终态：解冻恢复不得再自动把会话拉起来，同时打断 WEP 等待等轮询并禁止最后补投拉起
+        userCancelled = true
+        connectCancelled = true
         sessionWanted = false
         // 兼容模式的常开监听也一并停在这里；记下「用户叫停过」，
         // 否则看门狗 30 秒后又把监听挂回来（用户会以为断开没生效）
@@ -3312,6 +3342,14 @@ object SessionController {
         lastWifiPsk = wifi.passphrase
         // 完整凭据留给「网络被动断开后自动重绑」用（见 onCarWifiLost）
         lastCarWifi = wifi
+        // C5 修复：新凭据到达 = 车机重新回连了，之前的「放弃」状态不再成立。
+        // 否则 pendingWaitGaveUp=true 阻塞 watchForPendingStartSession 入口，
+        // WiFi 侧无观察者、BT 侧仍在拨号——状态不同步空转、恢复慢一拍。
+        if (pendingWaitGaveUp) {
+            pendingWaitGaveUp = false
+            pendingWaitBudgetStartedAt = 0L
+            appendLog("C5: 新凭据到达，清除 pendingWaitGaveUp——WiFi 观察者可以重新启动")
+        }
         // 审计 B1：车机换热点名/换密码（0x5703 重新下发）时，上一条 SSID 的授权记忆
         // 不再可信——清掉，让建议通道按新凭据重新走「登记 → 等授权」。
         if (lastSuggestionSsid != null && lastSuggestionSsid != wifi.ssid) {
@@ -3434,8 +3472,9 @@ object SessionController {
                 }
                 appendLog("WIFI: 建议短窗未连上——继续按「复用 → specifier → 建议」走完整入网")
             }
-            // 2) 入网（复用 → 静默 → 确认框，见 joinCarWifiOnce）
-            when (val result = joinCarWifiSpecifier(wifi, shellReady)) {
+            // 2) 入网（复用 → 静默 → 确认框，见 joinCarWifiOnce），全流程共享 25s 总预算
+            val budgetDeadlineMillis = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS
+            when (val result = joinCarWifiSpecifier(wifi, shellReady, budgetDeadlineMillis = budgetDeadlineMillis)) {
                 is WifiCarPlayConnector.JoinResult.Joined -> Unit
 
                 WifiCarPlayConnector.JoinResult.Unsupported -> {
@@ -3443,7 +3482,8 @@ object SessionController {
                     legacyJoinCarWifi(wifi, shellReady)
                 }
 
-                WifiCarPlayConnector.JoinResult.Unavailable -> retryJoinSpecifierSilently(wifi, shellReady)
+                WifiCarPlayConnector.JoinResult.Unavailable ->
+                    retryJoinSpecifierSilently(wifi, shellReady, budgetDeadlineMillis)
             }
         }
     }
@@ -3493,6 +3533,7 @@ object SessionController {
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
         force: Boolean = false,
+        budgetDeadlineMillis: Long = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS,
     ): WifiCarPlayConnector.JoinResult {
         val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
         if (shellReady) {
@@ -3500,7 +3541,7 @@ object SessionController {
             if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
         }
         phaseHint = "正在加入车机热点 ${wifi.ssid}…（不影响移动数据）"
-        val result = joinCarWifiOnce(connector, wifi, force)
+        val result = joinCarWifiOnce(connector, wifi, force, budgetDeadlineMillis)
         // 审计 B2：specifier 的成败是改道判据的输入——连续失败次数在入口统一记账，
         // 成功清零（失败后走建议关联短窗、不再 force 重试）。
         noteSpecifierResult(result is WifiCarPlayConnector.JoinResult.Joined)
@@ -3615,6 +3656,7 @@ object SessionController {
         connector: WifiCarPlayConnector,
         wifi: Iap2SenderSession.WifiConfiguration,
         force: Boolean,
+        budgetDeadlineMillis: Long = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS,
     ): WifiCarPlayConnector.JoinResult {
         // 复用判定（不再只看 `boundCarSsid` 这本账，见 tryReuseCarNetwork）：
         // 「已绑定且就绪」「已关联只差绑定」都算复用成功；「关联了但没地址」会先等一小会儿；
@@ -3696,7 +3738,7 @@ object SessionController {
                             if (adopted != null) {
                                 WifiCarPlayConnector.JoinResult.Joined(adopted)
                             } else {
-                                joinSpecifierThenSuggestion(connector, wifi)
+                                joinSpecifierThenSuggestion(connector, wifi, budgetDeadlineMillis)
                             }
                         joined = r is WifiCarPlayConnector.JoinResult.Joined
                         r
@@ -3728,14 +3770,14 @@ object SessionController {
     private fun joinSpecifierThenSuggestion(
         connector: WifiCarPlayConnector,
         wifi: Iap2SenderSession.WifiConfiguration,
+        budgetDeadlineMillis: Long = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS,
     ): WifiCarPlayConnector.JoinResult {
         appendLog(
             ">>> 以应用专属网络加入 \"${wifi.ssid}\"（不保存为系统 WiFi，其它应用继续走 4G/5G）" +
                 "；总预算 ${WIFI_JOIN_TOTAL_BUDGET_MS / 1_000}s（修复 #7：对齐车机 27s 窗口）",
         )
-        val joinStartedAt = android.os.SystemClock.uptimeMillis()
 
-        fun budgetLeft(): Long = (WIFI_JOIN_TOTAL_BUDGET_MS - (android.os.SystemClock.uptimeMillis() - joinStartedAt)).coerceAtLeast(0L)
+        fun budgetLeft(): Long = (budgetDeadlineMillis - android.os.SystemClock.uptimeMillis()).coerceAtLeast(0L)
         // 修复 #7：每层等待一律不超过总预算剩余——超时/宽限不再各自为政地叠加
         // （旧组合 15+20+12+2×5 ≈ 144s，每一轮都注定撞上车机 27s 拆链）。
         val specifierBudget = minOf(SPECIFIER_JOIN_TIMEOUT_MS, budgetLeft())
@@ -3816,11 +3858,22 @@ object SessionController {
         )
     }
 
+    /**
+     * `cmd wifi list-networks` 是否已被证实不可用（Shizuku 移除后 shell 恒失败）。
+     *
+     * D3 修复：首次执行失败后记住结果，后续调用直接跳过——不再每次 join 白等 5 秒。
+     * 进程级缓存足够：shell 权限不会在运行期突然恢复。
+     */
+    @Volatile
+    private var shellListNetworksFailed = false
+
     /** 查系统已保存的、SSID 与目标完全一致的网络 id（`cmd wifi list-networks`）。 */
     private fun savedNetworkIds(ssid: String): List<Int> {
+        if (shellListNetworksFailed) return emptyList()
         val listing = SysShell.exec("cmd wifi list-networks", 5_000L)
         if (!listing.ok) {
-            appendLog("WIFI: 无法读取系统已保存网络（exit=${listing.exitCode}）——跳过检查")
+            shellListNetworksFailed = true
+            appendLog("WIFI: 无法读取系统已保存网络（exit=${listing.exitCode}）——后续跳过（D3: 避免每次 join 白等 5s）")
             return emptyList()
         }
         return WifiSavedNetworks.idsOf(listing.output, ssid)
@@ -3889,6 +3942,7 @@ object SessionController {
     private fun retryJoinSpecifierSilently(
         wifi: Iap2SenderSession.WifiConfiguration,
         shellReady: Boolean,
+        budgetDeadlineMillis: Long = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS,
     ): Boolean {
         // 审计 B2：建议通道已授权/已生效时，specifier Unavailable 多半是「系统确认框无人点」
         // ——车上没人点屏，这条通道注定失败。失败 1 次即改走 awaitAssociation（建议关联）
@@ -3919,6 +3973,11 @@ object SessionController {
             return false
         }
         for (attempt in 1..SPECIFIER_AUTO_RETRY_TIMES) {
+            if (android.os.SystemClock.uptimeMillis() >= budgetDeadlineMillis) {
+                settleWifiHint("入网总预算已用尽（${wifi.ssid}）")
+                appendLog("WIFI: 入网总预算已用尽——不再开启新一轮重试（避免超出车机 27s 窗口）")
+                return false
+            }
             if (connectCancelled) {
                 // 修复 #6：取消早退也要收口「加入热点中」（实车 00:24 卡住的同款残留）。
                 settleWifiHint("已取消（${wifi.ssid}）")
@@ -3929,13 +3988,18 @@ object SessionController {
                 "WIFI: 自动重试加入 \"${wifi.ssid}\"（第 $attempt/${SPECIFIER_AUTO_RETRY_TIMES} 次，无需操作）",
             )
             sleepQuietly(SPECIFIER_RETRY_GAP_MS)
+            if (android.os.SystemClock.uptimeMillis() >= budgetDeadlineMillis) {
+                settleWifiHint("入网总预算已用尽（${wifi.ssid}）")
+                appendLog("WIFI: 重试间隙总预算已耗尽——本轮到此为止")
+                return false
+            }
             if (connectCancelled) {
                 // 修复 #6：重试间隙被取消同样收口，不留「正在重试加入…」的终态残留。
                 settleWifiHint("已取消（${wifi.ssid}）")
                 return false
             }
-            // force：绕过 5 秒去重窗口——这一轮本来就该重发
-            when (val retry = joinCarWifiSpecifier(wifi, shellReady, force = true)) {
+            // force：绕过 5 秒去重窗口——这一轮本来就该重发，但仍共享同一总预算截止时间
+            when (val retry = joinCarWifiSpecifier(wifi, shellReady, force = true, budgetDeadlineMillis = budgetDeadlineMillis)) {
                 is WifiCarPlayConnector.JoinResult.Joined -> return true
                 WifiCarPlayConnector.JoinResult.Unsupported -> {
                     legacyJoinCarWifi(wifi, shellReady)
@@ -4628,8 +4692,10 @@ object SessionController {
                 appendLog("CTRL: 等待车机 ctrl 邀请…（已等 ${now - startedAt}ms）")
                 lastLogAt = now
             }
+            // C4 修复：50ms 轮询改为 200ms，减少 CPU 空转（4× 降频）。
+            // 邀请到达是秒级事件（实车 1~4s），50ms 粒度无收益。
             try {
-                Thread.sleep(50)
+                Thread.sleep(200)
             } catch (_: InterruptedException) {
                 return false
             }
@@ -6177,7 +6243,7 @@ object SessionController {
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
     ) {
-        if (connectCancelled) {
+        if (userCancelled) {
             appendLog(">>> [$source] 0x4301 晚到（已取消连接）——忽略")
             return
         }
@@ -6609,6 +6675,7 @@ object SessionController {
                 // 新轮次起步清取消标志：上一轮可能因「BT 链路断开」置位退出（见
                 // onSenderLinkClosed）——能走到这里说明 BT 组件仍在运行（用户取消路径会
                 // 停组件、被上方守卫拦截），该标志属于已退场的旧轮次，不清会误伤本轮。
+                userCancelled = false
                 connectCancelled = false
                 val owner = connectionAttempt.incrementAndGet()
                 lastSessionTarget = NetworkSessionTarget(endpoint, onCurrentWifi)
@@ -6755,6 +6822,7 @@ object SessionController {
                 endpoint.airPlayPort > 0 && EndpointHosts.hasUsable(endpoint.ipAddresses)
             Bg.run("airplay-pairing") {
                 authReceiverKey = null
+                var passiveYieldForInvite = false
                 try {
                     if (!ownsAttempt(attempt)) {
                         appendLog("AIRPLAY: 用户已取消——中止配对")
@@ -6793,6 +6861,7 @@ object SessionController {
                             // 没等到本轮新邀请就不连：保留发现与蓝牙监听，等车机邀请或回连再起一轮
                             phaseHint = "等待车机发出新的连接邀请"
                             connectBudget.end(cause = "CARPLAY_CONTROL 车机尚未发出本轮新邀请", keywords = "ctrl-int / 新邀请")
+                            passiveYieldForInvite = true
                             releaseAttempt(attempt)
                             return@run
                         }
@@ -6834,8 +6903,11 @@ object SessionController {
                         }
                     }
 
-                    fun newClient() =
-                        AirPlayClient(
+                    fun newClient(): AirPlayClient {
+                        // 自动重连 / 退避重试 / 晚到重建等所有路径都需要重置 NowPlaying 去重与封面缓存，
+                        // 否则新会话同首歌不会再推歌名和专辑封面。
+                        resetNowPlayingDedupe()
+                        return AirPlayClient(
                             effectiveEndpoint,
                             log = { line -> appendLog(line) },
                             context = context.applicationContext,
@@ -6913,6 +6985,7 @@ object SessionController {
                                 handleCarAudioTransfer(created, transfer)
                             }
                         }
+                    }
                     var client =
                         synchronized(sessionLifecycleLock) {
                             requireAttempt(attempt)
@@ -7424,7 +7497,17 @@ object SessionController {
                                         // 等于答非所问（旧实现如此）。真车会发：奥迪 4260 在
                                         // 2026-11-09 09:38/09:42/09:43 共发 7 次 changeModes + 1 次 requestUI。
                                         // requestUI 是同一套仲裁里的「把界面交回手机」，走同一个出口。
-                                        "changeModes" -> resourceStreams?.reconcile()
+                                        "changeModes" -> {
+                                            val resources =
+                                                ((command["params"] as? Map<*, *>)?.get("resources") as? List<*>)
+                                            val touchesScreen =
+                                                resources == null ||
+                                                    resources.isEmpty() ||
+                                                    resources.any { item ->
+                                                        ((item as? Map<*, *>)?.get("resourceID") as? Number)?.toInt() == 1
+                                                    }
+                                            resourceStreams?.reconcile(fromCarScreenChange = touchesScreen)
+                                        }
 
                                         "requestUI" -> {
                                             val url =
@@ -8073,7 +8156,7 @@ object SessionController {
                     // 关掉（避免保活/重试路径上又打一次同一份小结）。推流中则保持计时，
                     // 由后续失败/结束时再收尾。
                     synchronized(sessionLifecycleLock) {
-                        if (ownsAttempt(attempt)) {
+                        if (!passiveYieldForInvite && ownsAttempt(attempt)) {
                             val sessionLive =
                                 videoSender?.isRunning == true ||
                                     resourceStreams?.screenPaused == true ||
@@ -8218,10 +8301,11 @@ object SessionController {
                 }
                 appendLog("WIFI[$source]: 建议短窗未连上——继续按「复用 → specifier → 建议」走完整入网")
             }
+            val budgetDeadlineMillis = android.os.SystemClock.uptimeMillis() + WIFI_JOIN_TOTAL_BUDGET_MS
             while (ownsAttempt(attempt)) {
                 // Shizuku 已移除：没有 shell 特权。
                 val shellReady = false
-                when (val result = joinCarWifiSpecifier(wifiConfig, shellReady)) {
+                when (val result = joinCarWifiSpecifier(wifiConfig, shellReady, budgetDeadlineMillis = budgetDeadlineMillis)) {
                     is WifiCarPlayConnector.JoinResult.Joined -> {
                         continueWithNetwork(true)
                         return@run
@@ -8236,10 +8320,8 @@ object SessionController {
                     }
 
                     WifiCarPlayConnector.JoinResult.Unavailable -> {
-                        // 三层路径（复用 → 静默建议 → 确认框）都没成：静默再试几轮。
-                        // 旧实现在这里弹「重试 / 打开 WLAN 设置」问用户，车上没人点屏
-                        // 就按无人应答中止——现在改成自动做，只是限次。
-                        retryJoinSpecifierSilently(wifiConfig, shellReady)
+                        // 三层路径（复用 → 静默建议 → 确认框）都没成：在剩余总预算内静默再试。
+                        retryJoinSpecifierSilently(wifiConfig, shellReady, budgetDeadlineMillis)
                         if (boundCarSsid == wifiConfig.ssid && wifiConnector?.currentUsableNetwork() != null) {
                             continueWithNetwork(true)
                         } else {

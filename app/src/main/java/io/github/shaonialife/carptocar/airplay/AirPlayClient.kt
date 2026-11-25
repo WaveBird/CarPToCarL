@@ -657,6 +657,7 @@ class AirPlayClient(
         Thread({
             var sent = 0
             while (isSessionAlive()) {
+                val ownerSocket = socket
                 try {
                     val (status, body) = request("POST", "/feedback", ByteArray(0))
                     sent++
@@ -678,8 +679,17 @@ class AirPlayClient(
                             if (sent <= 8 || sent % 30 == 0) logFeedbackBody(root)
                         }
                     }
-                } catch (_: IOException) {
-                    break // 连接已断（会话结束）
+                } catch (error: IOException) {
+                    // 半开断连感知：控制通道 soTimeout=0，无线死区或车机断电时 readLoop 不会收到 EOF；
+                    // /feedback 心跳超时/异常后主动触发 transportEnded() 清理僵尸会话并允许自动重连。
+                    if (ownerSocket != null && !cancelled && sessionEstablished) {
+                        transportEnded(
+                            owner = ownerSocket,
+                            event = false,
+                            reason = "feedback 心跳失败(${error.message ?: error.javaClass.simpleName})",
+                        )
+                    }
+                    break
                 }
                 try {
                     Thread.sleep(1_000)
@@ -3810,9 +3820,9 @@ class AirPlayClient(
                     BinaryPlist.encode(linkedMapOf<String, Any?>()),
                     contentType = "application/x-apple-binary-plist",
                 )
-            // 报文确实发出去了（拿到应答，不论状态码）：记进预算，后续不再补发。
-            recordBudget.noteSent()
             val ok = statusLine.contains("200")
+            // 仅在 200 激活成功后记入单次预算，避免首轮非 200（车机未就绪）导致后续跳过并返回假成功。
+            if (ok) recordBudget.noteSent()
             log(if (ok) "AIRPLAY: ✓ RECORD 完成——会话已激活" else "AIRPLAY: RECORD 应答 [$statusLine]")
             ok
         } catch (error: IOException) {
