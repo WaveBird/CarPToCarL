@@ -1578,6 +1578,14 @@ object BtSessionGate {
         iap2Ready = false
         inboundActive = inbound
         controlOwner = channel
+        // 通道对象已建立、stream 已打开——从这一刻起链路就是活的（含 bring-up 握手期）。
+        // 严重回归修复（1.2.112）：1.2.109 的 join 预检 controlLinkAlive 依赖 iap2Ready，
+        // 而 iap2Ready 要等发送端 session.run() 返回后才置位；但 0x5703 凭据到达时
+        // run() 还在执行中（onWifiCredentials 在 run() 内部触发），于是「车机正常交凭据、
+        // LINK tx/rx 都正常」的瞬间预检却判死——实车日志 2026-11-25 18:46:42 案例与
+        // 52 次「蓝牙链路已断——跳过本轮 join」全属这种正常路径。此位在 claimControl
+        // 置 true、releaseControl（链路真终结）置 false，让预检在握手期也放行。
+        controlChannelEstablished = true
         return previous
     }
 
@@ -1597,6 +1605,8 @@ object BtSessionGate {
         controlOwner = null
         iap2Ready = false
         inboundActive = false
+        // 链路真终结（onLinkClosed / 主动退役）：预检从此刻起可判死。
+        controlChannelEstablished = false
         return true
     }
 
@@ -1636,6 +1646,19 @@ object BtSessionGate {
      */
     @Volatile
     var sessionActive: Boolean = false
+
+    /**
+     * 控制通道已建立（claimControl 成功 → 链路就是活的，含 bring-up 握手期）。
+     *
+     * join 预检 [Iap2BluetoothServer.controlLinkAlive] 用它作为独立信号，不依赖
+     * [iap2Ready] / [sessionActive]：0x5703 凭据到达时发送端 session.run() 尚未返回
+     * （onWifiCredentials 在 run() 内部触发），此刻 iap2Ready=false 且 sessionActive=false
+     * （sessionActive 要等 onEndpoint 拿到端点才置位），旧预检于是把「车机正常交凭据、
+     * LINK tx/rx 正常」的瞬间误判为死链，1.2.112 修复 2026-11-25 18:46:42 实车案例
+     * 的 52 次误杀。releaseControl（链路真终结）时清零。
+     */
+    @Volatile
+    var controlChannelEstablished: Boolean = false
 
     /**
      * 目标设备软回退：指定了目标车机但连续多轮连不上时置位。

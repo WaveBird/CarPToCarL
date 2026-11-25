@@ -85,10 +85,18 @@ class Iap2BluetoothServer(
          *    → 死；通道活着 → 放行。
          */
         fun controlLinkAlive(channel: Iap2LinkChannel?): Boolean =
-            if (BtSessionGate.sessionActive) {
-                true
-            } else {
-                channel != null && channel.isAlive && BtSessionGate.iap2Ready
+            when {
+                // 会话已激活（iAP2 已迁 WiFi 隧道）→ 放行。
+                BtSessionGate.sessionActive -> true
+                // 控制通道已建立（claimControl 起即活，含 bring-up 握手期）→ 放行。
+                // 严重回归修复（1.2.112）：只看 iap2Ready 会误杀「车机正常交凭据」的瞬间——
+                // 0x5703 到达时发送端 session.run() 尚未返回，iap2Ready 要等 run() 返回后
+                // 才置位；sessionActive 也还没置（要等 onEndpoint）。2026-11-25 实车日志
+                // 18:46:42 案例与 52 次「蓝牙链路已断——跳过本轮 join」判死时 LINK tx/rx
+                // 完全正常，全是这种正常路径被误杀。见 BtSessionGate.controlChannelEstablished。
+                BtSessionGate.controlChannelEstablished -> true
+                // 旧三条件兜底（不在 Gate 登记的通道走这里）。
+                else -> channel != null && channel.isAlive && BtSessionGate.iap2Ready
             }
     }
 
