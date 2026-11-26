@@ -527,6 +527,56 @@ object SessionController {
     private var mediaWatchdogStarted = false
 
     /**
+     * 车机主动连入（用户在**车机**上点「连接」/点 CarPlay 图标）时的 headless 预处理（1.2.115）。
+     *
+     * 为什么要单独做（实车证据 `logs/CarPToCarL-log-20261126-085805.txt`）：
+     * 1. 08:48:19~08:49:38 本机连续 5 轮主动拨号全部失败（`read failed, socket might
+     *    closed or timeout, read ret: -1`），期间 20 条「车机蓝牙链路只维持了 420~556ms
+     *    就断开」——出站 SDP/建链与车机的连入打在同一条 ACL 上；
+     * 2. 真正建成会话的 4 次（08:49:42 / 08:50:31 / 08:53:19 / 08:53:29）**全部是车机主动连入**；
+     * 3. 而监听只在「进程活着 + 界面走过 ensure()」时存在：收摊后进程退出，SDP 记录与
+     *    监听一起消失，车机此时点「连接」必然在建链阶段失败。
+     *
+     * 所以 ACL 一显示目标车机连上，这里做两件**不依赖界面**的事：
+     *  - 记下入站窗口（出站循环让路，见 `BtSessionGate.INBOUND_APPROACH_GRACE_MILLIS`）；
+     *  - 把 iAP2 监听 + 占位 SDP 立刻挂起来，赶在车机的 RFCOMM（ACL 后几百毫秒）之前。
+     *
+     * 界面照旧由 `CarApproachReceiver` 拉起；这里只负责「让车机连得进来」。
+     * 用户明确「断开」过（[compatSuppressed]）时不动——那一刀必须生效。
+     *
+     * @return true = iAP2 监听此刻确实在跑（车机连得进来）
+     */
+    fun onCarInboundApproach(
+        context: Context,
+        reason: String,
+    ): Boolean {
+        // 先记时刻：下面的对象构建可能耗几百毫秒，而入站窗口要在 ACL 一出现就生效。
+        // 方向不分：本机正在拨号时这条 ACL 多半是我们自己建的，只压短窗口（见
+        // BtSessionGate.INBOUND_APPROACH_GRACE_OWN_DIAL_MILLIS）。
+        BtSessionGate.noteInboundApproach(fromOwnOutbound = BtSessionGate.outboundConnecting)
+        appContext = context.applicationContext
+        ensureSessionObjects(context.applicationContext)
+        // 冷启动时看门狗还没起：顺手拉起，监听日后被蓝牙关/开弄死时能自己回来
+        // （幂等，不会重复起线程）。
+        startBtCompatWatchdog()
+        if (compatSuppressed) return bluetoothServer?.isRunning == true
+        if (!BtCompatPrefs.enabled(context.applicationContext)) return bluetoothServer?.isRunning == true
+        val server = bluetoothServer ?: return false
+        if (server.isRunning) return true
+        if (!server.hasPermission()) return false
+        idleListening = true
+        if (server.start()) {
+            appendLog(
+                "BT: $reason——监听已提前挂起（iAP2 + CarPlay 占位 SDP），" +
+                    "车机此刻点「连接」就能直接连入，不必等界面起来",
+            )
+            return true
+        }
+        idleListening = false
+        return false
+    }
+
+    /**
      * 媒体信息看门狗：**通知监听器没被系统绑上时，定时用系统 API 请求重绑**。
      *
      * 为什么需要：重装 APK 后授权还在（`enabled_notification_listeners` 里有本组件），
@@ -2482,7 +2532,14 @@ object SessionController {
                         // 正在建链（createRfcomm 进行中）时守卫必须暂停踢除——设备级
                         // disconnect() 兜底会把这些刚建立的 ACL 一起拆掉。两个条件任一
                         // 为真都只跳过本轮，不清状态。
-                        shouldPause = { BtSessionGate.hasActiveControl || BtSessionGate.outboundConnecting },
+                        // 1.2.115：再加上「车机刚主动连入」的窗口——用户从车机点「连接」时
+                        // 踢 HFP/A2DP 会带 ACL 一起断，那一次连入就白费了（实车
+                        // 2026-11-26 08:48~08:49 的 420~556ms ACL 抖动）。
+                        shouldPause = {
+                            BtSessionGate.hasActiveControl ||
+                                BtSessionGate.outboundConnecting ||
+                                BtSessionGate.inboundApproachRemainingMillis() > 0
+                        },
                         controlConnected = { BtSessionGate.controlConnectCount > connectCountAtStart },
                     )
                 appendLog("BT-GUARD: 守卫线程结束（共断开 $drops 次）")
@@ -2811,6 +2868,11 @@ object SessionController {
                         if (idleListening) {
                             idleListening = false
                             appendLog("BT: 兼容模式的挂机监听已转为正式会话")
+                        }
+                        // 1.2.115：车机的 RFCOMM 已经进来了 —— 此刻出站拨号（若还在飞）
+                        // 只会继续占着同一条 ACL，直接放弃它，让车机这条建链完整走完。
+                        runCatching {
+                            bluetoothClient?.abortOutboundDialForInbound("车机已连入 iAP2 服务")
                         }
                     },
                 )

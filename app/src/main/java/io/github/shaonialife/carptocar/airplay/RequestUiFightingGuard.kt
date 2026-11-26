@@ -14,12 +14,24 @@ package io.github.shaonialife.carptocar.airplay
  * ```
  *
  * 「让出→拿回」在车机永久持有期间变成了归属争夺：每次拿回都触发车机立即再拿走并最终
- * 拆会话——这是倒车后进不去 CarPlay 的直接原因。本类把三层防护做成可单测的纯状态机：
+ * 拆会话——这是倒车后进不去 CarPlay 的直接原因。本类把防护做成可单测的纯状态机：
  *
  * 1. **URL 去重冷却**：同一 URL 3 秒内只处理第一次（实车 400ms 内 3 次是 HMI 重绘风暴）；
  * 2. **永久归属复核**：永久=车机时不执行让出拿回，改为纯等待；
  * 3. **跳变节流 + 收回禁用**：两次跳变至少间隔 1.5s；连续 2 次「拿回后车机改判收回」
  *    本会话禁用跳变（`surrenderRetakeBanned`）。
+ *
+ * ## 1.2.115 补充：「屏在车机手里」不是「不许要回来」
+ *
+ * 1.2.107 把上面的第 2 条也套到了「申请」上（`screenRequestFromCarUi && 永久=车机` →
+ * 不申请），于是车机 take 走主屏之后（倒车影像/HMI 切原生页）用户再从车机点 Apple CarPlay
+ * 时，我们连申请都不发——屏永远回不来，车机上只剩声音（2026-11-26 08:50:45~08:52:29 实车
+ * 日志：requestUI 连发 10 次，永久归属始终在手机反而全部走跳变，说明这台车给的是
+ * `takeConstraint=500`，本来就允许用户发起的申请拿回）。现在把两条路彻底分开：
+ *
+ * - 屏**还在手机手里**（entity=手机）→ 走 [decideRetake]（让出→拿回跳变，制造归属边沿）；
+ * - 屏**已被车机拿走**（entity=车机）→ 走 [decideClaim]（直接申请，不做让出），
+ *   节流退避 [CLAIM_BACKOFF_MIN_MS] 起、每次被车机拿走翻倍到 [CLAIM_BACKOFF_MAX_MS]。
  *
  * 线程模型：所有方法都只在调用方已有的串行上下文（CarPlayResourceStreams 工作线程 /
  * SessionController 事件读线程）上调用，实例内部不做加锁。
@@ -51,6 +63,12 @@ internal class RequestUiFightingGuard(
     private var retakeOverturnedCount = 0
     private var retakeAwaitingCarEcho = false
     private var bannedAtMs = -1L
+
+    // ---- 1.2.115：申请回主屏（claim）路径的节流 ----
+    /// 「车机手里拿着屏、下发 requestUI」时我们直接**申请**（不再让出），这条路的节流。
+    private var lastClaimAtMs = -1L
+    private var claimAwaitingCarEcho = false
+    private var claimBackoffMs = CLAIM_BACKOFF_MIN_MS
 
     /** 连续 2 次「拿回成功但车机改判收回」后进入禁用冷却（超过 [RETAKE_BAN_COOLDOWN_MS] 后自愈解禁）。 */
     @Volatile
@@ -90,6 +108,52 @@ internal class RequestUiFightingGuard(
     }
 
     /**
+     * 「车机拿着主屏、下发 requestUI」时**申请回**的复核（1.2.115）。
+     *
+     * 与 [decideRetake] 的区别：那条路是「屏本来就在手机手里，做一次让出→拿回制造归属边沿」，
+     * 所以永久归属在车机时**必须放弃**（让出动作会被 HMI 读成「手机放弃」）。这条路相反：
+     * 车机已经把屏拿走了（倒车影像/HMI 切原生页），它的 `requestUI` 就是「请把画面给我」
+     * 的显式信号——此时不申请，屏永远回不到手机，车机上就只剩声音。
+     *
+     * 1.2.107 曾把两条路合并成一条判定（`screenRequestFromCarUi && 永久=车机` → 拒绝申请），
+     * 这条过度修正正是「倒车后点 Apple CarPlay 进不去、只有声音」的直接原因：
+     * 车机 take 时给的是 `takeConstraint=500`，语义就是「用户发起的申请（PRIORITY_USER）
+     * 允许拿回」——它自己就把门留着了。
+     *
+     * 唯一的限制是**节流/退避**：每次「申请成功但车机又拿回去」（[onCarEcho]）把退避翻倍，
+     * 上限 [CLAIM_BACKOFF_MAX_MS]。这样既不会把屏锁死在车机手里，也不会变成争夺风暴。
+     */
+    fun decideClaim(): RetakeDecision {
+        // 让出拿回被禁用不影响「申请」——那是两条不同的动作，申请本身不做归属跳变。
+        // 但仍然要过退避，避免车机每次秒收回时我们每 100ms 撞一次。
+        liftRetakeBanIfCooledDown()
+        val sinceLast = if (lastClaimAtMs < 0) Long.MAX_VALUE else nowMs() - lastClaimAtMs
+        if (sinceLast < claimBackoffMs) {
+            log(
+                "requestUI 申请回主屏距上次仅 ${sinceLast}ms（<${claimBackoffMs}ms 退避）——本轮跳过，只补关键帧",
+            )
+            return RetakeDecision.SKIP_THROTTLED
+        }
+        return RetakeDecision.PROCEED
+    }
+
+    /** 跳变禁用满 [RETAKE_BAN_COOLDOWN_MS] 冷却后自愈解禁（两条判定路径共用）。 */
+    private fun liftRetakeBanIfCooledDown() {
+        if (!surrenderRetakeBanned) return
+        if (bannedAtMs < 0L || nowMs() - bannedAtMs < RETAKE_BAN_COOLDOWN_MS) return
+        surrenderRetakeBanned = false
+        retakeOverturnedCount = 0
+        bannedAtMs = -1L
+        log("requestUI 让出拿回禁用已满 ${RETAKE_BAN_COOLDOWN_MS / 1000}s 冷却——自愈解禁")
+    }
+
+    /** 申请回主屏已发布（无论车机是否接受）后调用：开始等车机下一次 changeModes 复述确认。 */
+    fun onClaimPublished() {
+        lastClaimAtMs = nowMs()
+        claimAwaitingCarEcho = true
+    }
+
+    /**
      * 让出拿回前的复核（修复 A2/A3）。
      *
      * @param screenPermanentOwnerIsCar 当前主屏**永久**归属是否在车机
@@ -97,17 +161,9 @@ internal class RequestUiFightingGuard(
      *   transferType=2 才会变——这正是 fighting 的判定输入）。
      */
     fun decideRetake(screenPermanentOwnerIsCar: Boolean): RetakeDecision {
+        liftRetakeBanIfCooledDown()
+        if (surrenderRetakeBanned) return RetakeDecision.SKIP_BANNED
         val now = nowMs()
-        if (surrenderRetakeBanned) {
-            if (bannedAtMs >= 0L && now - bannedAtMs >= RETAKE_BAN_COOLDOWN_MS) {
-                surrenderRetakeBanned = false
-                retakeOverturnedCount = 0
-                bannedAtMs = -1L
-                log("requestUI 让出拿回禁用已满 ${RETAKE_BAN_COOLDOWN_MS / 1000}s 冷却——自动解禁，恢复正常切屏判断")
-            } else {
-                return RetakeDecision.SKIP_BANNED
-            }
-        }
         if (screenPermanentOwnerIsCar) {
             log("requestUI 时主屏永久归属在车机——不执行让出拿回（避免 fighting），等待车机复述或 HMI 操作")
             return RetakeDecision.SKIP_PERMANENT_CAR
@@ -141,6 +197,20 @@ internal class RequestUiFightingGuard(
      * @return true = 本次计了一次收回（诊断用）
      */
     fun onCarEcho(screenPermanentOwnerIsCar: Boolean): Boolean {
+        // 申请回（claim）路径的退避：车机把屏又拿回去就翻倍，确认归手机就复位。
+        // 与让出拿回的计数器分开——申请是「正当请求」，不该被跳变的熔断连坐。
+        if (claimAwaitingCarEcho) {
+            claimAwaitingCarEcho = false
+            if (screenPermanentOwnerIsCar) {
+                claimBackoffMs = (claimBackoffMs * 2).coerceAtMost(CLAIM_BACKOFF_MAX_MS)
+                log(
+                    "requestUI 申请回后车机又拿走主屏——下次申请退避延长到 ${claimBackoffMs}ms" +
+                        "（避免每 100ms 撞一次）",
+                )
+            } else {
+                claimBackoffMs = CLAIM_BACKOFF_MIN_MS
+            }
+        }
         if (!retakeAwaitingCarEcho) return false
         retakeAwaitingCarEcho = false
         if (screenPermanentOwnerIsCar) {
@@ -176,6 +246,17 @@ internal class RequestUiFightingGuard(
 
         /** 禁用跳变后的自愈冷却时间：避免整趟行程永久无法通过车机点击 CarPlay 切回。 */
         const val RETAKE_BAN_COOLDOWN_MS = 60_000L
+
+        /**
+         * 申请回主屏的最小间隔（1.2.115）。
+         *
+         * 取 1.5s 与跳变节流同量级：车机的 requestUI 在 HMI 重绘时 400ms 内会来 3 次
+         * （URL 去重那层兜住同 URL），换页面时 URL 会变，靠这一层兜住不同 URL 的连发。
+         */
+        const val CLAIM_BACKOFF_MIN_MS = 1_500L
+
+        /** 申请回主屏的退避上限：车机反复拿走时最长 30s 才再试一次（不锁死、不风暴）。 */
+        const val CLAIM_BACKOFF_MAX_MS = 30_000L
 
         private const val MAX_TRACKED_URLS = 8
     }

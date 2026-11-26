@@ -163,6 +163,9 @@ class CarApproachReceiver : BroadcastReceiver() {
                         "APPROACH: 车机已靠近，但本机还停在上一轮重试里（尚未建链）" +
                             "——不重复拉起界面，改为提前催一轮重连",
                     )
+                    // 1.2.115：车机此刻正是在「从车机点连接」的那条路上，先把出站拨号让开、
+                    // 把监听挂稳，再催重连——否则我们连出、它连入，两条 RFCOMM 打同一条 ACL。
+                    runCatching { SessionController.onCarInboundApproach(context, "车机主动连入（本机重试中）") }
                     SessionController.requestImmediateRetry("车机蓝牙靠近")
                 }
 
@@ -174,10 +177,17 @@ class CarApproachReceiver : BroadcastReceiver() {
         // ---- 只做一件事：把界面叫到前台，连接交给前台 ----
         // 顺序仍按「先动作、后写日志」：磁盘 IO 不挡在拉起界面前面。
         CarApproachPrefs.markTriggered(context)
+        // 1.2.115：界面冷启动要 1~3 秒，而车机的 RFCOMM 在 ACL 之后几百毫秒就到。
+        // 先把监听 + 占位 SDP 挂起来（不依赖界面），再拉起界面——否则车机点「连接」
+        // 永远停在 `read failed, socket might closed or timeout`（实车 5 轮全败）。
+        val listenerReady =
+            runCatching { SessionController.onCarInboundApproach(context, "车机主动连入（靠近拉起）") }
+                .getOrDefault(false)
         val launched = launchApp(context)
         DebugFileLog.append(
             context,
             "APPROACH: 检测到目标车机「${target.name}」靠近——" +
+                (if (listenerReady) "监听已就绪，车机可直接连入；" else "监听拉起失败；") +
                 if (launched) "已拉起 App，交给前台自动发起连接" else "拉起 App 被系统拒绝（需允许本应用「自启动/后台弹界面」）",
         )
     }

@@ -862,6 +862,39 @@ class VideoSender(
     @Volatile
     var onPassthroughKeyFrameRequest: (() -> Boolean)? = null
 
+    /**
+     * 主屏**刚回到手机**时重新武装解码器：先重发 VideoConfig（车机可能已经把自己的
+     * avcC/解码器丢了），再催一帧新的 IDR。
+     *
+     * 为什么不能只补关键帧（1.2.115，实车症状「车机上只有声音、没有画面」）：
+     * 车机把主屏拿去显示倒车影像/原生页时，它的 CarPlay 视频通路会被拆掉重建；回来之后
+     * 它手里既没有 avcC 也没有参考帧，只靠我们周期 IDR 里那点数据不一定能自愈
+     * （`configSent` 仍为 true，`submitH264` 那条「SPS 变了才重发」的分支不会触发）。
+     * 重发一份同样的 csd 是幂等的，接收端不接受也只是多一条 config 帧。
+     *
+     * 刻意**不发 RECORD**：这台车机（BMW MGU）对首帧之后补发 RECORD 过敏
+     * （docs/bmw-fork-port-20261108.md 第三节），那一条只留给首轮/重新 SETUP 的路径。
+     *
+     * @return 是否至少做了一次真实动作（重发 config 或催到 IDR）
+     */
+    fun rearmDecoderOnScreenReturn(): Boolean {
+        if (!running.get()) return false
+        var acted = false
+        val csd = cachedCsd
+        if (passthrough && csd != null) {
+            try {
+                val output = socket?.getOutputStream()
+                if (output != null) {
+                    sendConfigFromNals(csd, output, "主屏归还重发 csd（车机可能已丢 avcC）")
+                    acted = true
+                }
+            } catch (error: Exception) {
+                log("VIDEO: 主屏归还重发 VideoConfig 失败 - ${error.message}")
+            }
+        }
+        return requestKeyFrame() || acted
+    }
+
     /** 编码器不存在时（直通模式）也允许请求关键帧：通知上游催 IDR，并在已有缓存 IDR 时立即补发一帧。 */
     fun requestKeyFrame(): Boolean {
         if (passthrough) {

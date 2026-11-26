@@ -165,24 +165,50 @@ internal class CarPlayResourceStreams(
         // 修复 A2/B1（1.2.107）：永久归属复核必须发生在**申请之前**——申请成功会把
         // entity 翻回手机（1.2.106 实车 19:35:44.424 acquired=true），但不代表车机认账：
         // 1.9s 后（19:35:47.504）它就再 take permanent 收回。申请前先取快照。
+        // 1.2.115：这份快照只喂「让出再拿回」的判定（下面 decideRetake）；「申请」那条路
+        // 不再看它（见下面的说明）。
         val permanentOwnerCarBeforeClaim = client.screenPermanentOwnerIsCar
+        var claimThrottled = false
         if (screenRequested && !wasOwnedBeforeApply) {
             // 实验开关打开时「尊重借用」：车机说有人在借（转向影像/倒车）就不去抢。
             // 旧行为 overrideBorrow=true 会在借用期间直接冲掉借用，车机随即把它夺回去，
             // 我们白付一轮 SETUP/RECORD。
             //
-            // 修复 B1：车机刚 take permanent（永久=车机）时，来自 requestUI 的申请被
-            // 「永久归属复核」拦下不执行——发出去也只会被车机一个往返夺回。
-            val blockedByPermanentCar = screenRequestFromCarUi && permanentOwnerCarBeforeClaim
+            // 1.2.115 修正（倒车后点 Apple CarPlay 进不去、只有声音的根因）：
+            // 1.2.107 的「永久归属复核」把 `requestUI + 永久=车机` 一律拦下不申请，
+            // 而车机把主屏 take 走（倒车影像/HMI 切原生页）之后**永久归属就是在车机**，
+            // 它的 requestUI 恰恰是「请把画面给我」的显式信号——拦下等于把屏永久锁死在
+            // 车机侧，车机上只剩音频（音频是独立所有权链路，不受这条影响）。
+            // 这台车 take 时给的是 `takeConstraint=500`（2026-11-26 08:53:22 实车
+            // /info.modes），语义就是「用户发起的申请允许拿回」——门是车机自己留的。
+            // 因此这里改为：requestUI 且屏不在本机 → 按节流退避**直接申请**（不做让出跳变）。
+            val requestUiClaim = screenRequestFromCarUi && !client.phoneOwnsScreen
+            val claimAllowed =
+                if (!requestUiClaim) {
+                    true
+                } else {
+                    when (fightingGuard.decideClaim()) {
+                        RequestUiFightingGuard.RetakeDecision.PROCEED -> true
+                        else -> {
+                            claimThrottled = true
+                            false
+                        }
+                    }
+                }
             published =
-                if (blockedByPermanentCar) {
+                if (!claimAllowed) {
                     false
                 } else {
                     client.acquireScreenResource(screenRequestFromCarUi, respectBorrow = keepScreenStreamOnTake)
                 }
+            if (published && requestUiClaim) fightingGuard.onClaimPublished()
             log(
                 "MODE: 申请主屏 fromRequestUi=$screenRequestFromCarUi acquired=$published" +
-                    if (blockedByPermanentCar) "（车机永久持有中，不申请——等待车机 requestUI 或 HMI 操作）" else "",
+                    when {
+                        claimThrottled -> "（申请节流退避中——只补关键帧，稍后再试）"
+                        published && requestUiClaim -> "（车机持有中→已按 requestUI 申请取回，不做让出跳变）"
+                        else -> ""
+                    },
             )
         }
         screenRequested = false
@@ -227,8 +253,14 @@ internal class CarPlayResourceStreams(
         if (owned && warmAlive) {
             if (screenPaused) {
                 screenPaused = false
-                sender?.requestKeyFrame()
-                log("MODE: 主屏归还手机（视频热流保持在线，无需二次 SETUP/RECORD）——已补关键帧秒切")
+                // 1.2.115：车机很可能在占屏期间把自己的解码器/avcC 丢了（它切去过倒车影像，
+                // 回来只补关键帧的话画面依旧黑着——声音照旧，就是「只有声音」）。
+                // rearmDecoderOnScreenReturn 会重发 VideoConfig 再催 IDR。
+                sender?.rearmDecoderOnScreenReturn()
+                log(
+                    "MODE: 主屏归还手机（视频热流保持在线，无需二次 SETUP/RECORD）" +
+                        "——已重发 VideoConfig + 补关键帧秒切",
+                )
             }
             return
         }
@@ -240,7 +272,18 @@ internal class CarPlayResourceStreams(
             if (!published) client.republishModes()
             return
         }
-        if (!owned && !screenNegotiated) return
+        if (!owned && !screenNegotiated) {
+            // 1.2.115：这条以前是静默 return——车机持有主屏 + 本轮屏幕流已 TEARDOWN 时，
+            // requestUI 落在这里就什么也不发，事后日志里完全看不出「为什么没画面」。
+            // 走到这里说明申请也没成功（车机 takeConstraint 不允许 / 发布被拒），只能等它归还。
+            if (fromCarUiNow) {
+                log(
+                    "MODE: requestUI 到达但主屏不在本机且本会话屏幕流已退役——申请未成功，" +
+                        "等待车机归还（此刻车机上只有音频）",
+                )
+            }
+            return
+        }
         // 车机改判后复述一次当前归属（已由本机申请发布过的除外）
         if (!published) client.republishModes()
         if (softHoldScreen(owned)) return
@@ -289,9 +332,10 @@ internal class CarPlayResourceStreams(
         streamStartedAtMs = nowMs()
         screenResumes++
         log(
-            "MODE: 主屏归还——沿用现有视频流（实验开关）· 补关键帧 + 重武装 HID" +
+            "MODE: 主屏归还——沿用现有视频流（实验开关）· 重发 VideoConfig + 补关键帧 + 重武装 HID" +
                 if (waited >= 0) " · 车机占屏 ${waited}ms" else "",
         )
+        current.rearmDecoderOnScreenReturn()
         if (!onScreenResumed(current, true)) {
             log("MODE: 沿用现有视频流被拒——退回重申请屏幕流")
             screenStreaming = false

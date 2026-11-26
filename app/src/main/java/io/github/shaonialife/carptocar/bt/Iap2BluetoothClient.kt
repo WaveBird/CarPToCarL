@@ -1472,6 +1472,21 @@ class Iap2BluetoothClient(
         }
     }
 
+    /**
+     * 车机正在连入：立刻放弃本轮**出站**拨号（关掉在途的 connect socket），把蓝牙链路让给车机。
+     *
+     * 只在 `socket.connect()` 正在飞的那一段动手（[BtSessionGate.outboundConnecting]），
+     * 已建成的会话绝不被误伤。调用方：`SessionController.onCarInboundApproach`
+     * ← `CarApproachReceiver`（ACL_CONNECTED，目标车机）。
+     */
+    fun abortOutboundDialForInbound(reason: String) {
+        BtSessionGate.noteInboundApproach()
+        if (!BtSessionGate.outboundConnecting) return
+        val socket = currentSocket.get() ?: return
+        runCatching { socket.close() }
+        log("BT-C: 车机正在连入本机——放弃本轮出站拨号（$reason），把链路让给车机")
+    }
+
     /** 主动结束当前 BT 控制会话（不影响重连循环）。供 AirPlay 配对前复现控制通道退役状态。 */
     fun detachCurrentSession() {
         synchronized(channelLock) {
@@ -1736,6 +1751,71 @@ object BtSessionGate {
      */
     const val PASSIVE_RECONNECT_GRACE_MILLIS = 15_000L
 
+    /**
+     * 车机侧刚发起连入（用户从**车机**点「连接」/点 CarPlay 图标）后的出站静默窗口（1.2.115）。
+     *
+     * 实车证据（`logs/CarPToCarL-log-20261126-085805.txt`）：08:48:19 起本机连续 5 轮
+     * 主动拨号全部失败（`read failed, socket might closed or timeout, read ret: -1`），
+     * 期间 08:48:21~08:49:38 有 20 条「车机蓝牙链路只维持了 420~556ms 就断开」——
+     * 每一次都是 SDP/建链在**同一条 ACL** 上打架；真正建成会话的 4 次全部是车机主动连入
+     * （08:49:42 / 08:50:31 / 08:53:19 / 08:53:29）。用户体感就是「在车机上点连接没反应」。
+     *
+     * 所以：ACL 一显示目标车机连上，立刻停掉出站拨号并把链路让给车机（[noteInboundApproach]）。
+     * 20 秒覆盖「ACL → SDP → RFCOMM → iAP2 起链」这段（实测 iAP2 在 1~3 秒内起来）。
+     */
+    const val INBOUND_APPROACH_GRACE_MILLIS = 20_000L
+
+    /**
+     * 同一次 ACL 事件但**本机自己正在拨号**时的短窗口（1.2.115）。
+     *
+     * 方向坑：`ACTION_ACL_CONNECTED` 不分方向——本机主动拨号时对端 ACL 也会把这条广播打出来。
+     * 若一律压 20 秒，出站拨号会被自己的 ACL 事件反复自我封锁（对奥迪这类「靠主动拨号」
+     * 的车机是硬回归）。所以 `BtSessionGate.outboundConnecting == true` 时只压 4 秒：
+     * 够躲开「刚失败立刻再拨」的抖动，又不至于把出站路径掐死。
+     */
+    const val INBOUND_APPROACH_GRACE_OWN_DIAL_MILLIS = 4_000L
+
+    /** 车机侧最近一次「链路出现」的时刻（单调时钟毫秒，0 = 本次进程还没记录过）。 */
+    @Volatile
+    private var inboundApproachAtMillis: Long = 0L
+
+    /** 这一次入站窗口的长度（见 [INBOUND_APPROACH_GRACE_MILLIS] / […_OWN_DIAL_MILLIS]）。 */
+    @Volatile
+    private var inboundApproachGraceMillis: Long = INBOUND_APPROACH_GRACE_MILLIS
+
+    /**
+     * 车机侧刚发起连入：记下时刻，让出站循环把链路让给车机。
+     *
+     * @param fromOwnOutbound ACL 事件出现的这一刻本机正在出站拨号（`outboundConnecting`）——
+     *   此时这条链路多半是我们自己建的，只压短窗口。
+     */
+    fun noteInboundApproach(fromOwnOutbound: Boolean = false) {
+        inboundApproachAtMillis = nowMillis()
+        inboundApproachGraceMillis =
+            if (fromOwnOutbound) INBOUND_APPROACH_GRACE_OWN_DIAL_MILLIS else INBOUND_APPROACH_GRACE_MILLIS
+    }
+
+    /** 距车机最近一次主动连入多少毫秒；从未记录返回 [Long.MAX_VALUE]。 */
+    fun sinceInboundApproach(): Long {
+        val at = inboundApproachAtMillis
+        if (at == 0L) return Long.MAX_VALUE
+        return nowMillis() - at
+    }
+
+    /** 入站静默窗口剩余毫秒（0 = 可以出站拨号）。 */
+    fun inboundApproachRemainingMillis(): Long {
+        val since = sinceInboundApproach()
+        // 从未记录过：MAX_VALUE 直接做减法会溢出，先挡掉（JVM 单测里 also 走这条）。
+        if (since == Long.MAX_VALUE) return 0L
+        return (inboundApproachGraceMillis - since).coerceAtLeast(0L)
+    }
+
+    /** 测试/复位用：清掉入站静默窗口（与 [clearRemoteDisconnectGrace] 同一套约定）。 */
+    internal fun clearInboundApproach() {
+        inboundApproachAtMillis = 0L
+        inboundApproachGraceMillis = INBOUND_APPROACH_GRACE_MILLIS
+    }
+
     @Volatile
     private var remoteDisconnectAt: Long = 0L
 
@@ -1809,8 +1889,17 @@ object BtSessionGate {
     /**
      * 出站拨号此刻仍需避让的毫秒数：车机已回连（入站会话 / CarPlay 会话已起）即避让目的已达成，返回 0。
      * 避让窗口本身不清，热点随会话断开时仍按它判定是否保持被动等待。
+     *
+     * 1.2.115：把「车机刚主动连入」也算进避让窗口——用户从车机点「连接」到 RFCOMM 建起来
+     * 只有几百毫秒，出站拨号在同一时间打同一条 ACL 会把这次连入搅掉（见
+     * [INBOUND_APPROACH_GRACE_MILLIS] 的实车证据）。两者取大，避免互相覆盖。
      */
-    fun outboundPassiveWaitMillis(): Long = if (inboundActive || sessionActive) 0L else passiveGraceRemainingMillis()
+    fun outboundPassiveWaitMillis(): Long =
+        if (inboundActive || sessionActive) {
+            0L
+        } else {
+            maxOf(passiveGraceRemainingMillis(), inboundApproachRemainingMillis())
+        }
 
     /** 记一次「控制链路掉线」，交给出站循环单独重连。 */
     fun noteLinkLost(address: String?) {

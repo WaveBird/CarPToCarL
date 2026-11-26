@@ -178,4 +178,88 @@ class RequestUiFightingGuardTest {
             g.decideRetake(true),
         )
     }
+
+    // ---- ④ 1.2.115：车机拿着主屏时「申请回」必须放行（倒车后只有声音的根因） ----
+
+    @Test
+    fun `车机持有主屏时 requestUI 的申请不被永久归属拦下`() {
+        val clock = FakeClock()
+        val g = guard(clock)
+        // 屏在车机手里（倒车影像/原生 HMI），车机下发 requestUI —— 这时必须申请。
+        // 旧实现（1.2.107）在这里直接返回 false，屏永远回不到手机，车上只剩声音。
+        assertEquals(
+            RequestUiFightingGuard.RetakeDecision.PROCEED,
+            g.decideClaim(),
+        )
+        // 让出拿回那条路仍然保持原语义（永久=车机就放弃跳变）
+        assertEquals(
+            RequestUiFightingGuard.RetakeDecision.SKIP_PERMANENT_CAR,
+            g.decideRetake(screenPermanentOwnerIsCar = true),
+        )
+    }
+
+    @Test
+    fun `申请回主屏两次之间至少间隔 1_5 秒`() {
+        val clock = FakeClock()
+        val g = guard(clock)
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+        g.onClaimPublished()
+        clock.advance(500)
+        assertEquals(
+            "500ms 内第二次申请要退避（车机 HMI 换页时 URL 不同，靠这层兜住）",
+            RequestUiFightingGuard.RetakeDecision.SKIP_THROTTLED,
+            g.decideClaim(),
+        )
+        clock.advance(1_200) // 距首次 1.7s
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+    }
+
+    @Test
+    fun `申请后被车机拿走则退避翻倍、确认归手机则复位`() {
+        val clock = FakeClock()
+        val g = guard(clock)
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+        g.onClaimPublished()
+        assertFalse("车机没拿走 → 不计收回", g.onCarEcho(screenPermanentOwnerIsCar = false))
+        // 确认归手机后仍是 1.5s 退避
+        clock.advance(1_600)
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+        g.onClaimPublished()
+        // 车机把屏又拿走了 → 申请退避翻倍。注意 onCarEcho 的返回值只表示「让出拿回的收回计数」，
+        // 申请路径不参与那个计数，所以这里只看退避效果。
+        g.onCarEcho(screenPermanentOwnerIsCar = true)
+        // 退避翻倍到 3s：1.6s 后仍被拦
+        clock.advance(1_600)
+        assertEquals(
+            "被拿走一次后退避翻倍到 3s",
+            RequestUiFightingGuard.RetakeDecision.SKIP_THROTTLED,
+            g.decideClaim(),
+        )
+        clock.advance(1_500) // 共 3.1s
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+        g.onClaimPublished()
+        // 这次确认归手机 → 退避回落到 1.5s
+        assertFalse(g.onCarEcho(screenPermanentOwnerIsCar = false))
+        clock.advance(1_600)
+        assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+    }
+
+    @Test
+    fun `申请退避有上限——不会把屏永久锁在车机手里`() {
+        val clock = FakeClock()
+        val g = guard(clock)
+        // 连续 6 次「申请→又被拿走」把退避顶到上限
+        repeat(6) {
+            assertEquals(RequestUiFightingGuard.RetakeDecision.PROCEED, g.decideClaim())
+            g.onClaimPublished()
+            g.onCarEcho(screenPermanentOwnerIsCar = true)
+            clock.advance(RequestUiFightingGuard.CLAIM_BACKOFF_MAX_MS + 1)
+        }
+        clock.advance(RequestUiFightingGuard.CLAIM_BACKOFF_MAX_MS + 1)
+        assertEquals(
+            "退避封顶后仍必须允许再申请（否则整趟行程都回不到 CarPlay）",
+            RequestUiFightingGuard.RetakeDecision.PROCEED,
+            g.decideClaim(),
+        )
+    }
 }

@@ -17,6 +17,7 @@ class BtSessionGateTest {
     fun tearDown() {
         BtSessionGate.nowMillis = originalClock
         BtSessionGate.clearRemoteDisconnectGrace()
+        BtSessionGate.clearInboundApproach()
         BtSessionGate.clearLinkLost()
         BtSessionGate.sessionActive = false
         BtSessionGate.inboundActive = false
@@ -90,6 +91,49 @@ class BtSessionGateTest {
 
         BtSessionGate.inboundActive = false
         BtSessionGate.sessionActive = true
+        assertEquals(0L, BtSessionGate.outboundPassiveWaitMillis())
+    }
+
+    @Test
+    fun `车机主动连入后出站拨号让路 20 秒，窗口过后恢复`() {
+        var clock = 10_000L
+        BtSessionGate.nowMillis = { clock }
+
+        assertEquals("没记录过入站时不该避让", 0L, BtSessionGate.inboundApproachRemainingMillis())
+        BtSessionGate.noteInboundApproach()
+        assertEquals(
+            BtSessionGate.INBOUND_APPROACH_GRACE_MILLIS,
+            BtSessionGate.inboundApproachRemainingMillis(),
+        )
+        assertEquals(
+            "出站循环看到的避让窗口要覆盖入站窗口（实车 5 轮出站全败、4 次入站全成）",
+            BtSessionGate.INBOUND_APPROACH_GRACE_MILLIS,
+            BtSessionGate.outboundPassiveWaitMillis(),
+        )
+
+        clock += 5_000L
+        assertEquals(15_000L, BtSessionGate.inboundApproachRemainingMillis())
+
+        clock += 15_000L
+        assertEquals("窗口到点后允许出站拨号", 0L, BtSessionGate.inboundApproachRemainingMillis())
+        assertEquals(0L, BtSessionGate.outboundPassiveWaitMillis())
+
+        // 两个窗口取大：车机回连窗口与入站窗口同时存在时以更长的为准
+        BtSessionGate.noteRemoteSessionEnded()
+        BtSessionGate.noteInboundApproach()
+        assertEquals(
+            BtSessionGate.INBOUND_APPROACH_GRACE_MILLIS,
+            BtSessionGate.outboundPassiveWaitMillis(),
+        )
+    }
+
+    @Test
+    fun `入站会话真的建起来后避让窗口立即归零`() {
+        var clock = 10_000L
+        BtSessionGate.nowMillis = { clock }
+        BtSessionGate.noteInboundApproach()
+        assertTrue(BtSessionGate.outboundPassiveWaitMillis() > 0L)
+        BtSessionGate.inboundActive = true
         assertEquals(0L, BtSessionGate.outboundPassiveWaitMillis())
     }
 
