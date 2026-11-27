@@ -36,6 +36,7 @@ import io.github.shaonialife.carptocar.bt.Iap2BluetoothClient
 import io.github.shaonialife.carptocar.bt.Iap2BluetoothServer
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.carlife.CarGpsFix
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoCoordinator
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
 import io.github.shaonialife.carptocar.carlife.CarLifeMediaInfo
 import io.github.shaonialife.carptocar.carlife.CarLifeProtocol
@@ -621,6 +622,16 @@ object SessionController {
         CarLifeHijack.onSpeechAudio = { appStateReporter.onSpeechAudio() }
         // AMcar 车机麦桥：引擎 0x10024/0x10023 才会走到这里，默认无消费者时是空操作。
         CarLifeHijack.onCarMicRequest = { active -> onCarMicRequest(active) }
+        // CarWith「返回原车」（0x10021，移植自 fork main 27938d7）：
+        // 主动把主屏归属交还车机（视频热流保持在线），资源状态机随后对账。
+        CarLifeHijack.onReturnToCar = {
+            Bg.run("carwith-return-to-car") {
+                val client = currentClient ?: return@run
+                if (client.relinquishScreenToCar()) {
+                    appendLog("RESOURCE: CarWith 请求返回原车界面——已将主屏归属交还车机（视频热流保持在线）")
+                }
+            }
+        }
     }
 
     /** 协议门面是否已装配进聚合层（幂等）。 */
@@ -7790,6 +7801,35 @@ object SessionController {
                                     if (!audioStartedBeforeRecord) {
                                         appendLog("AUDIO: 音频优先档未建立音频流——本轮仅推视频（RECORD 照发）")
                                     }
+                                }
+                                // RECORD 前置媒体门控（移植自 fork main 27938d7/623ceb2）：即便是车机主动
+                                // 反连蓝牙（绕过「启动连接」入口），若本机画面源尚未出真实帧，
+                                // 先尝试自动拉起并短等首帧（上限 4.5s），避免 0 帧进 RECORD 后
+                                // 被车机看门狗直接拆链；若已在出帧则 0ms 直通。
+                                if (CarLifeHijack.isEnabled(context) && !CarLifeHijack.sourceActive && !CarLifeHijack.isStreaming) {
+                                    appendLog("MEDIA-GATE: RECORD 前检测到本机尚未出帧——尝试自动拉起并等待真实首帧（上限 4.5s）")
+                                    CarLifeAutoCoordinator.maybeAutoLaunchOnConnect(context, ::appendLog, silentMode = true)
+                                    val gateDeadline = android.os.SystemClock.uptimeMillis() + 4_500L
+                                    while (!CarLifeHijack.sourceActive &&
+                                        !CarLifeHijack.isStreaming &&
+                                        android.os.SystemClock.uptimeMillis() < gateDeadline &&
+                                        !connectCancelled &&
+                                        connectionAttempt.get() == attempt
+                                    ) {
+                                        try {
+                                            Thread.sleep(150L)
+                                        } catch (_: InterruptedException) {
+                                            break
+                                        }
+                                    }
+                                    requireAttempt(attempt)
+                                    if (CarLifeHijack.sourceActive || CarLifeHijack.isStreaming) {
+                                        appendLog("MEDIA-GATE: RECORD 前已等到本机真实首帧——继续激活会话")
+                                    } else {
+                                        appendLog("MEDIA-GATE: ⚠ RECORD 前等待 4.5s 仍无真实首帧——继续 RECORD（若车机 1~5s 内拆链将归因为媒体缺席）")
+                                    }
+                                } else if (CarLifeHijack.isStreaming && !CarLifeHijack.sourceActive) {
+                                    CarLifeHijack.requestKeyFrame()
                                 }
                                 val firstRecordOk = client.record()
                                 if (!firstRecordOk && streamOrder == StreamOrderMemory.Order.AUDIO_FIRST) {

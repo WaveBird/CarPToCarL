@@ -871,7 +871,6 @@ object CarLifeHijack {
      * 上层据此上报 CarPlay `Speech` 应用态——**这是「手机正在收音」的唯一信源**，
      * 车机只有收到它才会把自己的音源收起来（AIS Table 23-56）。
      */
-    @Volatile
     /** 用户在 CarWith 内点击「返回原车」（0x10021）时通知上层释放主屏回原车界面。 */
     @Volatile
     var onReturnToCar: (() -> Unit)? = null

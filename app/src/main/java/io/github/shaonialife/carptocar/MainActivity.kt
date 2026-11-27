@@ -54,6 +54,7 @@ import io.github.shaonialife.carptocar.carlife.CarGpsOption
 import io.github.shaonialife.carptocar.carlife.CarLifeAutoCoordinator
 import io.github.shaonialife.carptocar.carlife.CarLifeAutoPrefs
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
+import io.github.shaonialife.carptocar.carlife.CarLifeAutoTriggerService
 import io.github.shaonialife.carptocar.carlife.CarLifeLauncher
 import io.github.shaonialife.carptocar.input.KnobRouter
 import io.github.shaonialife.carptocar.input.TouchRouter
@@ -84,6 +85,9 @@ import java.util.Locale
  * 也可以在 App 已在后台时重新武装一次自动连接（onNewIntent）。
  */
 const val EXTRA_CAR_APPROACH = "io.github.shaonialife.carptocar.extra.CAR_APPROACH"
+
+/** MainActivity 附加：接管出帧后把界面移入后台（CarLifeAutoCoordinator 兜底回退路径用）。 */
+const val EXTRA_MOVE_TO_BACKGROUND = "io.github.shaonialife.carptocar.extra.MOVE_TO_BACKGROUND"
 
 /**
  * 手机侧界面（Material 3 暗色重构，设计稿 design/phone-ui-proto.html）：
