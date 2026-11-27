@@ -240,6 +240,9 @@ class AudioSender(
     /** AAC-LC 编码器（仅 [AudioCodec.AAC_LC] 时创建）。 */
     private var aacEncoder: AacLcEncoder? = null
 
+    /** Opus 编码器（宝马 alert/default 通路，见 [OpusEncoder] 类注释）。 */
+    private var opusEncoder: OpusEncoder? = null
+
     /**
      * RTP 游标（原本是采集循环里的局部变量）。提到字段上是因为**同步包线程**要读
      * 「当前/下一包时间戳」，否则锚点里的时间戳永远对不上真实发出的包。
@@ -257,13 +260,24 @@ class AudioSender(
     /** 一包负载字节数（按本流声道数：立体声 1408B / 单声道 704B）。 */
     private val packetBytes: Int = SAMPLES_PER_PACKET * channelCount * 2
 
-    /** 每包/每帧对应的 PCM 字节数（PCM 通路=一包的负载；AAC 通路=一帧的输入）。 */
+    /** 每包/每帧对应的 PCM 字节数（PCM=一包负载；AAC=1024 采样/帧；Opus=960 样本/帧）。 */
     private val framePcmBytes: Int
-        get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.pcmBytes(channelCount) else packetBytes
+        get() =
+            when (codec) {
+                AudioCodec.AAC_LC -> AacLcEncoder.pcmBytes(channelCount)
+                // Opus 一帧 20ms：按本档采样率换算（48k→960、24k→480、16k→320）
+                AudioCodec.OPUS -> OpusEncoder.frameSamplesFor(sampleRate) * channelCount * 2
+                else -> packetBytes
+            }
 
-    /** 每包推进的样本数（AAC 一帧 1024，PCM 一包 352）。 */
+    /** 每包推进的样本数（AAC 一帧 1024，Opus 一帧 960，PCM 一包 352）。 */
     private val samplesPerPacket: Long
-        get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.FRAME_SAMPLES.toLong() else SAMPLES_PER_PACKET.toLong()
+        get() =
+            when (codec) {
+                AudioCodec.AAC_LC -> AacLcEncoder.FRAME_SAMPLES.toLong()
+                AudioCodec.OPUS -> OpusEncoder.frameSamplesFor(sampleRate).toLong()
+                else -> SAMPLES_PER_PACKET.toLong()
+            }
 
     /**
      * RTP SSRC：固定 0（catplay `prepare_header` 在真车上即用 0；DiPlay 收端不校验）。
@@ -449,14 +463,26 @@ class AudioSender(
             socket = client
 
             // AAC 通路先把编码器立起来：编不出来就没必要采集（也避免「有包无声」的假象）
-            if (codec == AudioCodec.AAC_LC) {
-                val encoder = AacLcEncoder(sampleRate, channelCount, wrapAdts = adtsFrames, log = log)
-                if (!encoder.start()) {
-                    client.close()
-                    socket = null
-                    return false
+            when (codec) {
+                AudioCodec.AAC_LC -> {
+                    val encoder = AacLcEncoder(sampleRate, channelCount, wrapAdts = adtsFrames, log = log)
+                    if (!encoder.start()) {
+                        client.close()
+                        socket = null
+                        return false
+                    }
+                    aacEncoder = encoder
                 }
-                aacEncoder = encoder
+                AudioCodec.OPUS -> {
+                    val encoder = OpusEncoder(sampleRate, channelCount, log = log)
+                    if (!encoder.start()) {
+                        client.close()
+                        socket = null
+                        return false
+                    }
+                    opusEncoder = encoder
+                }
+                else -> {}
             }
 
             val captureConfig = buildCaptureConfig(projection)
@@ -481,6 +507,8 @@ class AudioSender(
                 runCatching { recorder.release() }
                 aacEncoder?.stop()
                 aacEncoder = null
+                opusEncoder?.stop()
+                opusEncoder = null
                 client.close()
                 socket = null
                 return false
@@ -544,14 +572,26 @@ class AudioSender(
             val client = openDataSocket()
             socket = client
 
-            if (codec == AudioCodec.AAC_LC) {
-                val encoder = AacLcEncoder(sampleRate, channelCount, wrapAdts = adtsFrames, log = log)
-                if (!encoder.start()) {
-                    client.close()
-                    socket = null
-                    return false
+            when (codec) {
+                AudioCodec.AAC_LC -> {
+                    val encoder = AacLcEncoder(sampleRate, channelCount, wrapAdts = adtsFrames, log = log)
+                    if (!encoder.start()) {
+                        client.close()
+                        socket = null
+                        return false
+                    }
+                    aacEncoder = encoder
                 }
-                aacEncoder = encoder
+                AudioCodec.OPUS -> {
+                    val encoder = OpusEncoder(sampleRate, channelCount, log = log)
+                    if (!encoder.start()) {
+                        client.close()
+                        socket = null
+                        return false
+                    }
+                    opusEncoder = encoder
+                }
+                else -> {}
             }
 
             running.set(true)
@@ -883,16 +923,17 @@ class AudioSender(
     private fun dispatchPcm(pcm: ByteArray) {
         try {
             val payloads: List<ByteArray> =
-                if (codec == AudioCodec.AAC_LC) {
-                    val encoder = aacEncoder ?: return
-                    encoder.encode(pcm, pcm.size)
-                } else {
-                    listOf(pcm)
+                when (codec) {
+                    AudioCodec.AAC_LC -> aacEncoder?.encode(pcm, pcm.size) ?: return
+                    AudioCodec.OPUS -> opusEncoder?.encode(pcm, pcm.size) ?: return
+                    else -> listOf(pcm)
                 }
             if (payloads.isEmpty()) return
             // 一次性自检只对**真实音频**做：拿静音帧去自检只会得到「⚠ 解码为全零」，
             // 把「编码器坏了」误报成事实。
-            if (!selfChecked && !isAllZero(pcm)) {
+            if (!selfChecked && !isAllZero(pcm) && codec != AudioCodec.OPUS) {
+                // 自检用 AAC-LC 解码器验证比特流;OPUS 没有 AAC 解码器,跳过
+                // (避免每帧刷「解码异常」误导排查;OPUS 有效性由实车 SETUP/出声判定)
                 selfChecked = true
                 verifyEncodedFrame(payloads.first())
             }
@@ -936,6 +977,8 @@ class AudioSender(
         record = null
         aacEncoder?.stop()
         aacEncoder = null
+        opusEncoder?.stop()
+        opusEncoder = null
         runCatching { socket?.close() }
         socket = null
         runCatching { syncSocket?.close() }
@@ -1489,9 +1532,10 @@ class AudioSender(
         // byteSwapS16 转回小端再喂 AudioTrack（DiPlay AndroidMediaSink.kt:1687）。
         // Android 采集是原生小端，因此这里必须换序；漏掉会得到「沙沙声」（2026-10-10 实测）。
         //
-        // AAC 通路不做换序：AAC 比特流是字节流，不是 16bit 样本序列，换序会直接把
-        // 比特流搅烂（车机解码失败 → 有包无声）。
-        val wirePayload = if (codec == AudioCodec.AAC_LC) pcm else bigEndianS16(pcm)
+        // AAC/Opus 通路不做换序：它们都是字节流，不是 16bit 样本序列，换序会直接把
+        // 比特流搅烂（车机解码失败 → 有包无声）。只有 PCM 才需要大端化。
+        // （2026-11-22 审计 A1:此前 OPUS 落进 else 被 bigEndianS16 搅烂——致命。）
+        val wirePayload = if (codec == AudioCodec.PCM) bigEndianS16(pcm) else pcm
         val sealed = AirPlayCrypto.chachaSeal(streamKey, AirPlayCrypto.nonce64(nonceCounter), wirePayload, aad)
         val wire = ByteArray(RTP_HEADER_LEN + sealed.size + NONCE_SIZE)
         header.copyInto(wire, 0)

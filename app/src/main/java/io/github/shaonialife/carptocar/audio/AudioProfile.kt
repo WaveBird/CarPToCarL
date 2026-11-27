@@ -7,6 +7,17 @@ enum class AudioCodec {
 
     /** AAC-LC 裸帧（无 ADTS/AU 头），type=102 通路。 */
     AAC_LC,
+
+    /**
+     * Opus 裸帧（无 Ogg 封装），type=100/101 通路。
+     *
+     * 宝马 MGU-55-J 的 alert/default/telephony 档只声明 bit30（0x40000000）——
+     * 按 AirPlay 压缩类型表 ct=32 = Opus（2026-11-22 实测：高德 TTS 2.3MB 全部
+     * 因"101 档选不出可用格式"被丢弃）。帧长 20ms，编码前 PCM 需 48kHz 重采样
+     * （Opus 编码器内部只认 48k，低采样率输入要 libopus 的 downmix/重采样路径，
+     * MediaCodec audio/opus 只支持 48k 输入）。
+     */
+    OPUS,
 }
 
 /**
@@ -87,7 +98,13 @@ data class AudioProfile(
      * 加后缀等于把整份历史作废。上行档才追加 `|in` 区分。
      */
     val key: String
-        get() = "$streamType|${audioType.lowercase()}|$formatBit|${codec.name}" + if (isInput) "|in" else ""
+        get() = buildString {
+            append("$streamType|${audioType.lowercase()}|$formatBit|${codec.name}")
+            // Opus 变体（16k/48k mono、48k stereo）共用 bit30:车机记忆必须按
+            // 变体区分,否则成功变体的记忆会被下一个被拒变体覆盖。
+            if (codec == AudioCodec.OPUS) append("|${sampleRate}x$channels")
+            if (isInput) append("|in")
+        }
 
     /** 日志用短标签（上行带 ↑ 前缀，一眼区分收发方向）。 */
     val label: String

@@ -42,6 +42,23 @@ class AudioAacPayloadTest {
     }
 
     @Test
+    fun opusFrameGoesOnTheWireByteForByte() {
+        // A1 回归锁（2026-11-22）：旧实现 `if (codec == AAC_LC) pcm else bigEndianS16(pcm)`
+        // 会把 Opus 帧也按 2 字节对调——Opus 是字节流，换序后车机解码直接判坏帧，
+        // 表现同样是「SETUP 200、sampleTime 推进、喇叭全静」。只有 PCM 才允许换序。
+        val frame = ByteArray(283) { index -> ((index * 53 + 0x5A) and 0xFF).toByte() }
+        val wire = sender(AudioCodec.OPUS).sealPacket(frame, 0, 0, 0)
+        val decrypted =
+            AirPlayCrypto.chachaOpen(
+                key,
+                ByteArray(12).also { wire.copyOfRange(wire.size - 8, wire.size).copyInto(it, 4) },
+                wire.copyOfRange(12, wire.size - 8),
+                wire.copyOfRange(4, 12),
+            )
+        assertArrayEquals(frame, decrypted)
+    }
+
+    @Test
     fun pcmIsStillByteSwapped() {
         val pcm = byteArrayOf(0x34, 0x12, 0x78, 0x56)
         val wire = sender(AudioCodec.PCM).sealPacket(pcm, 0, 0, 0)

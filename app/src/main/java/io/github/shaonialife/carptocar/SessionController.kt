@@ -5054,68 +5054,90 @@ object SessionController {
         context: Context,
     ) {
         val audioType = NAV_AUDIO_TYPE
-        // 音频兼容实验 A：只建媒体流，不建 t101/default 导航独立流。
-        // 对所有车型生效；OFF 时照常建流，逐字节不变。
-        if (AudioCompatExperiment.current.skipNav) {
-            appendLog("AUDIO: 导航流（101/$audioType）—— 音频兼容实验 A 生效：跳过导航独立流（媒体流照常）")
-            return
-        }
         val secret =
             sharedSecret ?: run {
                 appendLog("AUDIO: 导航流（101/$audioType）—— 没有会话密钥，导航播报将无声")
                 return
             }
-        val profile =
-            client.audioProfileForType(audioType) ?: run {
-                appendLog(
-                    "AUDIO: 导航流（101/$audioType）—— 车机 /info 未声明该档，导航播报将无声" +
-                        "（媒体音频不受影响）",
-                )
-                return
+        // 多方案轮试：bit30（Opus）位图不写采样率/声道——16k 直编与 48k 重采样只有
+        // 实车 SETUP/出声才能分出对错（2026-11-22 宝马 MGU-55-J）。逐变体 SETUP，
+        // 被拒自动切下一个；成功变体写进车机记忆，下轮直用不再盲试。
+        val variants = client.audioProfileVariantsForType(audioType)
+        if (variants.isEmpty()) {
+            appendLog(
+                "AUDIO: 导航流（101/$audioType）—— 车机 /info 未声明该档，导航播报将无声" +
+                    "（媒体音频不受影响）",
+            )
+            return
+        }
+        var profile: AudioProfile? = null
+        var info: AirPlayClient.AudioStreamInfo? = null
+        // RECORD 敏感窗快速放弃（2026-11-22 审计 F 项根因）：
+        // 1.2.76 对宝马 101/default 是零 SETUP；多变体轮试在这个窗口对一台"对
+        // RECORD 后过敏"的车机最多打出 9s RTSP SETUP 流量，撞车机 6s 控制会话
+        // 就绪超时 → 整轮拆链。所以：
+        //  - 首变体 1.5s 短超时（宝马 400 是 25ms 量级快速拒绝，1.5s 足够判生死）；
+        //  - 任一变体失败即放弃本轮（不试满 3 档）——变体记忆留给下一轮会话，
+        //    那时不占 RECORD 窗口，随便试。
+        for ((index, variant) in variants.withIndex()) {
+            val attempt =
+                try {
+                    client.runAudioStream(
+                        secret,
+                        variant,
+                        AudioTuning.RAW_SPF,
+                        micPort = 0,
+                        fixVolume = false,
+                        setupTimeoutMillis = if (index == 0) 1_500 else 3_000,
+                    )
+                } catch (error: Exception) {
+                    appendLog("AUDIO: 导航流 ${variant.label} 协商异常 - ${error.message}")
+                    null
+                }
+            if (attempt != null) {
+                profile = variant
+                info = attempt
+                break
             }
-        val info =
-            try {
-                // 3s 超时：第二条流自己慢不要紧，但它挡住的是后面那次 RECORD——
-                // 而 RECORD 必须等两条流都 SETUP 完才发（补发 RECORD 会弄死宝马车机）
-                client.runAudioStream(
-                    secret,
-                    profile,
-                    AudioTuning.RAW_SPF,
-                    micPort = 0,
-                    fixVolume = false,
-                    setupTimeoutMillis = 3_000,
-                )
-            } catch (error: Exception) {
-                appendLog("AUDIO: 导航流协商异常 - ${error.message} —— 导航播报将无声")
-                null
-            }
-        if (info == null) {
-            appendLog("AUDIO: 导航流（101/$audioType）SETUP 失败 —— 导航播报将无声")
+            appendLog(
+                "AUDIO: 导航流变体 ${variant.label} SETUP 被拒——RECORD 敏感窗内不继续盲试，" +
+                    "本轮放弃（成功变体下轮经车机记忆直用）",
+            )
+            break
+        }
+        val chosen = profile
+        val streamInfo = info
+        if (chosen == null || streamInfo == null) {
+            appendLog(
+                "AUDIO: 导航流（101/$audioType）全部 ${variants.size} 方案 SETUP 失败 —— 导航播报将无声" +
+                    "（把日志发回来，按车机应答调变体参数）",
+            )
             return
         }
         val nav =
             AudioSender(
                 host = host,
-                dataPort = info.dataPort,
-                streamKey = info.streamKey,
+                dataPort = streamInfo.dataPort,
+                streamKey = streamInfo.streamKey,
                 log = { line -> appendLog(navLogLine(line)) },
                 context = context.applicationContext,
-                sampleRate = info.sampleRate,
-                codec = profile.codec,
-                streamType = profile.streamType,
+                sampleRate = streamInfo.sampleRate,
+                codec = chosen.codec,
+                streamType = chosen.streamType,
                 adtsFrames = AudioTuning.RAW_SPF.adts,
-                controlPort = info.controlPort,
-                channelCount = profile.channels,
-                // 导航流：不启用静音关流（播报有大段空白）与欠载加深。
-                isMedia = false,
-                queueGovernorEnabled = AudioQueueOption.enabled,
+                controlPort = streamInfo.controlPort,
+                channelCount = chosen.channels,
             )
         if (!nav.startPassthrough()) {
             appendLog("AUDIO: 导航流（101/$audioType）发送端启动失败 —— 导航播报将无声")
             return
         }
         navAudioSender = nav
-        activeNavAudioProfile = profile
+        activeNavAudioProfile = chosen
+        // A4 修正：此前这里注释写"成功变体进车机记忆"，实际只打了日志——导航档
+        // 没有接 AudioProfileMemory（记忆目前在媒体路径）。A3 之后一个格式位只对应
+        // 唯一参数，本就不存在"盲试组合"要记忆；保留日志记录本轮定型的档位即可。
+        appendLog("AUDIO: ✓ 导航流方案定型: ${chosen.label}")
         // 导航流建好后才启用压低：车机只有看到 101 上有独立流 + duckAudio 才把它当导航音轨。
         // 捕获 client 快照，会话切换后旧状态机的命令不会打到新连接。
         navigationDucking?.close()
@@ -5125,8 +5147,8 @@ object SessionController {
                 log = ::appendLog,
             )
         appendLog(
-            "AUDIO: ✓ 导航播报已独立成流 t${profile.streamType}/$audioType —— ${profile.label} " +
-                "dataPort=${info.dataPort} controlPort=${info.controlPort}；" +
+            "AUDIO: ✓ 导航播报已独立成流 t${chosen.streamType}/$audioType —— ${chosen.label} " +
+                "dataPort=${streamInfo.dataPort} controlPort=${streamInfo.controlPort}；" +
                 "9241 的 TTS 直投这条（车机按提示音处理，压低音乐由它决定），等会话 RECORD 一起激活",
         )
     }
@@ -5138,6 +5160,148 @@ object SessionController {
         } else {
             "AUDIO[导航流]: $line"
         }
+
+    /**
+     * **重建导航流**：换一条 101 AltAudio 流（必要时换变体），先建新的、成功了才停旧的。
+     *
+     * ## 为什么「音频必须重建才正常」修到它头上
+     *
+     * 2026-11-22 宝马 MGU-55-J 实车：导航流走 [startNavAudioChannel] 的多变体轮试，
+     * 但轮试只在**首连**生效——「重启音频」（三连击）只对导航流做 [AudioSender.restartPipeline]
+     * （清缓冲、时间轴不动）。若本轮选中的变体属于「SETUP 回 200、给端口，但车机不排播」
+     * 的档（bit30 位图不写采样率/声道，这种档只有实车放音才能分出对错），清缓冲救不了它，
+     * 唯一出路是**整条流重建 + 换下一个变体**——与主音频的 [rebuildAudioChannel] 同理。
+     *
+     * ## 步骤（按执行时序）
+     *
+     *  1. 前置检查：会话在线、车机未借用主音频、旧导航流在跑——不满足直接返回 false；
+     *  2. 取变体候选（`audioProfileVariantsForType`），用 [AudioProfileMemory.order] 按
+     *     本车机历史记忆重排：本轮失败的变体已被标 rejected，天然排到最后——重建时自动
+     *     换下一个方案；记忆中的 working 变体排最前；
+     *  3. 逐变体 SETUP（3s 超时，同 [startNavAudioChannel]）：每试一个就把失败的变体记进
+     *     车机记忆（`recordRejected`），下一轮连接不再盲试；
+     *  4. **新流 SETUP 成功才停旧流**（[AudioSender.stop]）：SETUP 被拒时旧流仍在推，
+     *     绝不把「导航有声」变「彻底没声」；
+     *  5. 装 [NavigationDucking]（导航流建好后才允许压低指令，与首连同一约定）；
+     *  6. 补发一次会话级 RECORD：新流是「会话已激活之后」加入的，按 AirPlay 语义必须补发
+     *     RECORD 才排播（与 [rebuildAudioChannel] 同款）；补发被拆链由 PostRecordWatch 兜底归因。
+     *
+     * @return 是否真的建成了新导航流（false = 旧流保持原样继续推）
+     */
+    @Synchronized
+    private fun rebuildNavAudioChannel(reason: String): Boolean {
+        val client = currentClient ?: return false
+        if (!client.phoneOwnsAudio) return false
+        val secret = currentSharedSecret ?: return false
+        val host = currentAudioHost ?: return false
+        val context = appContext?.applicationContext ?: return false
+        val identity = activeAudioReceiverKey
+        val old = navAudioSender ?: return false
+        if (!old.isRunning) return false
+        navLogLine("$reason → 重建导航流（换一条 101 流逼车机重开提示音通路；必要时换变体）")
+        // 变体候选按车机记忆重排：本轮失败的变体已 recordRejected，order() 把它排到最后，
+        // working 排最前——重建一次就等于「自动换到下一个方案」。
+        val baseVariants = client.audioProfileVariantsForType(NAV_AUDIO_TYPE)
+        val ordered =
+            if (identity.isBlank()) {
+                baseVariants
+            } else {
+                AudioProfileMemory
+                    .order(baseVariants, AudioProfileMemory.load(context, identity))
+                    .ifEmpty { baseVariants } // 全被判死时照常全试（换车机/固件升级不永久无声）
+            }
+        if (ordered.isEmpty()) {
+            navLogLine("车机 /info 未声明 101/$NAV_AUDIO_TYPE 档——无法重建，旧导航流保持原样")
+            return false
+        }
+        var chosen: AudioProfile? = null
+        var streamInfo: AirPlayClient.AudioStreamInfo? = null
+        for (variant in ordered) {
+            if (variant.key == activeNavAudioProfile?.key && ordered.size > 1) {
+                // 还在推的同款变体排到最后再试：重建的意义就是「换一个」，先给它机会的是
+                // 其它变体；只剩它一个时才允许原地重build。
+                continue
+            }
+            val attempt =
+                try {
+                    client.runAudioStream(
+                        secret,
+                        variant,
+                        AudioTuning.RAW_SPF,
+                        micPort = 0,
+                        fixVolume = false,
+                        setupTimeoutMillis = 3_000,
+                    )
+                } catch (error: Exception) {
+                    navLogLine("${variant.label} 协商异常 - ${error.message}")
+                    null
+                }
+            if (attempt != null) {
+                chosen = variant
+                streamInfo = attempt
+                break
+            }
+            navLogLine("变体 ${variant.label} SETUP 被拒——切下一方案")
+            if (identity.isNotBlank()) {
+                AudioProfileMemory.recordRejected(
+                    context,
+                    identity,
+                    variant.key,
+                    ordered.map { it.key }.toSet(),
+                    markExhausted = false,
+                )
+            }
+        }
+        val profile = chosen
+        val info = streamInfo
+        if (profile == null || info == null) {
+            navLogLine("全部 ${ordered.size} 变体 SETUP 失败——旧导航流保持原样继续推（不降级成无声）")
+            return false
+        }
+        // 新流已就绪：停旧流。旧流不再有包，接收端超时后自行回收。
+        old.stop()
+        navAudioSender = null
+        activeNavAudioProfile = null
+        val nav =
+            AudioSender(
+                host = host,
+                dataPort = info.dataPort,
+                streamKey = info.streamKey,
+                log = { line -> navLogLine(line) },
+                context = context,
+                sampleRate = info.sampleRate,
+                codec = profile.codec,
+                streamType = profile.streamType,
+                adtsFrames = AudioTuning.RAW_SPF.adts,
+                controlPort = info.controlPort,
+                channelCount = profile.channels,
+            )
+        if (!nav.startPassthrough()) {
+            navLogLine("发送端启动失败——导航播报将无声（重连可恢复；媒体音频不受影响）")
+            return false
+        }
+        navAudioSender = nav
+        activeNavAudioProfile = profile
+        navigationDucking?.close()
+        navigationDucking =
+            NavigationDucking(
+                send = { duck -> currentClient === client && client.postNavigationDucking(duck) },
+                log = ::appendLog,
+            )
+        // 新流是会话激活后加入的：必须补发 RECORD 才排播（与 rebuildAudioChannel 同款）。
+        if (client.record()) {
+            nav.onRecorded()
+            navLogLine(
+                "✓ 导航流重建完成（${profile.label} dataPort=${info.dataPort} controlPort=${info.controlPort}）" +
+                    "——RECORD 已补发",
+            )
+        } else {
+            navLogLine(
+                "导航流新流已建（${profile.label}）但 RECORD 补发被拒——若仍无声，看 PostRecordWatch 归因日志",
+            )
+        }
+        return true
+    }
 
     /**
      * 用户手动「重启音频」——方向盘语音键短按三次触发（[io.github.shaonialife.carptocar.carlife.VoiceKeyGesture]）。
@@ -5212,6 +5376,19 @@ object SessionController {
                 },
             )
             uiHintSink?.invoke(if (rebuilt) "音频已重启" else "音频已重置（流重建失败，旧流仍在推）")
+            // 导航流跟着重建（2026-11-22 宝马 MGU-55-J，de52be6 语义）：它同样可能是
+            // 「SETUP 200 但车机不排播」的变体——清缓冲救不了，只有整条流换掉
+            // （rebuildNavAudioChannel 会在记忆重排后自动换到下一个方案）。
+            if (navAudioSender?.isRunning == true) {
+                val navRebuilt = rebuildNavAudioChannel(reason)
+                appendLog(
+                    if (navRebuilt) {
+                        "AUDIO[导航流]: ✓ 随主音频一起重建完成"
+                    } else {
+                        "AUDIO[导航流]: 重建未成功——旧导航流保持原样继续推"
+                    },
+                )
+            }
             return rebuilt
         }
         // 流根本没在推（引擎退出后没恢复、上一轮拆流没建回来、发包失败被 stop）：
