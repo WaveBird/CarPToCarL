@@ -1,0 +1,208 @@
+package io.github.shaonialife.carptocar.audio
+
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+
+/**
+ * PCM → Opus 编码器（宝马 MGU alert/default/telephony 通路用，bit30）。
+ *
+ * 为什么需要它（2026-11-22 宝马 530Li / MGU-55-J 实测）：该车机 /info 的
+ * `type=101 AltAudio / default`（导航播报标准通路）与 `type=100` 的
+ * default/telephony/alert 全部只声明 `audioOutputFormats=0x40000000`（bit30）——
+ * 按 AirPlay 压缩类型表 ct=32 = **Opus**，没有任何 PCM/AAC 位。高德 TTS 的
+ * PCM（16kHz 单声道）全程照收却一条也发不出去（2.3MB 全被丢弃）。
+ *
+ * 线格式：MediaCodec audio/opus 输出裸 Opus 帧（无 Ogg 封装），RTP 负载即该帧，
+ * 一包一帧，与 AAC-LC 同构。
+ *
+ * 帧长与时间戳：
+ *  - CSD 配置帧（codec-config，OpusHead）被捕获到 [configFrame]，但**目前没有
+ *    任何发送点**——先不发（2026-11-22 审计 A5-B：盲目加 CSD 首包会引入新的时序
+ *    风险）。若实车 SETUP 200 仍无声，第一步就是把它当首包发出去再试。
+ *  - 普通帧 20ms（960 样本 @48kHz 或 480 样本 @24k / 320 样本 @16k）——
+ *    MediaCodec c2.android opus.encoder 固定 20ms 一帧，RTP 时间戳按
+ *    「20ms × 本档采样率」步进（见 AudioSender.samplesPerPacket）。
+ *  - 输入采样率由格式位决定（bit28/29/30 = 16/24/48k）；AudioSender 负责把
+ *    CarLife 引擎的源 PCM 重采样对齐到该值（与 AAC 通路共用同一套对齐逻辑）。
+ */
+class OpusEncoder(
+    /** 编码输入采样率，固定 48kHz（MediaCodec Opus 编码器限制）。 */
+    private val sampleRate: Int = 48_000,
+    /** 声道数：1 = 单声道（导航 TTS），2 = 立体声。 */
+    private val channels: Int = 1,
+    /** 编码码率（bps）。导航播报 64k 单声道已足够清亮；立体声媒体 128k。 */
+    private val bitRate: Int = if (channels == 1) 64_000 else 128_000,
+    private val log: (String) -> Unit,
+) {
+    companion object {
+        /** Opus 一帧固定 20ms；@48kHz 时每声道 960 样本（16k→320，24k→480）。 */
+        const val FRAME_SAMPLES_PER_CHANNEL = 960
+
+        /** 按本档采样率换算的 20ms 帧长（每声道样本数）。 */
+        fun frameSamplesFor(sampleRate: Int): Int = sampleRate / 50
+
+        /**
+         * 设备上的 MediaCodec 是否支持**指定采样率**的 Opus 编码。
+         *
+         * 大多数 c2.android.opus.encoder 只配 48k；16k 直编变体是否可行逐设备探测——
+         * 探测不到就把 16k 变体从候选表剔除，免得 SETUP 成功后编码器立不起来，
+         * 整条导航流反而死在"SETUP 已过、无法回退"的死角。
+         */
+        fun supportsSampleRate(sampleRate: Int): Boolean =
+            runCatching {
+                val format =
+                    MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, sampleRate, 1)
+                val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS)
+                try {
+                    encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    true
+                } catch (_: Exception) {
+                    false
+                } finally {
+                    runCatching { encoder.release() }
+                }
+            }.getOrDefault(false)
+
+        /** 编码器输入/输出超时（微秒），与 AacLcEncoder 同一量级。 */
+        private const val TIMEOUT_US = 10_000L
+    }
+
+    private val lock = Any()
+    private var codec: MediaCodec? = null
+    private var started = false
+
+    /** CSD（codec-specific data）：OpusHead，首个输出缓冲携带，须单独下发给车机。 */
+    @Volatile
+    var configFrame: ByteArray? = null
+        private set
+
+    /** 已喂入的 PCM 采样数（per channel）——RTP 时间戳步进依据。 */
+    var presentedSamples: Long = 0L
+        private set
+
+    /** stop 后仍到达的 encode 次数（竞态丢弃，收尾时汇总）。 */
+    private var droppedAfterStop = 0L
+    private var droppedInputBusy = 0L
+
+    fun start(): Boolean =
+        synchronized(lock) {
+            try {
+                val format =
+                    MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, sampleRate, channels).apply {
+                        setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+                        // 复杂度 10（0-10）：车机解码侧无所谓，编码端 CPU 允许就拉满，
+                        // 换取同等码率下更好的语音质量（导航播报是纯人声，Opus 语音
+                        // 模式在这个复杂度下 MOS 明显高于 5）。
+                        setInteger(MediaFormat.KEY_COMPLEXITY, 10)
+                        setInteger(MediaFormat.KEY_AAC_DRC_TARGET_REFERENCE_LEVEL, 0)
+                    }
+                val encoder =
+                    MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS).apply {
+                        configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                        start()
+                    }
+                codec = encoder
+                started = true
+                log(
+                    "AUDIO: Opus 编码器就绪（${sampleRate}Hz ${if (channels == 1) "单声道" else "立体声"} " +
+                        "${bitRate / 1000}kbps，帧=${FRAME_SAMPLES_PER_CHANNEL}样本/20ms，codec=${encoder.name}）",
+                    // 注：编码器本身固定按 20ms 组帧，实际样本数随 sampleRate 变化
+                )
+                true
+            } catch (error: Exception) {
+                log("AUDIO: Opus 编码器启动失败 - ${error.message}")
+                false
+            }
+        }
+
+    /**
+     * 编码一帧 PCM，返回 0..n 个 Opus 帧（首帧可能空——编码器有 1~2 帧延迟）。
+     * 帧内含 CSD 首位的话会先填 [configFrame]。
+     */
+    fun encode(pcm: ByteArray, size: Int): List<ByteArray> =
+        synchronized(lock) {
+            val encoder = codec
+            if (encoder == null || !started) {
+                droppedAfterStop++
+                return emptyList()
+            }
+            val output = mutableListOf<ByteArray>()
+            try {
+                val inputIndex = encoder.dequeueInputBuffer(TIMEOUT_US)
+                if (inputIndex < 0) {
+                    droppedInputBusy++
+                    if (droppedInputBusy == 1L || droppedInputBusy % 200L == 0L) {
+                        log("AUDIO: Opus 编码器输入缓冲满——已丢 $droppedInputBusy 帧 PCM（不影响会话）")
+                    }
+                } else {
+                    val buffer = encoder.getInputBuffer(inputIndex)
+                    val length = size.coerceAtMost(buffer?.capacity() ?: 0).coerceAtMost(pcm.size)
+                    if (buffer == null || length <= 0) {
+                        encoder.queueInputBuffer(inputIndex, 0, 0, presentedSamples * 1_000_000L / sampleRate, 0)
+                        droppedInputBusy++
+                    } else {
+                        buffer.clear()
+                        buffer.put(pcm, 0, length)
+                        encoder.queueInputBuffer(
+                            inputIndex,
+                            0,
+                            length,
+                            presentedSamples * 1_000_000L / sampleRate,
+                            0,
+                        )
+                        presentedSamples += length / 2 / channels
+                    }
+                }
+                drain(encoder, output)
+            } catch (error: IllegalStateException) {
+                codec = null
+                started = false
+                log("AUDIO: Opus 编码器已释放，停止编码（${error.message}）——收尾竞态，已忽略")
+            } catch (error: Exception) {
+                log("AUDIO: Opus 编码异常 - ${error.message}")
+            }
+            output
+        }
+
+    private fun drain(encoder: MediaCodec, output: MutableList<ByteArray>) {
+        while (true) {
+            val info = MediaCodec.BufferInfo()
+            val index = encoder.dequeueOutputBuffer(info, 0)
+            when {
+                index == MediaCodec.INFO_TRY_AGAIN_LATER -> return
+                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> continue
+                index < 0 -> return
+                else -> {
+                    val buffer = encoder.getOutputBuffer(index)
+                    if (buffer != null && info.size > 0) {
+                        val data = ByteArray(info.size)
+                        buffer.position(info.offset)
+                        buffer.limit(info.offset + info.size)
+                        buffer.get(data)
+                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                            configFrame = data
+                            log("AUDIO: Opus CSD 就绪（OpusHead ${data.size}B）")
+                        } else {
+                            output += data
+                        }
+                    }
+                    encoder.releaseOutputBuffer(index, false)
+                }
+            }
+        }
+    }
+
+    fun stop() {
+        synchronized(lock) {
+            if (droppedAfterStop > 0) {
+                log("AUDIO: Opus 收尾竞态丢弃 $droppedAfterStop 次 encode（无害）")
+                droppedAfterStop = 0
+            }
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            codec = null
+            started = false
+        }
+    }
+}
