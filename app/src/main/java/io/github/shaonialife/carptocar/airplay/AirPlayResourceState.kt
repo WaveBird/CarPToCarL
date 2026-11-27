@@ -223,6 +223,24 @@ class AirPlayResourceState {
         publish: (Map<String, Any?>) -> Boolean,
     ): Boolean = claimAndPublish(RESOURCE_AUDIO, publish) { if (temporary) it.borrowForPhone(priority) else it.claim(priority) }
 
+    /**
+     * 用户在手机 CarWith 内点击「返回原车」时主动把主屏交还车机
+     * （takeConstraint=100，允许下次用户点图标拿回）（移植自 fork main 27938d7）。
+     */
+    fun relinquishScreenToCar(publish: (Map<String, Any?>) -> Boolean): Boolean =
+        claimAndPublish(RESOURCE_SCREEN, publish) { screen ->
+            if (screen.entity == ENTITY_CAR && screen.permanentEntity == ENTITY_CAR && screen.borrowers.isEmpty()) {
+                false
+            } else {
+                screen.borrowers.clear()
+                screen.phoneBorrowing = false
+                screen.permanentEntity = ENTITY_CAR
+                screen.takeConstraint = 100
+                screen.borrowConstraint = 100
+                true
+            }
+        }
+
     fun releaseAudioBorrow(publish: (Map<String, Any?>) -> Boolean): Boolean =
         claimAndPublish(RESOURCE_AUDIO, publish) { audio -> audio.phoneBorrowing.also { audio.phoneBorrowing = false } }
 

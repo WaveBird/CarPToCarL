@@ -2,6 +2,7 @@ package io.github.shaonialife.carptocar.carlife
 
 import android.content.Context
 import io.github.shaonialife.carptocar.audio.AudioRatePreference
+import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.input.TouchDomainMapping
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.media.MediaSessionsState
@@ -608,6 +609,41 @@ object CarLifeHijack {
     /** 已劫持并收到流（车机连接前就该为 true）。 */
     val isStreaming: Boolean get() = running.get() && client?.isRunning == true && hasVideo
 
+    /** 守候线程最近一次探测到 7240 端口已开放（避免 UI 线程直接发起本地 TCP 探测）。 */
+    @Volatile
+    var portOpenDetected: Boolean = false
+        private set
+
+    /** 最近一次 7240 协议握手成功的时刻（uptimeMillis；断开或停用归零），用于检测「占口但零帧」。 */
+    @Volatile
+    private var handshakeAtMs: Long = 0L
+
+    /**
+     * 自守候以来 7240 是否发生过**协议握手**（≥1 次即 true；断开/停用归零）。
+     *
+     * 供 `CarLifeAutoCoordinator` 区分「入口没收到请求（一次握手都没有 → MIUI 静默
+     * 拦截，值得自动重发入口）」与「入口收到但引擎零帧（同样值得重发：2026-11-22 实车日志
+     * `已附着七口超过 5s 无视频帧——补请求入口` 后仍未恢复，用户手动重启才出帧）」。
+     */
+    val handshakeSeen: Boolean get() = handshakeAtMs > 0L
+
+    /** 收到真实视频首帧时的轻量回调（供 `CarLifeAutoCoordinator` 立即把 CarWith/CarLife 退入后台）。 */
+    @Volatile
+    var onSourceReady: (() -> Unit)? = null
+
+    /** 已连上 7240 但至今仍无视频帧的持续秒数（已有画面或未连上时为 0）。 */
+    val zeroFrameStalledSec: Int
+        get() {
+            if (!isActive || hasVideo || sourceActive) return 0
+            val since = handshakeAtMs
+            if (since <= 0L) return 0
+            return ((android.os.SystemClock.uptimeMillis() - since).coerceAtLeast(0L) / 1_000L).toInt()
+        }
+
+    /** 连续超过 12 秒已连上 7240 但 0 帧：典型表现为后台僵死组件占着 7240 却 `encode:0`。 */
+    val isZeroFrameStalled: Boolean
+        get() = zeroFrameStalledSec >= ZERO_FRAME_STALL_SEC
+
     /**
      * CarLife 引擎当前宣告的媒体 PCM 采样率（Hz）；0 = 尚未宣告。
      *
@@ -835,7 +871,29 @@ object CarLifeHijack {
      * 上层据此上报 CarPlay `Speech` 应用态——**这是「手机正在收音」的唯一信源**，
      * 车机只有收到它才会把自己的音源收起来（AIS Table 23-56）。
      */
+    /** 用户在 CarWith 内点击「返回原车」（0x10021）时通知上层释放主屏回原车界面。 */
     @Volatile
+    var onReturnToCar: (() -> Unit)? = null
+
+    @Volatile
+    private var lastKeyFrameRequestAt = 0L
+
+    /** 向本机 CarWith / CarLife 引擎请求立即输出关键帧（400ms 节流，避免车机连发 forceKeyFrame 打爆编码器）。 */
+    fun requestKeyFrame(): Boolean {
+        val hu = client ?: return false
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastKeyFrameRequestAt < 400L) return true
+        lastKeyFrameRequestAt = now
+        return hu.requestKeyFrame()
+    }
+
+    private fun shouldPreferEncryptedCarWith(context: Context?): Boolean {
+        val ctx = context ?: return false
+        if (!CarLifeLauncher.hasXiaomiCarWithDirectEntry(ctx)) return false
+        val target = CarLifeAutoPrefs.launchTarget(ctx)
+        return target == CarLifeAutoPrefs.LaunchTarget.AUTO || target == CarLifeAutoPrefs.LaunchTarget.XIAOMI_CARWITH
+    }
+
     var onVoiceSession: ((Boolean) -> Unit)? = null
 
     /**
@@ -887,8 +945,9 @@ object CarLifeHijack {
         logSink = log
         appContext = context.applicationContext
         // 上次连过的车机画布：首轮 98311 就按它申请，引擎才有可能在建编码器时就用对尺寸
-        // （详见 CarCanvasMemory 的说明）。没有缓存 = 首次连这台车，只能先用默认 1280×720。
-        val cachedCanvas = CarCanvasMemory.last(context)
+        // （详见 CarCanvasMemory 的说明）。按目标车机（BT MAC）分键读取，没有则回落全局键，
+        // 都没有 = 首次连这台车，只能先用默认 1280×720（fork main 1.2.102：换车不再互相污染缓存）。
+        val cachedCanvas = CarCanvasMemory.last(context, carKey())
         initialCanvasW = cachedCanvas?.first ?: CarCanvasMemory.DEFAULT.first
         initialCanvasH = cachedCanvas?.second ?: CarCanvasMemory.DEFAULT.second
         log(
@@ -924,6 +983,8 @@ object CarLifeHijack {
             },
         )
         hasVideo = false
+        portOpenDetected = false
+        handshakeAtMs = 0L
         lastSourceFrameAt = 0L
         stallSince = 0L
         requestedFps = context
@@ -1106,6 +1167,8 @@ object CarLifeHijack {
         worker = null
         logSink = null
         hasVideo = false
+        portOpenDetected = false
+        handshakeAtMs = 0L
         lastSourceFrameAt = 0L
         stallSince = 0L
         synchronized(gopLock) {
@@ -1119,6 +1182,7 @@ object CarLifeHijack {
     private fun workerLoop() {
         var announcedWait = false
         var restartArmed = false
+        var forcePlaintextNextRound = false
         while (running.get()) {
             // 2026-10-25 回滚：**不再自动拉起** CarLife 引擎。
             // 自动拉起（bindService / startForegroundService / CarlifeActivity）实测能让
@@ -1127,6 +1191,7 @@ object CarLifeHijack {
             // 「连接成功但长时间没画面」。真实画面必须由荣耀车联自己创建虚拟屏后才有，
             // 所以改回：用户手动打开 CarLife+ 点「无线连接」，本线程只负责守候并接管。
             if (!portListening(CarLifeProtocol.PORT_CMD)) {
+                portOpenDetected = false
                 hasVideo = false
                 if (!announcedWait) {
                     announcedWait = true
@@ -1138,8 +1203,15 @@ object CarLifeHijack {
                 sleep(1500)
                 continue
             }
+            portOpenDetected = true
             announcedWait = false
-            val sink = CarLifeAudioSink(logSink ?: {})
+            val preferCarWith = shouldPreferEncryptedCarWith(appContext) && !forcePlaintextNextRound
+            val trustedCanvas = (requestedW > 0 && requestedH > 0) || CarCanvasMemory.last(appContext, carKey()) != null
+            // CarWith 虚拟屏模式下，第三方音乐 App 的 MediaSession playing 状态频繁抖动
+            // （2-7 秒一次 true→false），触发 setPlaybackPaused(true) 导致 ~47% PCM 被丢弃，
+            // 车机 jitter buffer 被饿空后静音。禁用暂停丢弃：引擎自管理播放状态，宁可偶尔
+            // 重复播放几秒残留，也不要因误判导致持续没声音。
+            val sink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = !preferCarWith)
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃，投给 101 AltAudio/default
             val naviSink =
                 CarLifeAudioSink(
@@ -1218,7 +1290,7 @@ object CarLifeHijack {
                             runCatching { handler() }
                         }
                     },
-                    requestedFps = requestedFps,
+                    requestedFps = if (preferCarWith) 30 else requestedFps,
                     initialConnectType = connectType,
                     mediaSampleRate = AudioRatePreference.load(appContext).mediaSampleRateFeatureValue,
                     probeIds = probeIds,
@@ -1240,6 +1312,21 @@ object CarLifeHijack {
                     // 之后拿到的真实画布仍由 setRequestedResolution 覆盖并落盘。
                     initialWidth = initialCanvasW,
                     initialHeight = initialCanvasH,
+                    encryptedCarWith = preferCarWith,
+                    hasTrustedCanvas = trustedCanvas,
+                    onReturnToCar = { onReturnToCar?.invoke() },
+                    // 加密握手僵死（0x18052 后引擎无回音，fork main 1.2.100）：趁 socket 还活着
+                    // 回收 CarWith 进程并重新调起，随后 stop 本次连接——下一轮守候循环
+                    // 会接管新进程的 7240（等价用户手动重启，但抢在 Connection reset 之前动手）。
+                    onCarWithHandshakeStalled = {
+                        val ctx = appContext
+                        if (ctx != null && CarLifeAutoPrefs.autoLaunchOnConnect(ctx)) {
+                            CarLifeLauncher.restartCarWithProcess(ctx)
+                        }
+                        // client 字段此刻已指向本实例（构造后立即赋值）；若早于赋值触发
+                        // （理论上不可能——看门狗线程 start 在构造之后），runCatching 兜底。
+                        runCatching { client?.stop() }
+                    },
                 )
             hu.onCarMicRequest = { active -> onCarMicRequest?.invoke(active) }
             // start() 在握手返回前就会拉起视频读线程：必须先用旧会话栅栏通知解码状态复位，
@@ -1255,7 +1342,9 @@ object CarLifeHijack {
             }
             if (hu.start()) {
                 restartArmed = false
+                forcePlaintextNextRound = false
                 client = hu
+                handshakeAtMs = android.os.SystemClock.uptimeMillis()
                 // SETUP 先于 client 创建的边界（requestedW/H 已缓存车机画布）：把它回放为
                 // 「申请值」，让引擎尝试按车机画布编码；确认值（videoWidth）仍由引擎回显，
                 // 不受影响。
@@ -1288,13 +1377,49 @@ object CarLifeHijack {
                 }
                 logSink?.invoke("CARLIFE: 协议握手完成，等待真实源首帧（不等于已收到 CarLife 码流）")
             } else {
-                logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
+                if (preferCarWith && hu.handshakeFailed) {
+                    forcePlaintextNextRound = true
+                    logSink?.invoke("CARLIFE: 4.1 加密握手未匹配，下一轮自动回落 3.0 明文模式兼容独立版 CarLife+")
+                } else {
+                    logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
+                }
             }
             // 保持连接直到断开或停止
+            var carWithWakeSent = false
             while (running.get() && hu.isRunning) {
+                if (preferCarWith && !hasVideo && handshakeAtMs > 0L &&
+                    android.os.SystemClock.uptimeMillis() - handshakeAtMs > 5_000L
+                ) {
+                    val ctx = appContext
+                    if (ctx != null && CarLifeAutoPrefs.autoLaunchOnConnect(ctx)) {
+                        if (!carWithWakeSent) {
+                            // 第一级：温和补请求（可能只是入口请求被引擎吞掉）
+                            carWithWakeSent = true
+                            logSink?.invoke("CARLIFE: 已附着七口超过 5s 无视频帧——补请求 CarWith 公开虚拟屏入口")
+                            CarLifeLauncher.launchXiaomiCarWithDirect(ctx)
+                        } else if (android.os.SystemClock.uptimeMillis() - handshakeAtMs > 10_000L) {
+                            // 第二级（10s）：补请求后仍零帧。归因修正（fork main 1.2.101，CarWith
+                            // 官方状态机日志）：快速启停场景多为 WLAN 直连（P2P）未释放完
+                            // 或本次 P2P 失败——killBackgroundProcesses 对 CarWith 前台
+                            // 服务是 no-op，回收无效；如实记录并建议等几秒重试。
+                            carWithWakeSent = true
+                            logSink?.invoke(
+                                "CARLIFE: 补请求后仍无帧（握手已成功 ≥10s）——WLAN 直连（P2P）可能未释放完或已失败" +
+                                    "（CarWith 官方状态机 MSG_WIFI_P2P_CONNECT_FAILURE）——等 3~5s 再试；" +
+                                    "若反复失败请确认 WLAN 开关已打开",
+                            )
+                            CarLifeLauncher.restartCarWithProcess(ctx)
+                        }
+                    }
+                }
                 sleep(500)
             }
+            if (preferCarWith && hu.handshakeFailed && !hasVideo) {
+                forcePlaintextNextRound = true
+                logSink?.invoke("CARLIFE: 4.1 握手阶段被对端拒绝，下一轮回落 3.0 明文模式")
+            }
             if (client === hu) client = null
+            handshakeAtMs = 0L
             sink.stop()
             naviSink.stop()
             retireAudioSource(sink, naviSink)
@@ -1462,6 +1587,7 @@ object CarLifeHijack {
             if (!hasVideo && data.isNotEmpty()) {
                 hasVideo = true
                 logSink?.invoke("CARLIFE: ✓ 收到 CarLife 首帧（${data.size}B，keyFrame=$keyFrame）")
+                runCatching { onSourceReady?.invoke() }
             }
             rememberSpsPps(data)
             val frame = ensureSpsPps(data)
@@ -1641,7 +1767,7 @@ object CarLifeHijack {
     ) {
         requestedW = width
         requestedH = height
-        if (CarCanvasMemory.remember(appContext, width, height)) {
+        if (CarCanvasMemory.remember(appContext, width, height, carKey())) {
             logSink?.invoke(
                 "CARLIFE: 已记住车机画布 ${width}×${height}（下次开机首轮 98311 就按它申请）" +
                     "——引擎只在建编码器前认这个值：想让当前这轮也生效，" +
@@ -2029,6 +2155,13 @@ object CarLifeHijack {
 
     /** 「音频被丢弃」提示的限频（毫秒）。 */
     private const val AUDIO_DROP_LOG_MS = 10_000L
+
+    /** 已连上 7240 却持续 0 帧的告警阈值（秒）。 */
+    const val ZERO_FRAME_STALL_SEC = 12
+
+    /** 画布缓存按目标车机分键（BT MAC 大写；未指定目标返回 null = 用全局键）。 */
+    private fun carKey(): String? =
+        appContext?.let { TargetDevicePrefs.get(it)?.address?.uppercase() }
 
     private fun portListening(port: Int): Boolean = try {
         Socket().use { socket ->

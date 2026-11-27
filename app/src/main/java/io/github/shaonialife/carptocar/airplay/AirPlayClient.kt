@@ -1324,6 +1324,12 @@ class AirPlayClient(
     fun releaseAudioBorrow(): Boolean =
         synchronized(modesPublicationLock) { resourceState.releaseAudioBorrow { publishModes("归还临时借用的主音频", it) } }
 
+    /** 用户在 CarWith 点击「返回原车」时主动将主屏交还车机（移植自 fork main 27938d7）。 */
+    fun relinquishScreenToCar(): Boolean =
+        synchronized(modesPublicationLock) {
+            resourceState.relinquishScreenToCar { publishModes("返回原车交还主屏", it) }
+        }
+
     /** 车机改判后复述当前归属；不走 [assertModes] 的初始回退（那会把车机正借着的屏抢回来）。 */
     fun republishModes(): Boolean = synchronized(modesPublicationLock) { publishModes("车机改判后复述") }
 

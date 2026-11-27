@@ -21,7 +21,8 @@ plugins {
  * 下面那段 `require` 就是这条规则的执行者：撞号时**构建立刻失败**，而不是等到
  * 发完版才发现号码犯忌。
  */
-val appVersionName = "1.2.90"
+// 基于上游 1.2.90 + 小米 CarWith 适配（移植自 fork main 的 CarWith 提交系列）
+val appVersionName = "1.2.91-cw"
 require(!appVersionName.replace(".", "").contains("44")) {
     // 前面留一段 ASCII 前缀：Gradle 控制台按 GBK 输出时中文会成乱码，前缀至少能被人认出来。
     "[version] $appVersionName contains repeated 4 (44/444/4.4/4.44) —— " +
@@ -31,7 +32,10 @@ require(!appVersionName.replace(".", "").contains("44")) {
 val appVersionCode =
     appVersionName
         .split(".")
-        .let { (major, minor, patch) -> major.toInt() * 10_000 + minor.toInt() * 100 + patch.toInt() }
+        .let { (major, minor, patch) ->
+            // 「1.2.91-cw」这类带后缀的 fork 版本号：数值段截掉后缀再算 code。
+            major.toInt() * 10_000 + minor.toInt() * 100 + patch.takeWhile { it.isDigit() }.toInt()
+        }
 
 /**
  * 发布签名配置：从仓库外的 `keystore.properties` 读取（已在 .gitignore 排除）。
